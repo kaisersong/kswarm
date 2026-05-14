@@ -1,0 +1,34 @@
+{
+  "name": "kswarm",
+  "version": "0.1.0",
+  "description": "Project-scoped Agent Swarm Hub. Routes, boards, gates — no business logic.",
+  "type": "module",
+  "bin": {
+    "kswarm": "./src/cli/index.js"
+  },
+  "scripts": {
+    "start": "node scripts/guardian.js",
+    "start:daemon": "node scripts/guardian.js --daemon",
+    "stop": "node scripts/guardian.js --stop",
+    "status": "node scripts/guardian.js --status",
+    "server": "node src/server/index.js",
+    "dev": "node src/server/index.js & cd web && npx vite --port 5188",
+    "verify": "node src/cli/index.js verify",
+    "test": "node test/scenarios-v2.test.js",
+    "test:matcher": "node test/task-matcher.test.js",
+    "test:watchdog": "node test/watchdog.test.js",
+    "test:delivery": "node test/delivery.test.js",
+    "test:qoder": "node test/qoder-harness.test.js",
+    "test:e2e-p0": "node test/e2e-p0.test.js",
+    "test:e2e": "node test/e2e-full-flow.test.js",
+    "test:scenarios": "node test/scenarios.test.js",
+    "test:all": "node test/scenarios-v2.test.js && node test/task-matcher.test.js && node test/watchdog.test.js && node test/delivery.test.js && node test/qoder-harness.test.js && node test/e2e-p0.test.js",
+    "demo": "node src/cli/demo.js"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1"
+  }
+}

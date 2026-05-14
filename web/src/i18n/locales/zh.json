@@ -1,0 +1,103 @@
+{
+  "nav": {
+    "projects": "项目",
+    "agents": "智能体",
+    "logs": "日志",
+    "settings": "设置"
+  },
+  "header": {
+    "title": "KSwarm"
+  },
+  "status": {
+    "connected": "已连接",
+    "disconnected": "未连接",
+    "brokerConnected": "Broker 已连接",
+    "brokerDisconnected": "Broker 未连接"
+  },
+  "projects": {
+    "title": "项目",
+    "subtitle": "管理和跟踪你的 Swarm 项目",
+    "new": "新建项目",
+    "empty": "暂无项目",
+    "emptyHint": "创建你的第一个项目开始使用",
+    "delivered": "已交付",
+    "create": {
+      "title": "创建项目",
+      "name": "项目名称",
+      "namePlaceholder": "输入项目名称",
+      "goal": "项目目标",
+      "goalPlaceholder": "描述这个项目要实现的目标",
+      "requirements": "项目要求",
+      "requirementsPlaceholder": "输入项目的原则、策略、约束等要求（多行）",
+      "po": "项目负责人",
+      "poHint": "负责规划和交付的智能体",
+      "members": "团队成员",
+      "submit": "创建",
+      "cancel": "取消"
+    },
+    "status": {
+      "created": "已创建",
+      "planning": "规划中",
+      "active": "进行中",
+      "delivered": "已交付",
+      "closed": "已关闭"
+    },
+    "actions": {
+      "approve": "审批计划",
+      "dispatch": "派发任务",
+      "deliver": "交付项目",
+      "refresh": "刷新",
+      "close": "关闭"
+    },
+    "tasks": {
+      "add": "添加任务",
+      "addRow": "添加行",
+      "save": "保存",
+      "cancel": "取消",
+      "markDone": "标记完成",
+      "assignTo": "分配给",
+      "empty": "暂无任务",
+      "emptyHint": "规划完成后任务会显示在这里"
+    },
+    "board": {
+      "pending": "待处理",
+      "dispatched": "已派发",
+      "inProgress": "进行中",
+      "review": "审核中",
+      "done": "已完成"
+    },
+    "detail": {
+      "activities": "活动时间线",
+      "deliverable": "交付物",
+      "taskOutput": "任务产出",
+      "noOutput": "暂无产出",
+      "deliveredAt": "交付时间"
+    }
+  },
+  "agents": {
+    "title": "智能体",
+    "subtitle": "查看已连接的智能体及其能力",
+    "kind": "类型",
+    "roles": "角色",
+    "capabilities": "能力",
+    "status": {
+      "online": "在线"
+    },
+    "empty": "暂无智能体连接",
+    "emptyHint": "智能体连接到 Broker 后会显示在这里"
+  },
+  "logs": {
+    "title": "系统日志",
+    "subtitle": "来自 Swarm 的实时事件流",
+    "refresh": "刷新",
+    "empty": "暂无日志"
+  },
+  "settings": {
+    "title": "设置",
+    "language": "语言",
+    "languageDesc": "选择你偏好的显示语言",
+    "langEn": "English",
+    "langZh": "中文",
+    "followSystem": "跟随系统"
+  }
+}

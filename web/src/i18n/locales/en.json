@@ -1,0 +1,103 @@
+{
+  "nav": {
+    "projects": "Projects",
+    "agents": "Agents",
+    "logs": "Logs",
+    "settings": "Settings"
+  },
+  "header": {
+    "title": "KSwarm"
+  },
+  "status": {
+    "connected": "Connected",
+    "disconnected": "Disconnected",
+    "brokerConnected": "Broker Connected",
+    "brokerDisconnected": "Broker Disconnected"
+  },
+  "projects": {
+    "title": "Projects",
+    "subtitle": "Manage and track your swarm projects",
+    "new": "New Project",
+    "empty": "No projects yet",
+    "emptyHint": "Create your first project to get started",
+    "delivered": "Delivered",
+    "create": {
+      "title": "Create Project",
+      "name": "Project Name",
+      "namePlaceholder": "Enter project name",
+      "goal": "Project Goal",
+      "goalPlaceholder": "Describe what this project should achieve",
+      "requirements": "Requirements",
+      "requirementsPlaceholder": "Enter principles, strategies, constraints (multi-line)",
+      "po": "Project Owner",
+      "poHint": "The agent responsible for planning and delivery",
+      "members": "Team Members",
+      "submit": "Create",
+      "cancel": "Cancel"
+    },
+    "status": {
+      "created": "Created",
+      "planning": "Planning",
+      "active": "Active",
+      "delivered": "Delivered",
+      "closed": "Closed"
+    },
+    "actions": {
+      "approve": "Approve Plan",
+      "dispatch": "Dispatch Tasks",
+      "deliver": "Deliver Project",
+      "refresh": "Refresh",
+      "close": "Close"
+    },
+    "tasks": {
+      "add": "Add Task",
+      "addRow": "Add Row",
+      "save": "Save",
+      "cancel": "Cancel",
+      "markDone": "Mark Done",
+      "assignTo": "Assign To",
+      "empty": "No tasks yet",
+      "emptyHint": "Tasks will appear here after planning"
+    },
+    "board": {
+      "pending": "Pending",
+      "dispatched": "Dispatched",
+      "inProgress": "In Progress",
+      "review": "Review",
+      "done": "Done"
+    },
+    "detail": {
+      "activities": "Activity Timeline",
+      "deliverable": "Deliverable",
+      "taskOutput": "Task Output",
+      "noOutput": "No output yet",
+      "deliveredAt": "Delivered at"
+    }
+  },
+  "agents": {
+    "title": "Agents",
+    "subtitle": "View connected agents and their capabilities",
+    "kind": "Kind",
+    "roles": "Roles",
+    "capabilities": "Capabilities",
+    "status": {
+      "online": "Online"
+    },
+    "empty": "No agents connected",
+    "emptyHint": "Agents will appear here once they connect to the broker"
+  },
+  "logs": {
+    "title": "System Logs",
+    "subtitle": "Real-time event stream from the swarm",
+    "refresh": "Refresh",
+    "empty": "No logs yet"
+  },
+  "settings": {
+    "title": "Settings",
+    "language": "Language",
+    "languageDesc": "Choose your preferred display language",
+    "langEn": "English",
+    "langZh": "Chinese",
+    "followSystem": "Follow System"
+  }
+}
