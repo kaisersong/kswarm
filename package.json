@@ -2,6 +2,7 @@
   "name": "kswarm",
   "version": "0.1.0",
   "description": "Project-scoped Agent Swarm Hub. Routes, boards, gates — no business logic.",
+  "license": "Apache-2.0",
   "type": "module",
   "bin": {
     "kswarm": "./src/cli/index.js"
