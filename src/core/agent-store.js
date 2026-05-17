@@ -13,6 +13,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
+import { createUnknownRuntimeHealth } from './runtime-health.js';
 
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const AGENTS_FILE = join(KSWARM_HOME, 'agents.json');
@@ -58,6 +59,7 @@ const AGENT_DEFAULTS = {
   status: 'offline',
   runtimeId: null,
   runtimeMode: 'local',
+  runtimeHealth: null,
   createdAt: null,
   archivedAt: null,
   archivedBy: null,
@@ -186,7 +188,7 @@ export function createAgentStore() {
       try {
         const data = JSON.parse(readFileSync(AGENTS_FILE, 'utf-8'));
         if (Array.isArray(data)) {
-          for (const a of data) agents.set(a.id, a);
+          for (const a of data) agents.set(a.id, normalizeAgent(a));
         }
       } catch { /* ignore corrupt file */ }
     }
@@ -218,7 +220,7 @@ export function createAgentStore() {
       status: 'idle',
       createdAt: Date.now(),
     };
-    agents.set(xiaok.id, xiaok);
+    agents.set(xiaok.id, normalizeAgent(xiaok));
 
     _save();
     console.log(`[AgentStore] Seed: ensured xiaok PO+Worker agents`);
@@ -254,9 +256,9 @@ export function createAgentStore() {
     // Ensure required fields
     if (!agent.name) return { error: 'name is required', code: 400 };
 
-    agents.set(agent.id, agent);
+    agents.set(agent.id, normalizeAgent(agent));
     _save();
-    return { ok: true, agent };
+    return { ok: true, agent: agents.get(agent.id) };
   }
 
   function get(id) {
@@ -297,9 +299,9 @@ export function createAgentStore() {
       }
     }
 
-    agents.set(id, updated);
+    agents.set(id, normalizeAgent(updated));
     _save();
-    return { ok: true, agent: updated };
+    return { ok: true, agent: agents.get(id) };
   }
 
   function archive(id) {
@@ -349,6 +351,14 @@ export function createAgentStore() {
 
   function setOffline(id) {
     setStatus(id, 'offline', null);
+  }
+
+  function updateRuntimeHealth(id, runtimeHealth) {
+    const agent = agents.get(id);
+    if (!agent) return { error: 'agent not found', code: 404 };
+    agent.runtimeHealth = normalizeRuntimeHealth(agent, runtimeHealth);
+    _save();
+    return { ok: true, agent };
   }
 
   /** Reset all agents to offline — call on server startup (old processes are dead) */
@@ -444,6 +454,7 @@ export function createAgentStore() {
     setStatus,
     setOnline,
     setOffline,
+    updateRuntimeHealth,
     resetAllOffline,
     getLLMConfig,
     resolveLLMConfig,
@@ -452,4 +463,46 @@ export function createAgentStore() {
     getKnownCLIs: () => KNOWN_AGENT_CLIS.map(c => ({ type: c.type, bin: c.bin, displayName: c.displayName, description: c.description })),
     detectCLIs: () => _detectAgentCLIs(),
   };
+}
+
+function normalizeAgent(agent) {
+  if (!agent) return agent;
+  const normalized = {
+    ...AGENT_DEFAULTS,
+    ...agent,
+  };
+  normalized.runtimeHealth = normalizeRuntimeHealth(normalized, normalized.runtimeHealth);
+  return normalized;
+}
+
+function normalizeRuntimeHealth(agent, runtimeHealth = null) {
+  const outputCapabilities = normalizeCapabilityList(
+    runtimeHealth?.outputCapabilities?.length
+      ? runtimeHealth.outputCapabilities
+      : defaultOutputCapabilities(agent)
+  );
+  const taskCapabilities = normalizeCapabilityList(
+    runtimeHealth?.taskCapabilities?.length
+      ? runtimeHealth.taskCapabilities
+      : (agent.taskCapabilities || agent.capabilities || AGENT_DEFAULTS.capabilities)
+  );
+  return createUnknownRuntimeHealth({
+    ...(runtimeHealth || {}),
+    outputCapabilities,
+    taskCapabilities,
+  });
+}
+
+function defaultOutputCapabilities(agent = {}) {
+  if (Array.isArray(agent.outputCapabilities) && agent.outputCapabilities.length > 0) return agent.outputCapabilities;
+  if (agent.runtimeType === 'builtin' || agent.runtimeType === 'xiaok') return ['markdown', 'html'];
+  return ['markdown'];
+}
+
+function normalizeCapabilityList(values = []) {
+  return [...new Set(
+    (Array.isArray(values) ? values : [])
+      .map(value => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+  )];
 }

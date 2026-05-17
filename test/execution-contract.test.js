@@ -90,6 +90,24 @@ test('contract validation accepts artifact manifests with filename or relativePa
   assert.equal(result.ok, true);
 });
 
+test('explicit pptx tasks reject markdown-only submissions before review', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'talk-deck',
+    title: '技术大会演讲报告',
+    brief: '最终交付物必须是 PPTX 文件（.pptx），不是 Markdown 文档。',
+    assignedAgent: 'worker',
+  });
+
+  const result = validateTaskResultAgainstContract(task, {
+    summary: '已经完成技术大会演讲报告内容，包含主题、结构、章节摘要、讲稿要点、受众分析、时间安排、演示节奏和后续建议，可以用于准备演讲材料。',
+    artifacts: [{ filename: 'talk-deck-report.md', path: 'artifacts/talk-deck-report.md', mimeType: 'text/markdown' }],
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failureClass, 'artifact_type_mismatch');
+  assert.ok(result.errors.some(e => e.includes('missing required output: pptx')));
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

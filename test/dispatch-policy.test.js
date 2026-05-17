@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { planDispatch } from '../src/core/dispatch-policy.js';
+import { createUnknownRuntimeHealth, recordProbeResult } from '../src/core/runtime-health.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -75,6 +76,68 @@ test('dispatch planning reports dependency blockers without dispatching dependen
   assert.deepEqual(plan.blocked, [
     { taskId: 'draft', reason: 'dependency_pending', dependencies: ['research'] },
   ]);
+});
+
+test('dispatch planning can skip assigned agents that are not capable of required outputs', () => {
+  const now = 1779050000000;
+  const plan = planDispatch({
+    projectId: 'proj-a',
+    tasks: [
+      {
+        id: 'deck',
+        title: '技术大会演讲报告',
+        brief: '最终交付物必须是 PPTX 文件（.pptx）。',
+        status: 'pending',
+        assignedAgent: 'worker-md',
+        dependencies: [],
+      },
+    ],
+    allActiveTasks: [],
+    agentProfiles: [
+      {
+        id: 'worker-md',
+        runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+          commandOk: true,
+          generationOk: true,
+          taskCapabilities: ['presentation_generation'],
+          outputCapabilities: ['markdown'],
+        }, now),
+      },
+    ],
+    now,
+  });
+
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.deepEqual(plan.skipped, [
+    { taskId: 'deck', reason: 'output_missing:pptx', agent: 'worker-md' },
+  ]);
+  assert.equal(plan.projectGate, 'waiting_for_capable_agent');
+});
+
+test('dispatch planning reroutes to a capable healthy agent when assigned agent is unavailable', () => {
+  const now = 1779050000000;
+  const healthy = recordProbeResult(createUnknownRuntimeHealth(), {
+    commandOk: true,
+    generationOk: true,
+    taskCapabilities: ['analysis'],
+    outputCapabilities: ['markdown'],
+  }, now);
+  const plan = planDispatch({
+    projectId: 'proj-a',
+    tasks: [
+      { id: 'analysis', title: '分析报告', status: 'pending', assignedAgent: 'worker-a', requiredCapabilities: ['analysis'], requiredOutputs: ['markdown'], dependencies: [] },
+    ],
+    allActiveTasks: [],
+    agentProfiles: [
+      { id: 'worker-a', runtimeHealth: { state: 'cooldown', cooldownUntil: now + 60_000, taskCapabilities: ['analysis'], outputCapabilities: ['markdown'] } },
+      { id: 'worker-b', runtimeHealth: healthy },
+    ],
+    now,
+  });
+
+  assert.deepEqual(plan.dispatchedTasks.map(t => t.assignedAgent), ['worker-b']);
+  assert.equal(plan.dispatchedTasks[0].preferredAssignedAgent, 'worker-a');
+  assert.equal(plan.dispatchedTasks[0].selectedRoute.selectedAgentId, 'worker-b');
 });
 
 let passed = 0;

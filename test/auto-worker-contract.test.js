@@ -42,12 +42,28 @@ test('worker writes restart recovery journal around artifact and submission life
 test('worker validates execution contract before submit_result', () => {
   assert.match(source, /validateTaskResultAgainstContract/);
   assert.match(source, /review-evidence\.json/);
-  assert.match(source, /failureReason:\s*['"]contract_invalid['"]/);
+  assert.match(source, /contract_invalid/);
 
   const validationIndex = source.indexOf('validateTaskResultAgainstContract');
   const submitIndex = source.indexOf("kind: 'submit_result'");
   assert.ok(validationIndex > 0);
   assert.ok(submitIndex > validationIndex);
+});
+
+test('worker forwards concrete contract failure class when validation fails', () => {
+  assert.match(source, /failureReason:\s*contractValidation\.failureClass\s*\|\|\s*['"]contract_invalid['"]/);
+});
+
+test('worker emits runtime telemetry and supports owner-checked cancel_run', () => {
+  assert.match(source, /childPid/);
+  assert.match(source, /lastStdoutAt/);
+  assert.match(source, /lastStderrAt/);
+  assert.match(source, /lastArtifactAt/);
+  assert.match(source, /setInterval\(sendRunHeartbeat/);
+  assert.match(source, /kind === ['"]cancel_run['"]/);
+  assert.match(source, /cancelActiveRun/);
+  assert.match(source, /payload\.runId !== activeRun\.runId/);
+  assert.match(source, /activeChild\.kill\(['"]SIGTERM['"]\)/);
 });
 
 let passed = 0;

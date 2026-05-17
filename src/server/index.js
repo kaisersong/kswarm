@@ -27,6 +27,14 @@ import { parseTaskId } from '../core/task-identity.js';
 import { planProjectRecovery } from '../core/recovery-planner.js';
 import { readRunJournals } from '../core/recovery-store.js';
 import { executeRecoveryAction } from '../core/recovery-executor.js';
+import { normalizeProjectForPlanRetry } from '../core/plan-retry-recovery.js';
+import { probeAgentRuntime } from '../core/runtime-probe.js';
+import { planStalledRunActions } from '../core/run-watchdog.js';
+import { recordRuntimeFailure } from '../core/runtime-health.js';
+import {
+  executePresentationPptxTask,
+  PRESENTATION_PPTX_EXECUTOR_ID,
+} from '../executors/presentation-pptx-executor.js';
 import {
   initProjectWorkspace as initProjectWorkspaceRecord,
   setProjectWorkspace as setProjectWorkspaceRecord,
@@ -41,10 +49,17 @@ const PROJECTS_DIR = join(KSWARM_HOME, 'projects');
 mkdirSync(PROJECTS_DIR, { recursive: true });
 
 // ─── Hub Instance ─────────────────────────────────────────────────
-const hub = createHub({ eventLogDir: null, silent: false, dataDir: join(KSWARM_HOME, 'state.json') });
+let agentStore = null;
+const hub = createHub({
+  eventLogDir: null,
+  silent: false,
+  dataDir: join(KSWARM_HOME, 'state.json'),
+  getAgentProfiles: () => agentStore?.list({ includeArchived: false }) || [],
+  getExecutors: () => listLocalExecutors(),
+});
 
 // ─── Agent Store ──────────────────────────────────────────────────
-const agentStore = createAgentStore();
+agentStore = createAgentStore();
 const heartbeatManager = createHeartbeatManager(hub);
 heartbeatManager.start();
 // On server start, all old worker processes are dead — reset to offline
@@ -55,6 +70,16 @@ if (resetCount > 0) console.log(`[KSwarm] Reset ${resetCount} stale agent(s) to 
 // Each project gets: workFolder/artifacts/ for outputs
 // User can set custom path, otherwise auto-created under ~/.kswarm/projects/<id>/
 const projectWorkspaces = new Map(); // projectId → { path, artifacts, custom }
+
+function listLocalExecutors() {
+  return [
+    {
+      id: PRESENTATION_PPTX_EXECUTOR_ID,
+      taskCapabilities: ['presentation_generation'],
+      outputCapabilities: ['pptx'],
+    },
+  ];
+}
 
 function initProjectWorkspace(projectId, customPath) {
   return initProjectWorkspaceRecord(projectWorkspaces, PROJECTS_DIR, projectId, customPath);
@@ -114,6 +139,7 @@ let brokerClient = null;
 let recoveryRunning = false;
 let watchdogStarted = false;
 let watchdog = null;
+let stalledRunWatchdogTimer = null;
 
 async function sendBrokerRequestTasks(projectId, taskIds = []) {
   if (!brokerClient || !brokerClient.isConnected() || taskIds.length === 0) return;
@@ -125,6 +151,12 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
     if (!task?.assignedAgent) continue;
+    if (task.selectedRoute?.selectedExecutorId === PRESENTATION_PPTX_EXECUTOR_ID || task.assignedAgent === PRESENTATION_PPTX_EXECUTOR_ID) {
+      executeLocalPptxTask(projectId, task.id).catch(err => {
+        log('error', `Local PPTX executor failed for ${task.id}`, { projectId, error: err.message });
+      });
+      continue;
+    }
     try {
       await brokerClient.sendTo(task.assignedAgent, 'request_task', {
         taskId: task.id,
@@ -146,6 +178,52 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
     } catch (err) {
       log('warn', `Failed to send request_task to ${task.assignedAgent}`, { projectId, taskId: task.id, error: err.message });
     }
+  }
+}
+
+async function executeLocalPptxTask(projectId, taskId) {
+  const project = hub.getProject(projectId);
+  const board = hub.getBoard(projectId);
+  const task = board?.getTask(taskId);
+  if (!project || !task) return;
+  const ws = getProjectWorkspace(projectId);
+  const runId = task.activeRunId;
+  const executorId = PRESENTATION_PPTX_EXECUTOR_ID;
+
+  hub.handleAcceptTask(projectId, task.id, executorId, runId);
+  hub.handleProgress(projectId, task.id, 'started', executorId, runId, {
+    startedAt: Date.now(),
+    lastHeartbeatAt: Date.now(),
+  });
+
+  const generated = await executePresentationPptxTask({
+    projectId,
+    task,
+    workspacePath: ws.path,
+  });
+  if (!generated.ok) {
+    hub.handleWorkerFailure(projectId, task.id, executorId, runId, 'runtime_generation_unavailable', generated.error || 'pptx executor failed');
+    return;
+  }
+
+  const result = {
+    projectId,
+    taskId: task.id,
+    localTaskId: task.localTaskId,
+    runId,
+    participantId: executorId,
+    summary: generated.summary,
+    artifacts: generated.artifacts,
+    delivery: generated.delivery,
+    deliveryMode: generated.deliveryMode,
+  };
+  const submitted = hub.handleSubmitResult(projectId, task.id, result, executorId, runId);
+  broadcast({ type: 'task_update', projectId, taskId: task.id, status: submitted.ok ? 'submitted' : 'failed', agent: executorId, result: submitted });
+  if (submitted.ok && brokerClient && brokerClient.isConnected() && project.poAgent) {
+    await brokerClient.sendTo(project.poAgent, 'review_submission', {
+      taskId: task.id,
+      payload: { projectId, taskId: task.id, fromWorker: executorId, result },
+    });
   }
 }
 
@@ -288,7 +366,7 @@ function handleBrokerIntent(intent) {
     case 'report_progress': {
       const resolved = resolveIncomingTask(taskId, payload);
       if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
-      const result = hub.handleProgress(resolved.projectId, resolved.taskId, payload?.stage, fromParticipantId, payload?.runId);
+      const result = hub.handleProgress(resolved.projectId, resolved.taskId, payload?.stage, fromParticipantId, payload?.runId, payload?.telemetry);
       if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
       log('info', `Progress on task: ${resolved.taskId}`, { stage: payload?.stage, worker: fromParticipantId, projectId: resolved.projectId });
       broadcast({ type: 'task_update', projectId: resolved.projectId, taskId: resolved.taskId, status: 'in_progress', stage: payload?.stage, agent: fromParticipantId });
@@ -297,6 +375,7 @@ function handleBrokerIntent(intent) {
     case 'task_failed': {
       const resolved = resolveIncomingTask(taskId, payload);
       if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
+      recordAgentRuntimeFailure(fromParticipantId, payload?.failureReason, payload?.errorMessage);
       const result = hub.handleWorkerFailure(
         resolved.projectId,
         resolved.taskId,
@@ -313,7 +392,7 @@ function handleBrokerIntent(intent) {
         retried: result.retried,
       });
       broadcast({ type: 'task_failed', projectId: resolved.projectId, taskId: resolved.taskId, agent: fromParticipantId, ...result });
-      if (result.retried && result.retryTaskId) {
+      if (result.retryDispatched && result.retryTaskId) {
         sendBrokerRequestTasks(resolved.projectId, [result.retryTaskId]).catch(() => {});
       }
       break;
@@ -322,7 +401,10 @@ function handleBrokerIntent(intent) {
       const resolved = resolveIncomingTask(taskId, payload);
       if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
       const result = hub.handleSubmitResult(resolved.projectId, resolved.taskId, payload, fromParticipantId, payload?.runId);
-      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      if (!result.ok) {
+        recordAgentRuntimeFailure(fromParticipantId, result.failureClass, result.errors?.join('; ') || result.error);
+        return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      }
       log('info', `Task submitted: ${resolved.taskId}`, { worker: fromParticipantId, projectId: resolved.projectId });
       broadcast({ type: 'task_update', projectId: resolved.projectId, taskId: resolved.taskId, status: 'submitted', agent: fromParticipantId });
 
@@ -711,6 +793,9 @@ async function handleRequest(req, res) {
       const projectId = retryPlanMatch[1];
       const project = hub.getProject(projectId);
       if (!project) return json(res, { error: 'project_not_found' }, 404);
+      const board = hub.getBoard(projectId);
+      const normalized = normalizeProjectForPlanRetry(project, board?.getAllTasks() || []);
+      if (!normalized.ok) return json(res, { ok: false, error: normalized.error }, 409);
 
       // Auto-start PO and member agents
       if (project?.poAgent) {
@@ -720,10 +805,7 @@ async function handleRequest(req, res) {
         }
       }
 
-      // Reset plan state
-      project.plan = null;
-      project.planArtifact = null;
-      if (project.status === 'planning') project.status = 'created';
+      hub.persistState();
 
       // Send assign_po intent via brokerClient
       if (brokerClient && brokerClient.isConnected() && project.poAgent) {
@@ -733,9 +815,9 @@ async function handleRequest(req, res) {
         }).catch(err => log('warn', 'Failed to send assign_po intent', { error: err.message }));
       }
 
-      log('info', `Plan retry triggered for project: ${projectId}`, { po: project.poAgent });
-      broadcast({ type: 'plan_retry', projectId, po: project.poAgent });
-      return json(res, { ok: true, retried: true });
+      log('info', `Plan retry triggered for project: ${projectId}`, { po: project.poAgent, previousStatus: normalized.previousStatus, status: project.status });
+      broadcast({ type: 'plan_retry', projectId, po: project.poAgent, previousStatus: normalized.previousStatus, status: project.status });
+      return json(res, { ok: true, retried: true, ...normalized });
     }
     const planSubmitMatch = path.match(/^\/projects\/([^/]+)\/plan$/);
     if (planSubmitMatch && req.method === 'POST') {
@@ -1133,7 +1215,7 @@ async function handleRequest(req, res) {
       if (result.ok) {
         log('info', `Task failed: ${taskId}`, { projectId, failureReason: result.failureReason, retried: result.retried });
         broadcast({ type: 'task_failed', projectId, taskId, ...result });
-        if (result.retried && result.retryTaskId) {
+        if (result.retryDispatched && result.retryTaskId) {
           await sendBrokerRequestTasks(projectId, [result.retryTaskId]);
         }
       }
@@ -1576,45 +1658,10 @@ async function handleRequest(req, res) {
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
 
-      const result = { agentId, runtimeType: agent.runtimeType || null, runtimePath: agent.runtimePath || null };
-
-      if (!agent.runtimeType || agent.runtimeType === 'builtin') {
-        result.probe = 'skip';
-        result.message = 'No CLI runtime (builtin/API mode)';
-        result.healthy = true;
-        return json(res, result);
-      }
-
-      if (!agent.runtimePath) {
-        result.probe = 'fail';
-        result.message = 'runtimePath not set';
-        result.healthy = false;
-        return json(res, result);
-      }
-
-      // Run <cli> --version or --help with a short timeout
-      try {
-        const { execSync } = await import('node:child_process');
-        const versionCmd = `"${agent.runtimePath}" --version`;
-        const output = execSync(versionCmd, { encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        result.probe = 'ok';
-        result.version = output.split('\n')[0].slice(0, 100);
-        result.healthy = true;
-      } catch (err) {
-        // --version failed, try --help
-        try {
-          const { execSync } = await import('node:child_process');
-          const helpCmd = `"${agent.runtimePath}" --help`;
-          execSync(helpCmd, { encoding: 'utf-8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
-          result.probe = 'ok';
-          result.version = '(--help ok)';
-          result.healthy = true;
-        } catch (err2) {
-          result.probe = 'fail';
-          result.message = err2.message?.slice(0, 200) || 'CLI not responding';
-          result.healthy = false;
-        }
-      }
+      const result = await probeAgentRuntime(agent, {
+        enableGenerationProbe: process.env.KSWARM_ENABLE_GENERATION_PROBE === 'true',
+      });
+      if (result.runtimeHealth) agentStore.updateRuntimeHealth(agentId, result.runtimeHealth);
       return json(res, result);
     }
 
@@ -1698,4 +1745,75 @@ function startWatchdog() {
     maxRetries: 2,
   });
   watchdog.start();
+  if (!stalledRunWatchdogTimer) {
+    stalledRunWatchdogTimer = setInterval(runStalledRunWatchdog, 60_000);
+  }
+}
+
+function runStalledRunWatchdog() {
+  for (const project of hub.listProjects()) {
+    if (project.status === 'closed' || project.status === 'delivered') continue;
+    const board = hub.getBoard(project.id);
+    if (!board) continue;
+    const actions = planStalledRunActions({
+      projectId: project.id,
+      tasks: board.getAllTasks(),
+    });
+    for (const action of actions) {
+      if (action.type === 'stalled_warning') {
+        log('warn', `Stalled run warning: ${action.taskId}`, action);
+        broadcast({ type: 'run_stalled_warning', ...action });
+        continue;
+      }
+      if (action.type === 'mark_runtime_stalled') {
+        const agent = action.agentId ? agentStore.get(action.agentId) : null;
+        if (agent) {
+          agentStore.updateRuntimeHealth(action.agentId, recordRuntimeFailure(agent.runtimeHealth, {
+            failureClass: 'runtime_stalled',
+            error: action.reason,
+          }));
+        }
+        const result = hub.handleWorkerFailure(
+          action.projectId,
+          action.taskId,
+          action.agentId,
+          action.runId,
+          'runtime_stalled',
+          action.reason
+        );
+        log(result.ok ? 'warn' : 'error', `Marked run stalled: ${action.taskId}`, { ...action, result });
+        broadcast({ type: 'run_stalled', ...action, result });
+        continue;
+      }
+      if (action.type === 'request_cancel_run') {
+        if (brokerClient && brokerClient.isConnected() && action.agentId) {
+          brokerClient.sendTo(action.agentId, 'cancel_run', {
+            taskId: action.taskId,
+            payload: action,
+          }).catch(err => log('warn', `Failed to request cancel_run from ${action.agentId}`, { ...action, error: err.message }));
+        }
+      }
+    }
+  }
+}
+
+const AGENT_RUNTIME_FAILURE_CLASSES = new Set([
+  'agent_error',
+  'runtime_offline',
+  'runtime_missing',
+  'runtime_recovery',
+  'runtime_stalled',
+  'runtime_generation_unavailable',
+  'artifact_type_mismatch',
+  'artifact_invalid',
+]);
+
+function recordAgentRuntimeFailure(agentId, failureClass, errorMessage) {
+  if (!agentId || !AGENT_RUNTIME_FAILURE_CLASSES.has(failureClass)) return;
+  const agent = agentStore.get(agentId);
+  if (!agent) return;
+  agentStore.updateRuntimeHealth(agentId, recordRuntimeFailure(agent.runtimeHealth, {
+    failureClass,
+    error: errorMessage || failureClass,
+  }));
 }

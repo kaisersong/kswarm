@@ -21,8 +21,11 @@ import { getActiveTasksAcrossBoards, planDispatch } from './dispatch-policy.js';
 import { superviseTaskFailure } from './failure-supervisor.js';
 import { deriveProjectHealth } from './project-health.js';
 import { validateTaskResultAgainstContract } from './execution-contract.js';
+import { inferTaskRequirements } from './task-requirements.js';
+import { validateDeliverableContract } from './deliverable-contract.js';
+import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {}) {
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getExecutors = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
@@ -78,6 +81,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
       projectId,
       tasks: board.getAllTasks(),
       allActiveTasks: getActiveTasksAcrossBoards(boards),
+      agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
+      executors: typeof getExecutors === 'function' ? getExecutors() : [],
     });
   }
 
@@ -191,11 +196,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     if (!bridge) return { ok: false, error: 'no_bridge' };
-
-    // Reset plan so PO can create a new one
-    project.plan = null;
-    project.planArtifact = null;
-    if (project.status === 'planning') project.status = 'created';
+    const board = boards.get(projectId);
+    const normalized = normalizeProjectForPlanRetry(project, board?.getAllTasks() || []);
+    if (!normalized.ok) return normalized;
 
     bridge.send({
       type: 'intent', kind: 'assign_po',
@@ -203,8 +206,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
       payload: { name: project.name, goal: project.goal },
     });
 
-    eventLog.emit('plan.retry', { projectId, po: project.poAgent });
-    return { ok: true };
+    eventLog.emit('plan.retry', { projectId, po: project.poAgent, previousStatus: normalized.previousStatus });
+    return { ok: true, ...normalized };
   }
 
   /**
@@ -327,7 +330,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
     const dispatched = [];
 
     for (const task of dispatchPlan.dispatchedTasks) {
-      const result = board.transition(task.id, 'dispatched');
+      const result = board.transition(task.id, 'dispatched', {
+        assignedAgent: task.assignedAgent,
+        selectedRoute: task.selectedRoute || null,
+      });
       if (!result.ok) continue;
 
       if (bridge) {
@@ -427,22 +433,52 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
       const retryTask = createRetryTask(task);
       const added = board.addTasksChecked([retryTask]);
       if (!added.ok) return added;
+      const retryTaskId = added.taskIds[0];
+      const storedRetryTask = board.getTask(retryTaskId);
+      const retryDispatchPlan = storedRetryTask ? planDispatch({
+        projectId,
+        tasks: [storedRetryTask],
+        allActiveTasks: getActiveTasksAcrossBoards(boards),
+        agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
+        executors: typeof getExecutors === 'function' ? getExecutors() : [],
+      }) : { dispatchedTasks: [], skipped: [] };
 
-      // Auto-assign to same agent
-      if (retryTask.assignedAgent) {
-        board.transition(retryTask.id, 'dispatched', { assignedAgent: retryTask.assignedAgent });
+      let retryDispatched = false;
+      let retryDispatchError = null;
+      const routedRetry = retryDispatchPlan.dispatchedTasks[0];
+      if (routedRetry) {
+        const dispatchedRetry = board.transition(routedRetry.id, 'dispatched', {
+          assignedAgent: routedRetry.assignedAgent,
+          preferredAssignedAgent: routedRetry.preferredAssignedAgent || null,
+          selectedRoute: routedRetry.selectedRoute || null,
+        });
+        retryDispatched = dispatchedRetry.ok;
+        retryDispatchError = dispatchedRetry.ok ? null : dispatchedRetry.error;
       }
+      const finalRetryTask = board.getTask(retryTaskId);
 
       eventLog.emit('task.retry', {
         projectId,
         originalTaskId: task.id,
-        retryTaskId: added.taskIds[0],
+        retryTaskId,
         attempt: retryTask.attempt,
         failureReason: reason,
-        assignedAgent: retryTask.assignedAgent,
+        assignedAgent: finalRetryTask?.assignedAgent || retryTask.assignedAgent,
+        retryDispatched,
+        skipped: retryDispatchPlan.skipped,
       });
 
-      return { ok: true, taskId: task.id, retried: true, retryTaskId: added.taskIds[0], attempt: retryTask.attempt, failureReason: reason };
+      return {
+        ok: true,
+        taskId: task.id,
+        retried: true,
+        retryTaskId,
+        retryDispatched,
+        retryDispatchError,
+        retryDispatchSkipped: retryDispatchPlan.skipped,
+        attempt: retryTask.attempt,
+        failureReason: reason,
+      };
     }
 
     return { ok: true, taskId: task.id, retried: false, failureReason: reason };
@@ -500,7 +536,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
     return result;
   }
 
-  function handleProgress(projectId, taskId, stage, workerAgent, runId) {
+  function handleProgress(projectId, taskId, stage, workerAgent, runId, telemetry = null) {
     const board = boards.get(projectId);
     if (!board) return { ok: false, error: 'project_not_found' };
 
@@ -512,9 +548,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
     if (stage === 'started') {
       if (task.status === 'in_progress') {
         result = { ok: true, alreadyInProgress: true, taskId: task.id };
+        if (telemetry) board.updateRunTelemetry(task.id, telemetry);
       } else {
-        result = board.transition(task.id, 'in_progress');
+        result = board.transition(task.id, 'in_progress', telemetry ? { runTelemetry: telemetry } : {});
       }
+    } else if (telemetry) {
+      result = board.updateRunTelemetry(task.id, telemetry);
     }
     if (!result.ok) return result;
     eventLog.emit('task.progress', { projectId, taskId: task.id, taskTitle: task?.title, stage, agent: workerAgent });
@@ -556,6 +595,42 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
     }
     const runCheck = board.validateRun(task.id, runId, workerAgent);
     if (!runCheck.ok) return runCheck;
+
+    const deliverableValidation = validateSubmittedDeliverables(task, result);
+    if (!deliverableValidation.ok) {
+      task.rejectedSubmissions = Array.isArray(task.rejectedSubmissions) ? task.rejectedSubmissions : [];
+      task.rejectedSubmissions.push({
+        at: Date.now(),
+        fromAgent: workerAgent,
+        runId,
+        failureClass: deliverableValidation.failureClass,
+        errors: deliverableValidation.errors,
+        missing: deliverableValidation.missing,
+        result,
+      });
+      const failed = board.transition(task.id, 'failed', {
+        failureReason: deliverableValidation.failureClass,
+        failureClass: deliverableValidation.failureClass,
+      });
+      eventLog.emit('task.submission_rejected', {
+        projectId,
+        taskId: task.id,
+        taskTitle: task.title,
+        agent: workerAgent,
+        failureClass: deliverableValidation.failureClass,
+        errors: deliverableValidation.errors,
+        missing: deliverableValidation.missing,
+      });
+      return {
+        ok: false,
+        error: 'deliverable_contract_failed',
+        failureClass: deliverableValidation.failureClass,
+        errors: deliverableValidation.errors,
+        missing: deliverableValidation.missing,
+        transition: failed,
+      };
+    }
+
     const transResult = board.transition(task.id, 'submitted', { result, runId });
     if (!transResult.ok) return transResult;
 
@@ -573,6 +648,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir } = {})
       });
     }
     return { ok: true };
+  }
+
+  function validateSubmittedDeliverables(task, result = {}) {
+    const requirements = inferTaskRequirements(task);
+    const hardOutputs = (requirements.requiredOutputs || []).filter(output => output.enforcement === 'hard');
+    if (hardOutputs.length === 0) return { ok: true, errors: [], missing: [], failureClass: null };
+    return validateDeliverableContract({
+      requiredOutputs: hardOutputs,
+      artifacts: [
+        ...(Array.isArray(result.artifacts) ? result.artifacts : []),
+        ...(Array.isArray(result.artifactManifest) ? result.artifactManifest : []),
+      ],
+      workspacePath: result.workspacePath || result.workFolder || '',
+    });
   }
 
   function handleRecoverSubmission(projectId, taskId, result, fromAgent, meta = {}) {

@@ -41,9 +41,10 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 1. **PO 生成 Plan** — 深度分析目标，分阶段任务拆解，每项给出验收标准
 2. **人类审批** — 在执行开始前审核计划
 3. **阶段感知派发** — 只派发当前阶段的任务；下一阶段等待
-4. **质量验收** — PO 读取实际产物内容，对照验收标准评估
-5. **返工循环** — 验收不通过的任务带具体反馈打回
-6. **自动汇总** — 所有阶段完成后，PO 生成最终交付物
+4. **运行时安全执行** — 派发会结合 agent 健康、能力和 active-run lease
+5. **质量验收** — PO 读取实际产物内容，对照验收标准评估
+6. **返工循环** — 验收不通过的任务带具体反馈打回
+7. **自动汇总** — 所有阶段完成后，PO 生成最终交付物
 
 ### 核心设计决策
 
@@ -53,7 +54,9 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 | PO Agent 做所有决策 | 规划、派发策略、质量门控——一个负责人 |
 | 关键节点需人类确认 | 审批计划、关闭项目——人类始终有最终控制权 |
 | 阶段感知派发 | 防止过早并行执行；尊重依赖链 |
-| 离线 worker 自动接管 | 如果分配的 worker 不在线，PO 自动接管执行 |
+| Runtime 健康门控 | 在线但无法执行的 agent 会被降级、冷却并绕开 |
+| 交付物合同 | PPTX 等强输出要求会在 PO 验收前校验 |
+| 可恢复规划 | PO 制定计划中断后可在项目详情页重新制定计划 |
 
 ---
 
@@ -65,7 +68,11 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 - **任务状态机** — `pending → dispatched → accepted → in_progress → submitted → done`，含返工循环
 - **质量验收** — PO 读取产物内容（不只看文件名），评估实质性
 - **阶段感知派发** — 只派发最早未完成阶段的任务；防止过早并行
-- **离线接管** — PO 自动检测离线 worker 并接管执行
+- **能力感知路由** — 派发和失败重试会选择健康且具备任务/输出能力的 agent
+- **Runtime Watchdog** — 通过 heartbeat、stdout/stderr telemetry 和 stale-run 检测避免 CLI 静默卡死
+- **交付物合同** — 显式 PPTX/HTML/Markdown 任务会在验收前校验产物类型
+- **计划重试恢复** — PO 制定计划阶段中断的项目可安全重新启动规划
+- **本地 PPTX 兜底** — 没有 agent 能生成 PPTX 时，演示任务可使用确定性本地执行器
 - **持久化** — 项目数据在服务器重启后保留（防抖 JSON 状态文件）
 
 ### Web UI
@@ -144,6 +151,7 @@ curl -X POST http://localhost:4400/projects \
 | `/projects` | POST | 创建项目 |
 | `/projects/:id` | GET | 项目详情（任务、计划、产物） |
 | `/projects/:id/approve` | POST | 审批项目（开始执行） |
+| `/projects/:id/retry-plan` | POST | PO 制定计划中断或过期后重新触发规划 |
 | `/projects/:id/plan` | POST | PO 提交结构化计划 |
 | `/projects/:id/dispatch` | POST | 派发可用任务 |
 | `/projects/:id/tasks/:taskId/review` | POST | PO 质量验收 |
@@ -181,7 +189,7 @@ kswarm/
 │   └── net/
 │       └── broker-client.js  # Intent Broker WebSocket 客户端
 ├── scripts/
-│   └── auto-worker.js       # PO + Worker agent 运行时
+│   └── auto-worker.js       # PO + Worker agent 运行时，含 run telemetry
 ├── web/
 │   └── src/                  # React + Tailwind 前端
 ├── test/                     # 单元测试 + 集成测试
@@ -201,14 +209,16 @@ kswarm/
 ## 测试
 
 ```bash
-npm test              # 全部测试（80 个场景）
-npm run test:hub      # Hub 单元测试
-npm run test:plan     # Plan flow 集成测试
+npm test              # 默认场景套件
+npm run test:all      # 完整单元/集成/E2E 回归套件
+npm run test:e2e-p0   # P0 集成场景
 ```
 
 ---
 
 ## 版本历史
+
+**v0.7.0** — 可靠执行加固：runtime 探测与健康冷却、基于能力的派发/重试路由、带 heartbeat/stdout/stderr telemetry 的卡住运行 watchdog、PPTX/HTML/Markdown 强交付物合同、确定性本地 PPTX fallback、active run 重启恢复，以及 PO 制定计划中断后的重试入口。
 
 **v0.6.0** — Plan-Do 执行模式：结构化计划含阶段、质量验收读取产物内容、阶段感知派发、离线 worker 自动接管（PO 代执行）、返工循环、重启后持久化。
 

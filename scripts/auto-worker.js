@@ -66,6 +66,79 @@ function writeTaskJournal(workFolder, {
 let agentConfig = null;  // Full agent definition from server
 let llm = null;          // LLM provider instance
 let agentInstructions = ''; // System prompt from agent config
+let activeRun = null;
+let activeChild = null;
+let activeTelemetry = null;
+let heartbeatTimer = null;
+
+function startRunTelemetry({ projectId, taskId, localTaskId, runId }) {
+  if (!runId) return;
+  activeRun = { projectId, taskId, localTaskId, runId };
+  activeTelemetry = {
+    childPid: null,
+    startedAt: Date.now(),
+    lastHeartbeatAt: Date.now(),
+    lastStdoutAt: null,
+    lastStderrAt: null,
+    lastArtifactAt: null,
+  };
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(sendRunHeartbeat, 30_000);
+}
+
+function stopRunTelemetry() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  activeRun = null;
+  activeChild = null;
+  activeTelemetry = null;
+}
+
+function registerActiveChild(child) {
+  activeChild = child;
+  if (activeTelemetry) activeTelemetry.childPid = child.pid;
+}
+
+function clearActiveChild(child) {
+  if (activeChild === child) activeChild = null;
+}
+
+function noteStdout() {
+  if (activeTelemetry) activeTelemetry.lastStdoutAt = Date.now();
+}
+
+function noteStderr() {
+  if (activeTelemetry) activeTelemetry.lastStderrAt = Date.now();
+}
+
+function noteArtifact() {
+  if (activeTelemetry) activeTelemetry.lastArtifactAt = Date.now();
+}
+
+async function sendRunHeartbeat() {
+  if (!activeRun || !activeTelemetry) return;
+  activeTelemetry.lastHeartbeatAt = Date.now();
+  try {
+    await client.sendIntent({
+      kind: 'report_progress',
+      taskId: activeRun.taskId,
+      threadId: `thread-${activeRun.taskId}`,
+      payload: {
+        ...activeRun,
+        stage: 'heartbeat',
+        telemetry: { ...activeTelemetry },
+      },
+    });
+  } catch (_) { /* heartbeat best effort */ }
+}
+
+async function cancelActiveRun(payload = {}) {
+  if (!activeRun || payload.runId !== activeRun.runId) return { ok: false, error: 'run_mismatch' };
+  if (!activeChild || activeChild.pid !== activeTelemetry?.childPid) return { ok: false, error: 'child_mismatch' };
+  if (!activeChild.killed) activeChild.kill('SIGTERM');
+  await sendRunHeartbeat();
+  return { ok: true };
+}
 
 async function loadAgentConfig() {
   // Try to fetch from server
@@ -276,11 +349,13 @@ function runClaude(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       const lines = chunk.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
@@ -311,9 +386,10 @@ function runClaude(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`claude exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -321,7 +397,7 @@ function runClaude(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
 
     // Send prompt via stdin
     child.stdin.write(prompt);
@@ -346,11 +422,13 @@ function runCodex(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       const lines = chunk.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
@@ -367,9 +445,10 @@ function runCodex(binPath, prompt, model, workFolder) {
         }
       }
     });
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`codex exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -377,7 +456,7 @@ function runCodex(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
   });
 }
 
@@ -398,12 +477,14 @@ function runOpencode(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
     let buffer = ''; // Handle partial JSON lines
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       buffer += chunk.toString();
       const lines = buffer.split('\n');
       // Keep last potentially incomplete line in buffer
@@ -429,9 +510,10 @@ function runOpencode(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`opencode exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -439,7 +521,7 @@ function runOpencode(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
   });
 }
 
@@ -459,11 +541,13 @@ function runGemini(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       const lines = chunk.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
@@ -485,9 +569,10 @@ function runGemini(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`gemini exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -495,7 +580,7 @@ function runGemini(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
   });
 }
 
@@ -516,11 +601,13 @@ function runQoder(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       const lines = chunk.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
@@ -547,9 +634,10 @@ function runQoder(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`qodercli exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -557,7 +645,7 @@ function runQoder(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
   });
 }
 
@@ -578,11 +666,13 @@ function runXiaok(binPath, prompt, model, workFolder) {
       env: { ...process.env, ...(agentConfig.customEnv || {}) },
       timeout: CLI_TIMEOUT,
     });
+    registerActiveChild(child);
 
     let output = '';
     let stderr = '';
 
     child.stdout.on('data', (chunk) => {
+      noteStdout();
       const lines = chunk.toString().split('\n').filter(Boolean);
       for (const line of lines) {
         try {
@@ -605,9 +695,10 @@ function runXiaok(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { noteStderr(); stderr += chunk.toString(); });
 
     child.on('close', (code) => {
+      clearActiveChild(child);
       if (code !== 0 && !output) {
         reject(new Error(`xiaok exited ${code}: ${stderr.slice(0, 200)}`));
       } else {
@@ -615,7 +706,7 @@ function runXiaok(binPath, prompt, model, workFolder) {
       }
     });
 
-    child.on('error', (err) => reject(err));
+    child.on('error', (err) => { clearActiveChild(child); reject(err); });
   });
 }
 
@@ -651,6 +742,9 @@ async function handleIntent(intent) {
   } else if (kind === 'request_task' && taskId) {
     console.log(`[${ALIAS}] Received task: ${payload?.title || taskId}`);
     await doTask(taskId, payload);
+  } else if (kind === 'cancel_run' && payload?.runId) {
+    console.log(`[${ALIAS}] Received cancel_run for: ${payload.runId}`);
+    await cancelActiveRun(payload);
   } else if (kind === 'respond_approval' && payload?.decision === 'approved') {
     console.log(`[${ALIAS}] 📋 Project approved, auto-dispatching...`);
     await handleApprovalReceived(payload.projectId);
@@ -1858,6 +1952,7 @@ async function doTask(taskId, payload) {
   const goal = projectGoal || poInfo?.goal || '';
   const requirements = projectRequirements || poInfo?.requirements || '';
   writeTaskJournal(workFolder, { projectId, taskId, localTaskId, runId, status: 'received' });
+  startRunTelemetry({ projectId, taskId, localTaskId, runId });
 
   reportStatus('working');
 
@@ -1879,7 +1974,7 @@ async function doTask(taskId, payload) {
     kind: 'report_progress',
     taskId,
     threadId: `thread-${taskId}`,
-    payload: { projectId, taskId, localTaskId, runId, stage: 'started', body: { message: `Working on ${title}...` } },
+    payload: { projectId, taskId, localTaskId, runId, stage: 'started', telemetry: activeTelemetry ? { ...activeTelemetry } : undefined, body: { message: `Working on ${title}...` } },
   });
 
   // Read project directory context ONLY if requirements mention file access
@@ -1949,6 +2044,7 @@ async function doTask(taskId, payload) {
         errorMessage: `CLI and LLM both failed to generate output for "${title}"`,
       },
     });
+    stopRunTelemetry();
     return;
   }
 
@@ -1975,6 +2071,7 @@ async function doTask(taskId, payload) {
     for (const file of artifactFiles) {
       writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
     }
+    noteArtifact();
     writeTaskJournal(workFolder, {
       projectId,
       taskId,
@@ -2045,10 +2142,11 @@ async function doTask(taskId, payload) {
         taskId,
         localTaskId,
         runId,
-        failureReason: 'contract_invalid',
+        failureReason: contractValidation.failureClass || 'contract_invalid',
         errorMessage,
       },
     });
+    stopRunTelemetry();
     return;
   }
 
@@ -2081,6 +2179,7 @@ async function doTask(taskId, payload) {
     submission: { attemptedAt: Date.now(), ackedAt: Date.now(), lastError: null },
   });
   reportStatus('idle');
+  stopRunTelemetry();
 
   // If we are PO for this project, quality review (not just auto-confirm)
   if (projectId && poProjects.has(projectId)) {

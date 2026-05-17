@@ -41,9 +41,10 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 1. **PO generates a Plan** — Deep analysis, phased task breakdown, acceptance criteria per item
 2. **Human approves** — Review the plan before execution starts
 3. **Phase-aware dispatch** — Only the current phase's tasks are dispatched; next phase waits
-4. **Quality review** — PO reads actual artifact content and evaluates against acceptance criteria
-5. **Rework loop** — Failed reviews send tasks back with specific feedback
-6. **Auto-synthesis** — When all phases complete, PO generates a final deliverable
+4. **Runtime-safe execution** — dispatch routes through agent health, capability, and active-run leases
+5. **Quality review** — PO reads actual artifact content and evaluates against acceptance criteria
+6. **Rework loop** — Failed reviews send tasks back with specific feedback
+7. **Auto-synthesis** — When all phases complete, PO generates a final deliverable
 
 ### Key Design Decisions
 
@@ -53,7 +54,9 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 | PO Agent makes all decisions | Planning, dispatch strategy, quality gates — one accountable owner |
 | Human gates at key moments | Approve plans, close projects — human stays in control |
 | Phase-aware dispatch | Prevents premature parallel execution; respects dependency chains |
-| Offline worker fallback | If assigned worker is offline, PO takes over execution automatically |
+| Runtime health gates | Agents that are online but unable to execute are degraded, cooled down, and routed around |
+| Deliverable contracts | Hard output requests such as PPTX are validated before PO review |
+| Recoverable planning | Interrupted PO planning can be retried from the project detail page |
 
 ---
 
@@ -65,7 +68,11 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 - **Task State Machine** — `pending → dispatched → accepted → in_progress → submitted → done` with rework loop
 - **Quality Review** — PO reads artifact content (not just filenames) and evaluates substance
 - **Phase-aware Dispatch** — Only earliest incomplete phase dispatches; prevents premature parallel work
-- **Offline Fallback** — PO auto-detects offline workers and takes over execution
+- **Capability-aware Routing** — Retries and dispatches route to healthy agents with matching task/output capability
+- **Runtime Watchdogs** — Heartbeats, stdout/stderr telemetry, and stale-run detection prevent silent CLI hangs
+- **Deliverable Contracts** — Explicit PPTX/HTML/Markdown tasks are validated before review
+- **Plan Retry Recovery** — Projects interrupted during PO planning can be restarted safely
+- **Local PPTX Fallback** — Presentation tasks can use a deterministic local executor when no agent can produce PPTX
 - **Persistence** — Projects survive server restarts (debounced JSON state file)
 
 ### Web UI
@@ -144,6 +151,7 @@ Created → [Human Approves] → Active → [Tasks Execute] → Delivered → [H
 | `/projects` | POST | Create project |
 | `/projects/:id` | GET | Project detail (tasks, plan, artifacts) |
 | `/projects/:id/approve` | POST | Approve project (starts execution) |
+| `/projects/:id/retry-plan` | POST | Re-trigger PO planning after an interrupted or stale plan attempt |
 | `/projects/:id/plan` | POST | PO submits structured plan |
 | `/projects/:id/dispatch` | POST | Dispatch available tasks |
 | `/projects/:id/tasks/:taskId/review` | POST | PO quality review |
@@ -181,7 +189,7 @@ kswarm/
 │   └── net/
 │       └── broker-client.js  # Intent Broker WebSocket client
 ├── scripts/
-│   └── auto-worker.js       # PO + Worker agent runtime
+  │   └── auto-worker.js       # PO + Worker agent runtime with run telemetry
 ├── web/
 │   └── src/                  # React + Tailwind frontend
 ├── test/                     # Unit + integration tests
@@ -201,14 +209,16 @@ kswarm/
 ## Testing
 
 ```bash
-npm test              # All tests (80 scenarios)
-npm run test:hub      # Hub unit tests
-npm run test:plan     # Plan flow integration tests
+npm test              # Default scenario suite
+npm run test:all      # Full unit/integration/e2e regression suite
+npm run test:e2e-p0   # P0 integration scenarios
 ```
 
 ---
 
 ## Version History
+
+**v0.7.0** — Reliable execution hardening: runtime probes and health cooldowns, capability-aware dispatch/retry routing, stalled-run watchdogs with heartbeat/stdout/stderr telemetry, strict deliverable contracts for PPTX/HTML/Markdown tasks, deterministic local PPTX fallback, restart recovery for active runs, and retryable planning when the PO planning phase is interrupted.
 
 **v0.6.0** — Plan-Do execution model: structured planning with phases, quality review with artifact content reading, phase-aware dispatch, offline worker fallback (PO auto-takes-over), rework loop, persistence across restarts.
 

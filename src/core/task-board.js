@@ -75,6 +75,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         runtimeFailureCount: task.runtimeFailureCount || 0,
         qualityFailureCount: task.qualityFailureCount || 0,
         qualityReviewHistory: Array.isArray(task.qualityReviewHistory) ? task.qualityReviewHistory : [],
+        rejectedSubmissions: Array.isArray(task.rejectedSubmissions) ? task.rejectedSubmissions : [],
         lastFailureClass: task.lastFailureClass || null,
         blockedAt: task.blockedAt || null,
         blockedReason: task.blockedReason || null,
@@ -85,6 +86,9 @@ export function createTaskBoard(projectId = 'legacy-project') {
         parentTaskId: task.parentTaskId || null,
         activeRunId: task.activeRunId || null,
         runLease: task.runLease || null,
+        runTelemetry: task.runTelemetry || null,
+        selectedRoute: task.selectedRoute || null,
+        preferredAssignedAgent: task.preferredAssignedAgent || null,
         lastRunLease: task.lastRunLease || null,
         recoveryStatus: task.recoveryStatus || null,
         recoveryReason: task.recoveryReason || null,
@@ -118,6 +122,15 @@ export function createTaskBoard(projectId = 'legacy-project') {
     if (Object.prototype.hasOwnProperty.call(meta, 'result')) task.result = meta.result;
     if (meta.failureReason) task.failureReason = meta.failureReason;
     if (meta.failureClass) task.lastFailureClass = meta.failureClass;
+    if (meta.selectedRoute) task.selectedRoute = meta.selectedRoute;
+    if (meta.preferredAssignedAgent) task.preferredAssignedAgent = meta.preferredAssignedAgent;
+    if (meta.runTelemetry) {
+      task.runTelemetry = {
+        ...(task.runTelemetry || {}),
+        ...meta.runTelemetry,
+        updatedAt: now,
+      };
+    }
     if (Object.prototype.hasOwnProperty.call(meta, 'qualityFailureCount')) task.qualityFailureCount = meta.qualityFailureCount;
     if (Object.prototype.hasOwnProperty.call(meta, 'runtimeFailureCount')) task.runtimeFailureCount = meta.runtimeFailureCount;
     if (newStatus === 'dispatched') {
@@ -136,6 +149,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         artifactManifest: [],
         submissionAcked: false,
       };
+      task.runTelemetry = meta.runTelemetry || null;
       task.recoveryStatus = null;
       task.recoveryReason = null;
     }
@@ -155,6 +169,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
         task.lastRunLease = { ...task.runLease, status: 'expired', expiredAt: now };
       }
       task.runLease = null;
+      task.runTelemetry = null;
+      task.selectedRoute = null;
       task.activeRunId = null;
       task.blockedAt = null;
       task.blockedReason = null;
@@ -171,6 +187,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         };
       }
       task.runLease = null;
+      if (newStatus !== 'submitted') task.runTelemetry = null;
       task.activeRunId = null;
     }
     if (newStatus === 'done') task.completedAt = now;
@@ -298,6 +315,21 @@ export function createTaskBoard(projectId = 'legacy-project') {
     return { ok: true, taskId: task.id, recoveryStatus: status, recoveryReason: reason };
   }
 
+  function updateRunTelemetry(taskId, telemetry = {}) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (!task.runLease) return { ok: false, error: 'no_active_run' };
+    const now = Date.now();
+    task.runTelemetry = {
+      ...(task.runTelemetry || {}),
+      ...telemetry,
+      updatedAt: now,
+    };
+    task.runLease.lastHeartbeatAt = telemetry.lastHeartbeatAt || now;
+    task.updatedAt = now;
+    return { ok: true, taskId: task.id };
+  }
+
   /**
    * 依赖检查：哪些 pending 任务的所有前置已 done
    */
@@ -410,6 +442,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     recoverSubmission,
     resetStaleRun,
     markRecoveryStatus,
+    updateRunTelemetry,
     resolveTaskId,
     getDispatchable,
     getDispatchableInPhase,

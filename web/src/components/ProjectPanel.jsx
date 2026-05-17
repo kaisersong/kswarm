@@ -6,7 +6,7 @@ export function ProjectPanel({ kswarm }) {
   const { t } = useT();
   const { projects, agents, participants, createProject, approveProject, getProjectDetail,
     humanAddTasks, createTasks, dispatchTasks, markTaskDone, cancelTask, deliverProject,
-    closeProject, lastTaskEvent, logs } = kswarm;
+    closeProject, retryPlan, lastTaskEvent, logs } = kswarm;
   const [showCreate, setShowCreate] = useState(false);
   const [selectedProject, setSelectedProject] = useState(null);
   const [projectDetail, setProjectDetail] = useState(null);
@@ -99,6 +99,7 @@ export function ProjectPanel({ kswarm }) {
               onCreateTasks={(tasks) => createTasks(selectedProject, tasks, projectDetail.project.poAgent)}
               onDispatch={() => dispatchTasks(selectedProject, projectDetail.project.poAgent)}
               onApprove={() => approveProject(selectedProject)}
+              onRetryPlan={() => retryPlan(selectedProject)}
               onMarkDone={(taskId) => markTaskDone(selectedProject, taskId, projectDetail.project.poAgent)}
               onCancel={(taskId) => cancelTask(selectedProject, taskId)}
               onDeliver={() => deliverProject(selectedProject, projectDetail.project.poAgent)}
@@ -283,7 +284,17 @@ function ProjectCard({ t, project, selected, agentName, onView }) {
 
 // ─── Project Detail ───────────────────────────────────────────────
 
-function ProjectDetail({ t, data, availableAgents, agents, participants, logs, agentName, onHumanAddTasks, onCreateTasks, onDispatch, onApprove, onMarkDone, onCancel, onDeliver, onClose, onRefresh, onClosePanel }) {
+const PRE_APPROVAL_STATUSES = new Set(['draft', 'created', 'planning']);
+function isInterruptedPlanProject(project, plan, tasks) {
+  return project?.status === 'active' && !plan && (tasks || []).length === 0;
+}
+
+function canRetryPlanForProject(project, plan, tasks) {
+  if (!project || project.status === 'closed' || project.status === 'delivered') return false;
+  return PRE_APPROVAL_STATUSES.has(project.status) || isInterruptedPlanProject(project, plan, tasks);
+}
+
+function ProjectDetail({ t, data, availableAgents, agents, participants, logs, agentName, onHumanAddTasks, onCreateTasks, onDispatch, onApprove, onRetryPlan, onMarkDone, onCancel, onDeliver, onClose, onRefresh, onClosePanel }) {
   const { project, tasks, activities = [], humanActions = [], workspace, plan, planProgress } = data;
   const [showAddTasks, setShowAddTasks] = useState(false);
   const [detailTab, setDetailTab] = useState(plan ? 'plan' : 'board');
@@ -292,6 +303,8 @@ function ProjectDetail({ t, data, availableAgents, agents, participants, logs, a
 
   const allDone = tasks.length > 0 && tasks.every(t => t.status === 'done');
   const isClosed = project.status === 'closed';
+  const showRetryPlan = canRetryPlanForProject(project, plan, tasks);
+  const showInterruptedPlanHint = isInterruptedPlanProject(project, plan, tasks);
 
   const TABS = [
     ...(plan ? [{ id: 'plan', label: `Plan v${plan.version}` }] : []),
@@ -324,7 +337,10 @@ function ProjectDetail({ t, data, availableAgents, agents, participants, logs, a
               )}
             </div>
           )}
-          {(project.status === 'created' || project.status === 'planning') && !plan && (
+          {showInterruptedPlanHint && (
+            <p className="text-[10px] text-yellow-500 mt-1">计划中断，可重新制定计划</p>
+          )}
+          {!showInterruptedPlanHint && (project.status === 'created' || project.status === 'planning') && !plan && (
             <p className="text-[10px] text-yellow-500 mt-1">等待 PO 制定计划...</p>
           )}
           {(project.status === 'created' || project.status === 'planning') && plan && (
@@ -332,6 +348,14 @@ function ProjectDetail({ t, data, availableAgents, agents, participants, logs, a
           )}
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          {showRetryPlan && (
+            <ActionBtn color="blue" onClick={async () => {
+              await onRetryPlan();
+              onRefresh();
+            }}>
+              重新制定计划
+            </ActionBtn>
+          )}
           {(project.status === 'created' || project.status === 'planning') && (
             <ActionBtn color="green" onClick={async () => {
               const result = await onApprove();
@@ -452,6 +476,9 @@ const AGENT_STATUS_STYLES = {
   blocked: { dot: 'bg-yellow-400', chip: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-300' },
   failed: { dot: 'bg-red-500', chip: 'border-red-500/30 bg-red-500/10 text-red-300' },
   error: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-500/40 bg-red-500/15 text-red-200' },
+  cooldown: { dot: 'bg-orange-400', chip: 'border-orange-500/30 bg-orange-500/10 text-orange-300' },
+  stalled: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-500/40 bg-red-500/15 text-red-200' },
+  artifact_mismatch: { dot: 'bg-red-500', chip: 'border-red-500/30 bg-red-500/10 text-red-300' },
   cancelled: { dot: 'bg-zinc-500', chip: 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400' },
   done: { dot: 'bg-green-400', chip: 'border-green-500/30 bg-green-500/10 text-green-300' },
   offline: { dot: 'bg-zinc-700', chip: 'border-zinc-800 bg-zinc-950/50 text-zinc-500' },

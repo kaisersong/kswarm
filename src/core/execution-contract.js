@@ -1,3 +1,6 @@
+import { validateDeliverableContract } from './deliverable-contract.js';
+import { inferTaskRequirements } from './task-requirements.js';
+
 const REVIEW_KEYWORDS = [
   'review',
   'quality',
@@ -26,6 +29,7 @@ export function isReviewLikeTask(task = {}) {
 
 export function inferExecutionContract(task = {}) {
   const reviewLike = task.evidenceContract?.kind === 'review_iteration_v1' || isReviewLikeTask(task);
+  const requirements = inferTaskRequirements(task);
   const executionContract = {
     version: 1,
     minSummaryChars: task.executionContract?.minSummaryChars ?? 50,
@@ -48,6 +52,7 @@ export function inferExecutionContract(task = {}) {
     ok: true,
     task: {
       ...task,
+      ...requirements,
       executionContract,
       evidenceContract,
     },
@@ -60,19 +65,21 @@ export function enrichTaskWithExecutionContract(task = {}) {
   return inferExecutionContract(task).task;
 }
 
-export function validateTaskResultAgainstContract(task = {}, result = {}) {
+export function validateTaskResultAgainstContract(task = {}, result = {}, options = {}) {
   const enriched = enrichTaskWithExecutionContract(task);
   const contract = enriched.executionContract || {};
   const errors = [];
   const missing = [];
+  const failureClasses = [];
 
   const summary = getSummary(result);
   if (contract.requireMeaningfulSummary !== false) {
     const min = contract.minSummaryChars ?? 50;
     if (summary.length < min || PLACEHOLDER_SUMMARIES.has(summary.toLowerCase())) {
-      errors.push(`summary must contain at least ${min} meaningful characters`);
-      missing.push('summary');
-    }
+        errors.push(`summary must contain at least ${min} meaningful characters`);
+        missing.push('summary');
+        failureClasses.push('quality_evidence_missing');
+      }
   }
 
   if (enriched.evidenceContract?.kind === 'review_iteration_v1') {
@@ -81,6 +88,7 @@ export function validateTaskResultAgainstContract(task = {}, result = {}) {
       if (!artifacts.some(name => name.endsWith(artifactName) || name === artifactName)) {
         errors.push(`missing required artifact: ${artifactName}`);
         missing.push(artifactName);
+        failureClasses.push('quality_evidence_missing');
       }
     }
 
@@ -89,8 +97,23 @@ export function validateTaskResultAgainstContract(task = {}, result = {}) {
       if (!hasMeaningfulField(evidence, field)) {
         errors.push(`missing required review evidence field: ${field}`);
         missing.push(field);
+        failureClasses.push('quality_evidence_missing');
       }
     }
+  }
+
+  const deliverableValidation = validateDeliverableContract({
+    requiredOutputs: enriched.requiredOutputs || [],
+    artifacts: [
+      ...(Array.isArray(result.artifacts) ? result.artifacts : []),
+      ...(Array.isArray(result.artifactManifest) ? result.artifactManifest : []),
+    ],
+    workspacePath: options.workspacePath || result.workspacePath || result.workFolder || '',
+  });
+  if (!deliverableValidation.ok) {
+    errors.push(...deliverableValidation.errors);
+    missing.push(...deliverableValidation.missing);
+    failureClasses.push(deliverableValidation.failureClass);
   }
 
   const ok = errors.length === 0;
@@ -98,8 +121,12 @@ export function validateTaskResultAgainstContract(task = {}, result = {}) {
     ok,
     errors,
     missing,
-    failureClass: ok ? null : 'quality_evidence_missing',
+    failureClass: ok ? null : firstFailureClass(failureClasses),
   };
+}
+
+function firstFailureClass(classes = []) {
+  return classes.find(Boolean) || 'quality_evidence_missing';
 }
 
 function getSummary(result = {}) {

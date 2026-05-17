@@ -24,6 +24,16 @@ const STATUS_LABELS = {
   review: '审核中', delivered: '已交付', closed: '已关闭',
 };
 
+const PRE_APPROVAL_STATUSES = new Set(['draft', 'created', 'planning']);
+function isInterruptedPlanProject(project, plan, tasks) {
+  return project?.status === 'active' && !plan && (tasks || []).length === 0;
+}
+
+function canRetryPlanForProject(project, plan, tasks) {
+  if (!project || project.status === 'closed' || project.status === 'delivered') return false;
+  return PRE_APPROVAL_STATUSES.has(project.status) || isInterruptedPlanProject(project, plan, tasks);
+}
+
 export function ProjectDetailPage() {
   const { projectId } = useParams();
   const navigate = useNavigate();
@@ -76,6 +86,8 @@ export function ProjectDetailPage() {
 
   const { project, tasks, activities, humanActions, workspace, plan, planProgress, projectHealth, dispatchPlan } = detail;
   const showApprove = project.status === 'created' || project.status === 'draft' || project.status === 'planning';
+  const showRetryPlan = canRetryPlanForProject(project, plan, tasks);
+  const showInterruptedPlanHint = isInterruptedPlanProject(project, plan, tasks);
   const showDispatch = project.status === 'active' && tasks.some(t => t.status === 'pending');
   const showDeliver = project.status === 'active' && tasks.every(t => t.status === 'done' || t.status === 'cancelled');
   const showClose = project.status === 'active' || project.status === 'delivered';
@@ -101,7 +113,10 @@ export function ProjectDetailPage() {
               {workspace.artifacts?.length > 0 && <span className="text-[9px] px-1 rounded bg-gray-100 text-gray-500">{workspace.artifacts.length} files</span>}
             </div>
           )}
-          {(project.status === 'created' || project.status === 'draft' || project.status === 'planning') && !plan && (
+          {showInterruptedPlanHint && (
+            <p className="text-[10px] text-yellow-400 mt-1">计划中断，可重新制定计划</p>
+          )}
+          {!showInterruptedPlanHint && (project.status === 'created' || project.status === 'draft' || project.status === 'planning') && !plan && (
             <p className="text-[10px] text-yellow-400 mt-1">等待 PO 制定计划...</p>
           )}
           {(project.status === 'created' || project.status === 'draft' || project.status === 'planning') && plan && (
@@ -109,13 +124,10 @@ export function ProjectDetailPage() {
           )}
         </div>
         <div className="flex items-center gap-2">
-          {showApprove && !plan && (
-            <button type="button" onClick={async () => {
-              await retryPlan(projectId);
-              await refreshOnce();
-            }} disabled={actionLoading === 'retry'}
+          {showRetryPlan && (
+            <button type="button" onClick={() => handleAction('retry', () => retryPlan(projectId))} disabled={actionLoading === 'retry'}
               className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-indigo-400 bg-gray-100 hover:brightness-95 disabled:opacity-50">
-              <RefreshCw size={13} /><span>重新制定计划</span>
+              <RefreshCw size={13} /><span>{actionLoading === 'retry' ? '...' : '重新制定计划'}</span>
             </button>
           )}
           {showApprove && (
@@ -222,6 +234,9 @@ const AGENT_STATUS_STYLES = {
   blocked: { dot: 'bg-yellow-500', chip: 'border-yellow-200 bg-yellow-50 text-yellow-700' },
   failed: { dot: 'bg-red-500', chip: 'border-red-200 bg-red-50 text-red-700' },
   error: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-200 bg-red-50 text-red-700' },
+  cooldown: { dot: 'bg-orange-500', chip: 'border-orange-200 bg-orange-50 text-orange-700' },
+  stalled: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-200 bg-red-50 text-red-700' },
+  artifact_mismatch: { dot: 'bg-red-500', chip: 'border-red-200 bg-red-50 text-red-700' },
   cancelled: { dot: 'bg-gray-400', chip: 'border-gray-200 bg-gray-50 text-gray-500' },
   done: { dot: 'bg-green-500', chip: 'border-green-200 bg-green-50 text-green-700' },
   offline: { dot: 'bg-gray-300', chip: 'border-gray-200 bg-gray-50 text-gray-400' },

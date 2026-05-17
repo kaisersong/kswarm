@@ -145,6 +145,53 @@ test('done, failed, cancelled, waiting, and offline states are distinguishable',
   assert.equal(byId(statuses, 'offline').status, 'offline');
 });
 
+test('runtime degraded and cooldown states are visible when agent has no active task', () => {
+  const statuses = deriveAgentStatuses({
+    project: { ...baseProject, members: ['degraded', 'cooldown'] },
+    agents: [
+      { id: 'po', name: 'PO' },
+      { id: 'degraded', name: 'Degraded', runtimeHealth: { state: 'degraded', lastError: 'auth required' } },
+      { id: 'cooldown', name: 'Cooldown', runtimeHealth: { state: 'cooldown', lastFailureClass: 'runtime_generation_unavailable', cooldownUntil: Date.now() + 60_000 } },
+    ],
+    participants: [
+      { kind: 'agent', participantId: 'po' },
+      { kind: 'agent', participantId: 'degraded' },
+      { kind: 'agent', participantId: 'cooldown' },
+    ],
+    tasks: [],
+  });
+
+  assert.equal(byId(statuses, 'degraded').status, 'error');
+  assert.match(byId(statuses, 'degraded').detail, /auth required/);
+  assert.equal(byId(statuses, 'cooldown').status, 'cooldown');
+  assert.match(byId(statuses, 'cooldown').detail, /runtime_generation_unavailable/);
+});
+
+test('runtime stalled and artifact mismatch task details are visible', () => {
+  const statuses = deriveAgentStatuses({
+    project: { ...baseProject, members: ['stalled', 'mismatch'] },
+    agents: [
+      { id: 'po', name: 'PO' },
+      { id: 'stalled', name: 'Stalled', runtimeHealth: { state: 'stalled', lastFailureClass: 'runtime_stalled' } },
+      { id: 'mismatch', name: 'Mismatch' },
+    ],
+    participants: [
+      { kind: 'agent', participantId: 'po' },
+      { kind: 'agent', participantId: 'stalled' },
+      { kind: 'agent', participantId: 'mismatch' },
+    ],
+    tasks: [
+      { id: 'proj-a__item-1', title: 'Long task', status: 'pending', assignedAgent: 'stalled' },
+      { id: 'proj-a__item-2', title: 'Deck', status: 'failed', assignedAgent: 'mismatch', lastFailureClass: 'artifact_type_mismatch', failureReason: 'artifact_type_mismatch' },
+    ],
+  });
+
+  assert.equal(byId(statuses, 'stalled').status, 'stalled');
+  assert.match(byId(statuses, 'stalled').detail, /runtime_stalled/);
+  assert.equal(byId(statuses, 'mismatch').status, 'artifact_mismatch');
+  assert.match(byId(statuses, 'mismatch').detail, /产物类型/);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

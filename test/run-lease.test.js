@@ -46,6 +46,23 @@ test('accept and progress update the run lease status and heartbeat', () => {
   assert.equal(typeof task.runLease.lastHeartbeatAt, 'number');
 });
 
+test('progress telemetry is stored on active task run', () => {
+  const board = setupBoard();
+  board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-lease-1' });
+  board.transition('item-1', 'accepted', { assignedAgent: 'worker' });
+  const result = board.transition('item-1', 'in_progress', {
+    runTelemetry: {
+    childPid: 123,
+    lastStdoutAt: 1779050000000,
+    lastStderrAt: 1779050000100,
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(board.getTask('item-1').runTelemetry.childPid, 123);
+  assert.equal(board.getTask('item-1').runTelemetry.lastStdoutAt, 1779050000000);
+});
+
 test('submit moves the active lease to lastRunLease and rejects stale later submits', () => {
   const board = setupBoard();
   board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-lease-1' });

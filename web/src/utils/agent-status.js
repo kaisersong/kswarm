@@ -8,6 +8,9 @@ const STATUS_LABELS = {
   blocked: '阻塞',
   failed: '失败',
   error: '错误',
+  cooldown: '冷却',
+  stalled: '卡住',
+  artifact_mismatch: '产物不匹配',
   cancelled: '已取消',
   done: '完成',
   offline: '离线',
@@ -62,6 +65,11 @@ export function deriveAgentStatuses({
       return withTaskStatus(base, 'blocked', hardBlockedTask, hardBlockedTask.blockedReason || '任务已阻塞');
     }
 
+    const artifactMismatchTask = assignedTasks.find(t => t.lastFailureClass === 'artifact_type_mismatch' || t.failureReason === 'artifact_type_mismatch');
+    if (artifactMismatchTask) {
+      return withTaskStatus(base, 'artifact_mismatch', artifactMismatchTask, '产物类型不符合任务要求');
+    }
+
     const failedTask = assignedTasks.find(t => t.status === 'failed');
     if (failedTask) {
       return withTaskStatus(base, 'failed', failedTask, failedTask.failureReason || '任务失败');
@@ -80,6 +88,11 @@ export function deriveAgentStatuses({
     if (agentId === poId) {
       const poStatus = derivePoStatus(project, tasks, submittedTasks, online);
       return withStatus(base, poStatus.status, poStatus);
+    }
+
+    const runtimeStatus = deriveRuntimeStatus(agent.runtimeHealth);
+    if (runtimeStatus) {
+      return withStatus(base, runtimeStatus.status, runtimeStatus);
     }
 
     const submittedTask = assignedTasks.find(t => t.status === 'submitted');
@@ -112,6 +125,29 @@ export function deriveAgentStatuses({
 
     return withStatus(base, 'waiting', { detail: '等待任务' });
   });
+}
+
+function deriveRuntimeStatus(runtimeHealth) {
+  if (!runtimeHealth?.state) return null;
+  if (runtimeHealth.state === 'cooldown') {
+    return {
+      status: 'cooldown',
+      detail: runtimeHealth.lastFailureClass || runtimeHealth.lastError || '运行时冷却中',
+    };
+  }
+  if (runtimeHealth.state === 'stalled') {
+    return {
+      status: 'stalled',
+      detail: runtimeHealth.lastFailureClass || runtimeHealth.lastError || '运行时无进展',
+    };
+  }
+  if (runtimeHealth.state === 'degraded') {
+    return {
+      status: 'error',
+      detail: runtimeHealth.lastError || runtimeHealth.lastFailureClass || '运行时不可用',
+    };
+  }
+  return null;
 }
 
 function collectProjectAgentIds(project, tasks) {
