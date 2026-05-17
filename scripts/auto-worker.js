@@ -17,6 +17,11 @@
 import { createBrokerClient } from '../src/net/broker-client.js';
 import { createProvider } from '../src/llm/provider.js';
 import { assignTasksSmartly } from '../src/core/task-matcher.js';
+import { buildArtifactManifest, writeRunJournal } from '../src/core/recovery-store.js';
+import {
+  enrichTaskWithExecutionContract,
+  validateTaskResultAgainstContract,
+} from '../src/core/execution-contract.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -27,6 +32,35 @@ const KSWARM_API = process.env.KSWARM_API || 'http://127.0.0.1:4400';
 const AGENT_ID = process.env.KSWARM_AGENT_ID || process.argv[2] || `auto-worker-${Date.now()}`;
 const ALIAS = process.argv[3] || 'AutoWorker';
 const DELAY = Number(process.env.WORK_DELAY || 2000);
+
+function writeTaskJournal(workFolder, {
+  projectId,
+  taskId,
+  localTaskId,
+  runId,
+  status,
+  artifactManifest = undefined,
+  submission = undefined,
+  errorMessage = undefined,
+}) {
+  if (!workFolder || !runId || !taskId || !projectId) return;
+  try {
+    writeRunJournal(workFolder, {
+      schemaVersion: 1,
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      agentId: AGENT_ID,
+      status,
+      artifactManifest,
+      submission,
+      errorMessage,
+    });
+  } catch (err) {
+    console.log(`[${ALIAS}]   ⚠ Failed to write recovery journal (${status}): ${err.message}`);
+  }
+}
 
 // ─── Agent Config (fetched from server or env) ───────────────────────────────
 let agentConfig = null;  // Full agent definition from server
@@ -947,12 +981,14 @@ async function qualityReviewTask(projectId, taskId, result) {
   // Get task details and acceptance criteria from plan
   let acceptanceCriteria = '';
   let taskTitle = '';
+  let taskLocalId = '';
   try {
     const projRes = await fetch(`${KSWARM_API}/projects/${projectId}`);
     if (projRes.ok) {
       const projData = await projRes.json();
       const task = (projData.tasks || []).find(t => t.id === taskId);
       taskTitle = task?.title || taskId;
+      taskLocalId = task?.localTaskId || task?.legacyTaskId || task?.planItemId || '';
       acceptanceCriteria = task?.acceptanceCriteria || '';
 
       // Try to get from plan if task has planItemId
@@ -974,8 +1010,12 @@ async function qualityReviewTask(projectId, taskId, result) {
     const artRes = await fetch(`${KSWARM_API}/projects/${projectId}/artifacts`);
     if (artRes.ok) {
       const artData = await artRes.json();
+      const resultArtifactNames = new Set((result?.artifacts || []).map(a => a.filename || a).filter(Boolean));
       const artifacts = (artData.artifacts || []).filter(a =>
-        a.filename.includes(taskId) || a.filename.includes(taskTitle.replace(/\s+/g, '-'))
+        resultArtifactNames.has(a.filename) ||
+        a.filename.includes(taskId) ||
+        (taskLocalId && a.filename.includes(taskLocalId)) ||
+        a.filename.includes(taskTitle.replace(/\s+/g, '-'))
       );
 
       for (const art of artifacts.slice(0, 3)) {
@@ -1101,6 +1141,11 @@ Strict JSON (no markdown fences):
     });
     const data = await res.json();
     if (data.ok) {
+      if (data.alreadyReviewed) {
+        console.log(`[${ALIAS}]   → Review ignored; task was already reviewed: ${taskTitle}`);
+        return;
+      }
+
       if (reviewResult.passed) {
         console.log(`[${ALIAS}]   → ✓ Quality review PASSED: ${taskTitle}`);
         console.log(`[${ALIAS}]     Feedback: ${reviewResult.feedback.slice(0, 100)}`);
@@ -1206,10 +1251,16 @@ async function synthesizeProject(projectId) {
   // Read plan and all artifacts
   let planText = '';
   let allArtifactContent = '';
+  let enableSummary = true; // default true for backwards compatibility
   try {
     const projRes = await fetch(`${KSWARM_API}/projects/${projectId}`);
     if (projRes.ok) {
       const projData = await projRes.json();
+
+      // Read enableSummary from project
+      if (projData.project && projData.project.enableSummary === false) {
+        enableSummary = false;
+      }
 
       // Plan info
       if (projData.plan) {
@@ -1231,7 +1282,7 @@ async function synthesizeProject(projectId) {
     }
   } catch (_) {}
 
-  const synthesisPrompt = lang === 'zh'
+  let synthesisPrompt = lang === 'zh'
     ? `你是项目负责人（PO），项目所有任务已完成，现在需要做最终汇总。
 ${langInstr}
 
@@ -1266,6 +1317,51 @@ ${allArtifactContent.slice(0, 12000) || 'No readable artifacts'}
 3. Highlight strengths and weaknesses
 4. Give overall delivery assessment
 5. Output a complete synthesis document (markdown)`;
+
+  // Append project summary section if enabled
+  if (enableSummary) {
+    const summaryPrompt = lang === 'zh'
+      ? `
+
+## 项目小结（必须输出）
+
+在汇总文档的最后，输出以下结构化小结（用 markdown heading \`## 项目小结\` 标记）：
+
+### 评分
+给出项目整体评分（1-10），并简述理由。评分格式必须严格为"评分: X/10"，不要加任何修饰符号。
+
+### 遵循的原则
+列出本项目实际遵循了哪些原则（从项目要求中提取），并评价每条原则的实际效果：
+- 原则内容 → 效果评价（有效/部分有效/未体现）
+
+### 原则优化建议
+基于本次项目经验，给出原则优化建议：
+- 建议新增：...
+- 建议修改：...
+- 建议删除：...
+- 无需调整的原则：...`
+      : `
+
+## Project Summary (required)
+
+At the end of the synthesis document, output a structured summary under the heading \`## Project Summary\`:
+
+### Score
+Rate the project overall (1-10) with a brief rationale. Score format must be exactly "Score: X/10" with no additional formatting.
+
+### Principles Followed
+List which principles from the requirements were actually followed, and evaluate each:
+- Principle → Assessment (effective/partially effective/not reflected)
+
+### Principle Optimization Suggestions
+Based on this project experience, suggest principle improvements:
+- Suggest adding: ...
+- Suggest modifying: ...
+- Suggest removing: ...
+- No changes needed: ...`;
+
+    synthesisPrompt += summaryPrompt;
+  }
 
   let synthesis = null;
 
@@ -1693,9 +1789,12 @@ async function doTask(taskId, payload) {
   let projectName = payload?.projectName || 'Unknown Project';
   const brief = payload?.brief || '';
   const projectId = payload?.projectId || taskId.replace(/-t\d+$/, '');
+  const localTaskId = payload?.localTaskId || taskId.split('__').pop() || taskId;
+  const runId = payload?.runId || null;
   let projectGoal = payload?.projectGoal || '';
   let projectRequirements = payload?.projectRequirements || '';
   let workFolder = payload?.workFolder || '';
+  let currentTask = payload?.task || null;
 
   // Also check poProjects for goal/requirements (if we are PO for this project)
   const poInfo = projectId ? poProjects.get(projectId) : null;
@@ -1714,7 +1813,8 @@ async function doTask(taskId, payload) {
 
       // Find this task's dependencies and read their completed artifacts
       const allTasks = projData.tasks || [];
-      const thisTask = allTasks.find(t => t.id === taskId);
+      const thisTask = allTasks.find(t => t.id === taskId || t.localTaskId === localTaskId);
+      currentTask = thisTask || currentTask;
       if (thisTask?.dependencies?.length > 0 && workFolder) {
         const artifactsDir = join(workFolder, 'artifacts');
         if (existsSync(artifactsDir)) {
@@ -1724,11 +1824,20 @@ async function doTask(taskId, payload) {
             const depTask = allTasks.find(t => t.title === depTitle);
             if (depTask && depTask.status === 'done') {
               // Read its artifact
-              const depFilename = `${depTask.id}-report.md`;
-              const depPath = join(artifactsDir, depFilename);
-              if (existsSync(depPath)) {
-                const content = readFileSync(depPath, 'utf-8');
-                depArtifacts.push({ title: depTask.title, content });
+              const candidates = [];
+              for (const art of depTask.result?.artifacts || []) {
+                const filename = typeof art === 'string' ? art : (art.filename || art.name || '');
+                if (filename) candidates.push(filename);
+              }
+              candidates.push(`${depTask.id}-report.md`);
+              if (depTask.localTaskId) candidates.push(`${depTask.localTaskId}-report.md`);
+              for (const depFilename of candidates) {
+                const depPath = join(artifactsDir, depFilename);
+                if (existsSync(depPath)) {
+                  const content = readFileSync(depPath, 'utf-8');
+                  depArtifacts.push({ title: depTask.title, content });
+                  break;
+                }
               }
             }
           }
@@ -1748,26 +1857,29 @@ async function doTask(taskId, payload) {
 
   const goal = projectGoal || poInfo?.goal || '';
   const requirements = projectRequirements || poInfo?.requirements || '';
+  writeTaskJournal(workFolder, { projectId, taskId, localTaskId, runId, status: 'received' });
 
   reportStatus('working');
 
   // Step 1: Accept
   console.log(`[${ALIAS}]   → Accepting: ${title}`);
+  writeTaskJournal(workFolder, { projectId, taskId, localTaskId, runId, status: 'accepting' });
   await client.sendIntent({
     kind: 'accept_task',
     taskId,
     threadId: `thread-${taskId}`,
-    payload: { participantId: AGENT_ID },
+    payload: { projectId, taskId, localTaskId, runId, participantId: AGENT_ID },
   });
 
   // Step 2: Progress
   await sleep(DELAY / 2);
   console.log(`[${ALIAS}]   → Working on: ${title}`);
+  writeTaskJournal(workFolder, { projectId, taskId, localTaskId, runId, status: 'in_progress' });
   await client.sendIntent({
     kind: 'report_progress',
     taskId,
     threadId: `thread-${taskId}`,
-    payload: { stage: 'started', body: { message: `Working on ${title}...` } },
+    payload: { projectId, taskId, localTaskId, runId, stage: 'started', body: { message: `Working on ${title}...` } },
   });
 
   // Read project directory context ONLY if requirements mention file access
@@ -1783,7 +1895,9 @@ async function doTask(taskId, payload) {
   let artifactContent;
 
   // Build the prompt for the CLI/LLM
-  const taskPrompt = buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext);
+  const taskContract = enrichTaskWithExecutionContract(currentTask || { id: taskId, title, brief });
+  const contractContext = buildExecutionContractPrompt(taskContract);
+  const taskPrompt = buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext, contractContext);
 
   // Priority 1: CLI harness (spawn real agent binary)
   if (agentConfig?.runtimeType && agentConfig?.runtimePath && agentConfig.runtimeType !== 'builtin') {
@@ -1812,56 +1926,160 @@ async function doTask(taskId, payload) {
   if (!artifactContent) {
     console.log(`[${ALIAS}]   ✗ Both CLI and LLM failed for: ${title} — reporting task failure`);
     reportStatus('idle');
-    // Report failure via intent
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'failed',
+      errorMessage: `CLI and LLM both failed to generate output for "${title}"`,
+    });
+    // Report failure via explicit task_failed intent. A progress update alone
+    // would leave the task stuck in in_progress.
     await client.sendIntent({
-      kind: 'report_progress',
+      kind: 'task_failed',
       taskId,
       threadId: `thread-${taskId}`,
-      payload: { stage: 'failed', body: { message: `CLI and LLM both failed to generate output for "${title}"` } },
+      payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        failureReason: 'agent_error',
+        errorMessage: `CLI and LLM both failed to generate output for "${title}"`,
+      },
     });
     return;
   }
 
-  // Write artifact to project workFolder directly (if available)
+  const artifactFiles = [
+    { filename: artifactFilename, content: artifactContent, previewable: true, mimeType: 'text/markdown' },
+  ];
+  let reviewEvidence = null;
+  if (taskContract.evidenceContract?.kind === 'review_iteration_v1') {
+    reviewEvidence = buildReviewEvidenceFromContent(artifactContent, taskContract);
+    artifactFiles.push({
+      filename: 'review-evidence.json',
+      content: JSON.stringify(reviewEvidence, null, 2),
+      previewable: true,
+      mimeType: 'application/json',
+    });
+  }
+
+  const artifactFilenames = artifactFiles.map(file => file.filename);
+
+  // Write artifacts to project workFolder directly (if available)
   if (workFolder) {
     const artifactsDir = join(workFolder, 'artifacts');
     mkdirSync(artifactsDir, { recursive: true });
-    writeFileSync(join(artifactsDir, artifactFilename), artifactContent, 'utf-8');
-    console.log(`[${ALIAS}]   → Written to workFolder: ${artifactsDir}/${artifactFilename}`);
+    for (const file of artifactFiles) {
+      writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
+    }
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'artifact_written',
+      artifactManifest: buildArtifactManifest(workFolder, artifactFilenames),
+    });
+    console.log(`[${ALIAS}]   → Written to workFolder: ${artifactFilenames.map(name => `${artifactsDir}/${name}`).join(', ')}`);
   }
 
-  // Upload artifact to server
-  let artifactUrl = `/artifacts/${artifactFilename}`;
-  try {
-    const uploadRes = await fetch(`${KSWARM_API}/artifacts`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ filename: artifactFilename, content: artifactContent, projectId }),
+  // Upload artifacts to server
+  const submittedArtifacts = [];
+  for (const file of artifactFiles) {
+    let artifactUrl = `/artifacts/${file.filename}`;
+    try {
+      const uploadRes = await fetch(`${KSWARM_API}/artifacts`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ filename: file.filename, content: file.content, projectId }),
+      });
+      const uploadData = await uploadRes.json();
+      if (uploadData.artifact?.url) artifactUrl = uploadData.artifact.url;
+      console.log(`[${ALIAS}]   → Artifact saved: ${uploadData.artifact?.filename} (${uploadData.artifact?.path || 'unknown'})`);
+    } catch (err) {
+      console.log(`[${ALIAS}]   ⚠ Failed to upload artifact: ${err.message}`);
+    }
+    submittedArtifacts.push({
+      filename: file.filename,
+      url: artifactUrl,
+      previewable: file.previewable,
+      mimeType: file.mimeType,
     });
-    const uploadData = await uploadRes.json();
-    if (uploadData.artifact?.url) artifactUrl = uploadData.artifact.url;
-    console.log(`[${ALIAS}]   → Artifact saved: ${uploadData.artifact?.filename} (${uploadData.artifact?.path || 'unknown'})`);
-  } catch (err) {
-    console.log(`[${ALIAS}]   ⚠ Failed to upload artifact: ${err.message}`);
+  }
+
+  const resultPayload = {
+    projectId,
+    taskId,
+    localTaskId,
+    runId,
+    summary: buildResultSummary(title, artifactContent),
+    participantId: AGENT_ID,
+    artifacts: submittedArtifacts,
+    delivery: { semantic: 'document', source: ALIAS },
+    ...(reviewEvidence ? { reviewEvidence } : {}),
+  };
+
+  const contractValidation = validateTaskResultAgainstContract(taskContract, resultPayload);
+  if (!contractValidation.ok) {
+    const errorMessage = `Execution contract invalid: ${contractValidation.errors.join('; ')}`;
+    console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
+    reportStatus('idle');
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'failed',
+      artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+      errorMessage,
+    });
+    await client.sendIntent({
+      kind: 'task_failed',
+      taskId,
+      threadId: `thread-${taskId}`,
+      payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        failureReason: 'contract_invalid',
+        errorMessage,
+      },
+    });
+    return;
   }
 
   // Step 4: Submit result
   console.log(`[${ALIAS}]   → Submitting: ${title}`);
+  writeTaskJournal(workFolder, {
+    projectId,
+    taskId,
+    localTaskId,
+    runId,
+    status: 'submitting',
+    artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+    submission: { attemptedAt: Date.now(), ackedAt: null, lastError: null },
+  });
   await client.sendIntent({
     kind: 'submit_result',
     taskId,
     threadId: `thread-${taskId}`,
-    payload: {
-      summary: `Completed: ${title}`,
-      participantId: AGENT_ID,
-      artifacts: [
-        { filename: artifactFilename, url: artifactUrl, previewable: true, mimeType: 'text/markdown' },
-      ],
-      delivery: { semantic: 'document', source: ALIAS },
-    },
+    payload: resultPayload,
   });
 
   console.log(`[${ALIAS}]   ✓ Done: ${title}\n`);
+  writeTaskJournal(workFolder, {
+    projectId,
+    taskId,
+    localTaskId,
+    runId,
+    status: 'submitted',
+    artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+    submission: { attemptedAt: Date.now(), ackedAt: Date.now(), lastError: null },
+  });
   reportStatus('idle');
 
   // If we are PO for this project, quality review (not just auto-confirm)
@@ -1871,13 +2089,58 @@ async function doTask(taskId, payload) {
   }
 }
 
+function buildExecutionContractPrompt(task) {
+  if (task?.evidenceContract?.kind !== 'review_iteration_v1') return '';
+  return `\n## 评审证据合同\n本任务是质量评审任务。你的 Markdown 产物必须包含明确的 verdict、发现的问题清单、风险等级和可执行修改建议。系统会在提交前生成并校验 review-evidence.json，缺少 verdict/findings 会导致任务失败。`;
+}
+
+function buildResultSummary(title, artifactContent) {
+  const text = String(artifactContent || '')
+    .replace(/[`*_>#-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const excerpt = text.slice(0, 320);
+  return `${title}: ${excerpt}`;
+}
+
+function buildReviewEvidenceFromContent(content, task) {
+  const findings = extractReviewFindings(content);
+  const lowered = String(content || '').toLowerCase();
+  let verdict = 'needs_changes';
+  if (/通过|pass|approved|accept/.test(lowered) && !/不通过|fail|blocked|reject/.test(lowered)) {
+    verdict = 'pass';
+  } else if (/不通过|fail|blocked|reject/.test(lowered)) {
+    verdict = 'fail';
+  }
+  return {
+    verdict,
+    reviewedTaskId: task.reviewOfTaskId || task.parentTaskId || task.id,
+    generatedAt: new Date().toISOString(),
+    findings,
+  };
+}
+
+function extractReviewFindings(content) {
+  const lines = String(content || '')
+    .split('\n')
+    .map(line => line.replace(/^[\s*#>\-.0-9）)]+/, '').trim())
+    .filter(line => line.length >= 12);
+  const findings = lines.slice(0, 8).map(line => ({
+    severity: /严重|高|critical|major|blocker/i.test(line) ? 'major' : 'minor',
+    message: line.slice(0, 240),
+  }));
+  if (findings.length > 0) return findings;
+  const fallback = String(content || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  return [{ severity: 'minor', message: fallback || '评审产物未提供可提取的问题描述。' }];
+}
+
 // ─── LLM-powered artifact generation ────────────────────────────────────────
 
 /**
  * Build a natural-language prompt for the CLI agent to execute a task.
  * This is used both for CLI harness and (if needed) as context for LLM API.
  */
-function buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext) {
+function buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext, contractContext = '') {
   const lang = detectLanguage(goal || title || projectName);
   const parts = [];
 
@@ -1894,6 +2157,7 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
       parts.push(dependencyContext);
       parts.push(`\n## 重要：你必须基于上述前序产出开展工作，不能忽略或重复前序内容。如果你的任务是"评审"，请针对前序方案提出具体的、有挑战性的质疑和改进建议。如果是"修订"，请逐条回应评审意见并修改方案。`);
     }
+    if (contractContext) parts.push(contractContext);
     parts.push(`\n## 输出要求`);
     parts.push(`1. 输出 Markdown 格式，内容必须具体、深入、有细节，不允许空泛的模板式回答`);
     parts.push(`2. 字数不少于 800 字`);
@@ -1914,6 +2178,7 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
       parts.push(dependencyContext);
       parts.push(`\n## IMPORTANT: You MUST build upon the prior outputs above. If your task is "review", provide specific, challenging critiques. If "revision", address each review point explicitly.`);
     }
+    if (contractContext) parts.push(contractContext);
     parts.push(`\n## Output Requirements`);
     parts.push(`1. Output in Markdown, must be specific, detailed, and substantive — no generic templates`);
     parts.push(`2. Minimum 800 words`);

@@ -16,25 +16,51 @@
  * - 状态流转是否合法
  */
 
+import {
+  buildTaskAliases,
+  makeRunId,
+  normalizeExistingTask,
+  normalizeTasksForProject,
+} from './task-identity.js';
+
 const VALID_TRANSITIONS = {
-  pending: ['dispatched', 'failed', 'cancelled'],
-  dispatched: ['accepted', 'pending', 'cancelled'],  // pending = 超时退回
-  accepted: ['in_progress', 'pending', 'cancelled'],  // pending = agent 放弃
-  in_progress: ['submitted', 'failed', 'cancelled'],
-  submitted: ['done', 'in_progress', 'cancelled'],    // in_progress = PO 要求返工
+  pending: ['dispatched', 'failed', 'blocked', 'cancelled'],
+  dispatched: ['accepted', 'pending', 'failed', 'blocked', 'cancelled'],  // pending = 超时退回
+  accepted: ['in_progress', 'pending', 'failed', 'blocked', 'cancelled'],  // pending = agent 放弃
+  in_progress: ['submitted', 'failed', 'blocked', 'cancelled'],
+  submitted: ['done', 'in_progress', 'blocked', 'cancelled'],    // in_progress = PO 要求返工
   done: ['in_progress'],  // PO quality review can reopen for rework
-  failed: ['pending'],  // 可重新派发
+  failed: ['pending', 'blocked'],  // 可重新派发或人工阻塞
+  blocked: ['pending', 'cancelled'],
   cancelled: [],  // terminal
 };
 
-export function createTaskBoard() {
+export function createTaskBoard(projectId = 'legacy-project') {
   const tasks = new Map();  // taskId → task
+  let aliases = new Map();
+
+  function rebuildAliases() {
+    aliases = buildTaskAliases(projectId, [...tasks.values()]);
+  }
+
+  function resolveTaskId(taskId) {
+    if (tasks.has(taskId)) return taskId;
+    return aliases.get(taskId) || null;
+  }
 
   /**
    * PO 提交任务列表（批量创建）
    */
   function addTasks(taskList) {
-    for (const task of taskList) {
+    const result = addTasksChecked(taskList);
+    return result.ok ? result.taskIds : [];
+  }
+
+  function addTasksChecked(taskList) {
+    const normalized = normalizeTasksForProject(projectId, taskList, [...tasks.values()]);
+    if (!normalized.ok) return normalized;
+
+    for (const task of normalized.tasks) {
       // Skip if task already exists (prevents duplicate submissions resetting state)
       if (tasks.has(task.id)) continue;
       tasks.set(task.id, {
@@ -45,19 +71,37 @@ export function createTaskBoard() {
         attempt: task.attempt || 1,
         maxAttempts: task.maxAttempts || 2,
         failureReason: task.failureReason || null,
+        failureHistory: Array.isArray(task.failureHistory) ? task.failureHistory : [],
+        runtimeFailureCount: task.runtimeFailureCount || 0,
+        qualityFailureCount: task.qualityFailureCount || 0,
+        qualityReviewHistory: Array.isArray(task.qualityReviewHistory) ? task.qualityReviewHistory : [],
+        lastFailureClass: task.lastFailureClass || null,
+        blockedAt: task.blockedAt || null,
+        blockedReason: task.blockedReason || null,
+        blockKind: task.blockKind || null,
+        nextActions: Array.isArray(task.nextActions) ? task.nextActions : [],
+        isCompositeParent: task.isCompositeParent === true,
+        childTaskIds: Array.isArray(task.childTaskIds) ? [...task.childTaskIds] : [],
         parentTaskId: task.parentTaskId || null,
+        activeRunId: task.activeRunId || null,
+        runLease: task.runLease || null,
+        lastRunLease: task.lastRunLease || null,
+        recoveryStatus: task.recoveryStatus || null,
+        recoveryReason: task.recoveryReason || null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
     }
-    return taskList.map(t => t.id);
+    rebuildAliases();
+    return { ok: true, taskIds: normalized.tasks.map(t => t.id) };
   }
 
   /**
    * 状态流转（带合法性检查）
    */
   function transition(taskId, newStatus, meta = {}) {
-    const task = tasks.get(taskId);
+    const resolvedTaskId = resolveTaskId(taskId);
+    const task = resolvedTaskId ? tasks.get(resolvedTaskId) : null;
     if (!task) return { ok: false, error: 'task_not_found' };
 
     const allowed = VALID_TRANSITIONS[task.status];
@@ -66,16 +110,192 @@ export function createTaskBoard() {
     }
 
     const oldStatus = task.status;
+    const now = Date.now();
     task.status = newStatus;
-    task.updatedAt = Date.now();
+    task.updatedAt = now;
 
     if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
-    if (meta.result) task.result = meta.result;
+    if (Object.prototype.hasOwnProperty.call(meta, 'result')) task.result = meta.result;
     if (meta.failureReason) task.failureReason = meta.failureReason;
-    if (newStatus === 'done') task.completedAt = Date.now();
-    if (newStatus === 'failed') task.failedAt = Date.now();
+    if (meta.failureClass) task.lastFailureClass = meta.failureClass;
+    if (Object.prototype.hasOwnProperty.call(meta, 'qualityFailureCount')) task.qualityFailureCount = meta.qualityFailureCount;
+    if (Object.prototype.hasOwnProperty.call(meta, 'runtimeFailureCount')) task.runtimeFailureCount = meta.runtimeFailureCount;
+    if (newStatus === 'dispatched') {
+      task.activeRunId = meta.runId || makeRunId(task.id, task.attempt || 1);
+      if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
+      task.runLease = {
+        runId: task.activeRunId,
+        projectId,
+        taskId: task.id,
+        assignedAgent: task.assignedAgent || null,
+        attempt: task.attempt || 1,
+        status: 'dispatched',
+        createdAt: now,
+        lastHeartbeatAt: now,
+        leaseExpiresAt: meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000)),
+        artifactManifest: [],
+        submissionAcked: false,
+      };
+      task.recoveryStatus = null;
+      task.recoveryReason = null;
+    }
+    if (newStatus === 'accepted' && task.runLease) {
+      task.runLease.status = 'accepted';
+      task.runLease.assignedAgent = task.assignedAgent || meta.assignedAgent || task.runLease.assignedAgent || null;
+      task.runLease.lastHeartbeatAt = now;
+      task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+    }
+    if (newStatus === 'in_progress' && task.runLease) {
+      task.runLease.status = 'in_progress';
+      task.runLease.lastHeartbeatAt = now;
+      task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+    }
+    if (newStatus === 'pending') {
+      if (task.runLease) {
+        task.lastRunLease = { ...task.runLease, status: 'expired', expiredAt: now };
+      }
+      task.runLease = null;
+      task.activeRunId = null;
+      task.blockedAt = null;
+      task.blockedReason = null;
+      task.blockKind = null;
+      task.nextActions = [];
+    }
+    if (['submitted', 'done', 'failed', 'blocked', 'cancelled'].includes(newStatus)) {
+      if (task.runLease) {
+        task.lastRunLease = {
+          ...task.runLease,
+          status: newStatus,
+          lastHeartbeatAt: now,
+          submissionAcked: newStatus === 'submitted' ? true : task.runLease.submissionAcked,
+        };
+      }
+      task.runLease = null;
+      task.activeRunId = null;
+    }
+    if (newStatus === 'done') task.completedAt = now;
+    if (newStatus === 'failed') task.failedAt = now;
+    if (newStatus === 'blocked') {
+      task.blockedAt = now;
+      task.blockedReason = meta.blockedReason || meta.failureReason || task.blockedReason || '任务已阻塞';
+      task.blockKind = meta.blockKind || task.blockKind || 'task_blocked';
+      task.nextActions = Array.isArray(meta.nextActions) ? [...meta.nextActions] : (task.nextActions || []);
+    }
 
-    return { ok: true, taskId, from: oldStatus, to: newStatus };
+    return { ok: true, taskId: task.id, from: oldStatus, to: newStatus, runId: task.activeRunId || meta.runId || null };
+  }
+
+  function blockTask(taskId, blockInfo = {}) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (task.status === 'blocked') {
+      task.blockedReason = blockInfo.blockedReason || blockInfo.reason || task.blockedReason;
+      task.blockKind = blockInfo.blockKind || task.blockKind;
+      task.nextActions = Array.isArray(blockInfo.nextActions) ? [...blockInfo.nextActions] : (task.nextActions || []);
+      task.lastFailureClass = blockInfo.failureClass || task.lastFailureClass;
+      task.updatedAt = Date.now();
+      return { ok: true, taskId: task.id, alreadyBlocked: true };
+    }
+    return transition(task.id, 'blocked', {
+      blockedReason: blockInfo.blockedReason || blockInfo.reason,
+      blockKind: blockInfo.blockKind,
+      nextActions: blockInfo.nextActions,
+      failureClass: blockInfo.failureClass,
+      failureReason: blockInfo.blockedReason || blockInfo.reason,
+      qualityFailureCount: blockInfo.qualityFailureCount,
+      runtimeFailureCount: blockInfo.runtimeFailureCount,
+    });
+  }
+
+  function completeCompositeParent(parentTaskId, result = null, meta = {}) {
+    const parent = getTask(parentTaskId);
+    if (!parent) return { ok: false, error: 'task_not_found' };
+    if (!parent.isCompositeParent) return { ok: false, error: 'not_composite_parent' };
+    const children = (parent.childTaskIds || []).map(id => getTask(id)).filter(Boolean);
+    if (children.length !== (parent.childTaskIds || []).length) return { ok: false, error: 'child_task_missing' };
+    const incomplete = children.filter(child => child.status !== 'done');
+    if (incomplete.length > 0) {
+      return { ok: false, error: 'children_not_done', incompleteTaskIds: incomplete.map(child => child.id) };
+    }
+    const now = Date.now();
+    const oldStatus = parent.status;
+    parent.status = 'done';
+    parent.result = result;
+    parent.completedAt = now;
+    parent.updatedAt = now;
+    parent.completedBy = meta.completedBy || 'composite_children';
+    return { ok: true, taskId: parent.id, from: oldStatus, to: 'done' };
+  }
+
+  function validateRun(taskId, runId, workerAgent) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (workerAgent && task.assignedAgent && task.assignedAgent !== workerAgent) {
+      return { ok: false, error: 'wrong_assigned_agent', assignedAgent: task.assignedAgent };
+    }
+    if (task.activeRunId && runId && task.activeRunId !== runId) {
+      return { ok: false, error: 'stale_task_run', activeRunId: task.activeRunId, runId };
+    }
+    if (task.activeRunId && !runId) {
+      return { ok: false, error: 'missing_run_id', activeRunId: task.activeRunId };
+    }
+    if (!task.activeRunId && runId && task.lastRunLease?.runId && task.lastRunLease.runId !== runId) {
+      return { ok: false, error: 'stale_task_run', lastRunId: task.lastRunLease.runId, runId };
+    }
+    return { ok: true, task };
+  }
+
+  function recoverSubmission(taskId, result, meta = {}) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (!['cancelled', 'failed', 'in_progress', 'accepted', 'dispatched'].includes(task.status)) {
+      return { ok: false, error: `cannot_recover_from_status: ${task.status}` };
+    }
+    const oldStatus = task.status;
+    task.status = 'submitted';
+    task.result = result;
+    task.updatedAt = Date.now();
+    if (task.runLease) {
+      task.lastRunLease = { ...task.runLease, status: 'recovered', recoveredAt: task.updatedAt };
+    }
+    task.runLease = null;
+    task.activeRunId = null;
+    task.recoveredFromStatus = oldStatus;
+    task.recoveredAt = task.updatedAt;
+    task.recoveredBy = meta.recoveredBy || meta.fromAgent || 'human';
+    task.recoveredRunId = meta.runId || result?.runId || null;
+    task.recoveryStatus = 'recovered';
+    task.recoveryReason = meta.recoveryReason || 'recover_submission';
+    return { ok: true, taskId: task.id, from: oldStatus, to: 'submitted' };
+  }
+
+  function resetStaleRun(taskId, reason = 'lease_expired') {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) {
+      return { ok: false, error: `cannot_reset_from_status: ${task.status}` };
+    }
+    const now = Date.now();
+    const oldStatus = task.status;
+    if (task.runLease) {
+      task.lastRunLease = { ...task.runLease, status: 'expired', expiredAt: now, recoveryReason: reason };
+    }
+    task.status = 'pending';
+    task.activeRunId = null;
+    task.runLease = null;
+    task.updatedAt = now;
+    task.recoveryStatus = 'redispatch_ready';
+    task.recoveryReason = reason;
+    return { ok: true, taskId: task.id, from: oldStatus, to: 'pending', reason };
+  }
+
+  function markRecoveryStatus(taskId, status, reason = null) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    task.recoveryStatus = status;
+    task.recoveryReason = reason;
+    task.updatedAt = Date.now();
+    return { ok: true, taskId: task.id, recoveryStatus: status, recoveryReason: reason };
   }
 
   /**
@@ -85,9 +305,11 @@ export function createTaskBoard() {
     const allTasks = [...tasks.values()];
     return allTasks
       .filter(t => t.status === 'pending')
+      .filter(t => !t.isCompositeParent)
+      .filter(t => !t.unresolvedDependencies || t.unresolvedDependencies.length === 0)
       .filter(t => (t.dependencies || []).every(depRef => {
-        // Try by ID first, then by title match
-        const dep = tasks.get(depRef) || allTasks.find(x => x.title === depRef);
+        const depId = resolveTaskId(depRef);
+        const dep = depId ? tasks.get(depId) : null;
         return dep && dep.status === 'done';
       }));
   }
@@ -100,7 +322,10 @@ export function createTaskBoard() {
     return [...tasks.values()].every(t => t.status === 'done' || t.status === 'cancelled');
   }
 
-  function getTask(id) { return tasks.get(id); }
+  function getTask(id) {
+    const taskId = resolveTaskId(id);
+    return taskId ? tasks.get(taskId) : undefined;
+  }
   function getAllTasks() { return [...tasks.values()]; }
 
   /**
@@ -147,6 +372,7 @@ export function createTaskBoard() {
       submitted: all.filter(t => t.status === 'submitted').length,
       done: all.filter(t => t.status === 'done').length,
       failed: all.filter(t => t.status === 'failed').length,
+      blocked: all.filter(t => t.status === 'blocked').length,
     };
   }
 
@@ -154,19 +380,54 @@ export function createTaskBoard() {
    * Restore tasks from persisted state (no status reset)
    */
   function loadTasks(taskArray) {
+    tasks.clear();
     for (const task of taskArray) {
-      tasks.set(task.id, task);
+      const normalized = normalizeExistingTask(projectId, task);
+      tasks.set(normalized.id, normalized);
+    }
+    rebuildAliases();
+    for (const task of tasks.values()) {
+      const refs = Array.isArray(task.dependencyRefs) ? task.dependencyRefs : (task.dependencies || []);
+      const deps = [];
+      const unresolved = [];
+      for (const ref of refs) {
+        const depId = resolveTaskId(ref);
+        if (depId) deps.push(depId);
+        else unresolved.push(ref);
+      }
+      task.dependencies = deps;
+      task.unresolvedDependencies = unresolved;
     }
   }
 
-  return { addTasks, transition, getDispatchable, getDispatchableInPhase, getPhaseStatus, getPlanProgress, isAllDone, getTask, getAllTasks, getStats, loadTasks };
+  return {
+    addTasks,
+    addTasksChecked,
+    transition,
+    blockTask,
+    completeCompositeParent,
+    validateRun,
+    recoverSubmission,
+    resetStaleRun,
+    markRecoveryStatus,
+    resolveTaskId,
+    getDispatchable,
+    getDispatchableInPhase,
+    getPhaseStatus,
+    getPlanProgress,
+    isAllDone,
+    getTask,
+    getAllTasks,
+    getStats,
+    loadTasks,
+  };
 }
 
 /**
  * Restore a task board from serialized task array
  */
-export function restoreTaskBoard(taskArray) {
-  const board = createTaskBoard();
+export function restoreTaskBoard(taskArray, projectId = 'legacy-project') {
+  const board = createTaskBoard(projectId);
   board.loadTasks(taskArray);
   return board;
 }

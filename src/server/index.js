@@ -16,13 +16,21 @@ import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { createBrokerClient } from '../net/broker-client.js';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { basename, join, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
 import { createHeartbeatManager } from '../core/heartbeat-manager.js';
 import { aggregateDelivery } from '../core/delivery.js';
 import { createWatchdog } from '../core/watchdog.js';
+import { parseTaskId } from '../core/task-identity.js';
+import { planProjectRecovery } from '../core/recovery-planner.js';
+import { readRunJournals } from '../core/recovery-store.js';
+import { executeRecoveryAction } from '../core/recovery-executor.js';
+import {
+  initProjectWorkspace as initProjectWorkspaceRecord,
+  setProjectWorkspace as setProjectWorkspaceRecord,
+} from './project-workspace.js';
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
@@ -49,18 +57,7 @@ if (resetCount > 0) console.log(`[KSwarm] Reset ${resetCount} stale agent(s) to 
 const projectWorkspaces = new Map(); // projectId → { path, artifacts, custom }
 
 function initProjectWorkspace(projectId, customPath) {
-  let wsPath;
-  if (customPath && existsSync(customPath)) {
-    wsPath = customPath;
-  } else {
-    wsPath = join(PROJECTS_DIR, projectId);
-  }
-  const artifactsPath = join(wsPath, 'artifacts');
-  mkdirSync(artifactsPath, { recursive: true });
-
-  const ws = { path: wsPath, artifacts: artifactsPath, custom: !!customPath };
-  projectWorkspaces.set(projectId, ws);
-  return ws;
+  return initProjectWorkspaceRecord(projectWorkspaces, PROJECTS_DIR, projectId, customPath);
 }
 
 function getProjectWorkspace(projectId) {
@@ -71,10 +68,7 @@ function getProjectWorkspace(projectId) {
 }
 
 function setProjectWorkspace(projectId, newPath) {
-  mkdirSync(join(newPath, 'artifacts'), { recursive: true });
-  const ws = { path: newPath, artifacts: join(newPath, 'artifacts'), custom: true };
-  projectWorkspaces.set(projectId, ws);
-  return ws;
+  return setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
 }
 
 function listProjectArtifacts(projectId) {
@@ -117,6 +111,43 @@ function broadcast(msg) {
 // ─── Broker Connection ────────────────────────────────────────────
 let brokerConnected = false;
 let brokerClient = null;
+let recoveryRunning = false;
+let watchdogStarted = false;
+let watchdog = null;
+
+async function sendBrokerRequestTasks(projectId, taskIds = []) {
+  if (!brokerClient || !brokerClient.isConnected() || taskIds.length === 0) return;
+
+  const project = hub.getProject(projectId);
+  const board = hub.getBoard(projectId);
+  const ws = getProjectWorkspace(projectId);
+
+  for (const taskId of taskIds) {
+    const task = board?.getTask(taskId);
+    if (!task?.assignedAgent) continue;
+    try {
+      await brokerClient.sendTo(task.assignedAgent, 'request_task', {
+        taskId: task.id,
+        threadId: `thread-${task.id}`,
+        payload: {
+          projectId,
+          taskId: task.id,
+          localTaskId: task.localTaskId,
+          runId: task.activeRunId,
+          attempt: task.attempt || 1,
+          title: task.title,
+          brief: task.brief,
+          projectName: project?.name,
+          projectGoal: project?.goal || '',
+          projectRequirements: project?.requirements || '',
+          workFolder: ws.path,
+        },
+      });
+    } catch (err) {
+      log('warn', `Failed to send request_task to ${task.assignedAgent}`, { projectId, taskId: task.id, error: err.message });
+    }
+  }
+}
 
 function connectBroker() {
   try {
@@ -132,6 +163,7 @@ function connectBroker() {
         brokerConnected = true;
         log('info', 'Connected to intent-broker', { url: BROKER_URL });
         broadcast({ type: 'broker_status', connected: true });
+        runStartupRecovery().finally(startWatchdog);
       },
       onDisconnect: () => {
         brokerConnected = false;
@@ -151,55 +183,207 @@ function connectBroker() {
   }
 }
 
+async function getOnlineAgentIds() {
+  try {
+    const res = await fetch(`${BROKER_URL}/participants`);
+    if (!res.ok) return new Set();
+    const data = await res.json();
+    const participants = data.participants || data || [];
+    return new Set(
+      participants
+        .filter(p => p.kind === 'agent' && p.inboxMode === 'realtime')
+        .map(p => p.participantId)
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+async function sendRecoveryReviewSubmission({ projectId, taskId, fromWorker, result }) {
+  const project = hub.getProject(projectId);
+  if (!brokerClient || !brokerClient.isConnected() || !project?.poAgent) return;
+  await brokerClient.sendTo(project.poAgent, 'review_submission', {
+    taskId,
+    payload: { projectId, taskId, fromWorker, result },
+  });
+}
+
+async function runStartupRecovery() {
+  if (recoveryRunning) return;
+  recoveryRunning = true;
+  try {
+    const onlineAgents = await getOnlineAgentIds();
+    for (const project of hub.listProjects()) {
+      if (project.status !== 'active') continue;
+      const board = hub.getBoard(project.id);
+      if (!board) continue;
+      const ws = getProjectWorkspace(project.id);
+      const journals = readRunJournals(ws.path);
+      const recoveryPlan = planProjectRecovery({
+        project,
+        tasks: board.getAllTasks(),
+        journals,
+        onlineAgents,
+      });
+      if (recoveryPlan.actions.length === 0) continue;
+
+      log('info', `Startup recovery started for project ${project.id}`, { actions: recoveryPlan.actions.length });
+      broadcast({ type: 'project_recovery_started', projectId: project.id, actions: recoveryPlan.actions.length });
+
+      let recovered = 0;
+      let failed = 0;
+      let needsDispatch = false;
+      for (const action of recoveryPlan.actions) {
+        try {
+          const result = await executeRecoveryAction(action, {
+            hub,
+            sendReviewSubmission: sendRecoveryReviewSubmission,
+            sendRequestTask: (projectId, taskId) => sendBrokerRequestTasks(projectId, [taskId]),
+          });
+          if (result?.ok) {
+            recovered++;
+            if (action.type === 'reset_pending') needsDispatch = true;
+            broadcast({ type: 'task_recovered', projectId: action.projectId, taskId: action.taskId, action: action.type });
+          } else {
+            failed++;
+            broadcast({ type: 'task_recovery_failed', projectId: action.projectId, taskId: action.taskId, action: action.type, error: result?.error || 'unknown_error' });
+          }
+        } catch (err) {
+          failed++;
+          log('warn', `Startup recovery action failed`, { projectId: action.projectId, taskId: action.taskId, action: action.type, error: err.message });
+          broadcast({ type: 'task_recovery_failed', projectId: action.projectId, taskId: action.taskId, action: action.type, error: err.message });
+        }
+      }
+
+      if (needsDispatch) {
+        const dispatchResult = hub.handleRequestDispatch(project.id, project.poAgent);
+        if (dispatchResult.ok && dispatchResult.dispatched.length > 0) {
+          log('info', `Startup recovery redispatched tasks`, { projectId: project.id, dispatched: dispatchResult.dispatched });
+          broadcast({ type: 'tasks_dispatched', projectId: project.id, dispatched: dispatchResult.dispatched });
+          await sendBrokerRequestTasks(project.id, dispatchResult.dispatched);
+        }
+      }
+
+      broadcast({ type: 'project_recovery_completed', projectId: project.id, summary: { recovered, failed } });
+      log('info', `Startup recovery completed for project ${project.id}`, { recovered, failed });
+    }
+  } finally {
+    recoveryRunning = false;
+  }
+}
+
 function handleBrokerIntent(intent) {
   const { kind, taskId, fromParticipantId, payload } = intent;
 
   switch (kind) {
     case 'accept_task': {
-      const projectId = findProjectByTask(taskId);
-      if (projectId) {
-        hub.handleAcceptTask(projectId, taskId, fromParticipantId);
-        log('info', `Worker accepted task: ${taskId}`, { worker: fromParticipantId, projectId });
-        broadcast({ type: 'task_update', projectId, taskId, status: 'accepted', agent: fromParticipantId });
-      }
+      const resolved = resolveIncomingTask(taskId, payload);
+      if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
+      const result = hub.handleAcceptTask(resolved.projectId, resolved.taskId, fromParticipantId, payload?.runId);
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      log('info', `Worker accepted task: ${resolved.taskId}`, { worker: fromParticipantId, projectId: resolved.projectId });
+      broadcast({ type: 'task_update', projectId: resolved.projectId, taskId: resolved.taskId, status: 'accepted', agent: fromParticipantId });
       break;
     }
     case 'report_progress': {
-      const projectId = findProjectByTask(taskId);
-      if (projectId) {
-        hub.handleProgress(projectId, taskId, payload?.stage, fromParticipantId);
-        log('info', `Progress on task: ${taskId}`, { stage: payload?.stage, worker: fromParticipantId });
-        broadcast({ type: 'task_update', projectId, taskId, status: 'in_progress', stage: payload?.stage, agent: fromParticipantId });
+      const resolved = resolveIncomingTask(taskId, payload);
+      if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
+      const result = hub.handleProgress(resolved.projectId, resolved.taskId, payload?.stage, fromParticipantId, payload?.runId);
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      log('info', `Progress on task: ${resolved.taskId}`, { stage: payload?.stage, worker: fromParticipantId, projectId: resolved.projectId });
+      broadcast({ type: 'task_update', projectId: resolved.projectId, taskId: resolved.taskId, status: 'in_progress', stage: payload?.stage, agent: fromParticipantId });
+      break;
+    }
+    case 'task_failed': {
+      const resolved = resolveIncomingTask(taskId, payload);
+      if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
+      const result = hub.handleWorkerFailure(
+        resolved.projectId,
+        resolved.taskId,
+        fromParticipantId,
+        payload?.runId,
+        payload?.failureReason,
+        payload?.errorMessage
+      );
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      log('info', `Worker reported task failure: ${resolved.taskId}`, {
+        worker: fromParticipantId,
+        projectId: resolved.projectId,
+        failureReason: result.failureReason,
+        retried: result.retried,
+      });
+      broadcast({ type: 'task_failed', projectId: resolved.projectId, taskId: resolved.taskId, agent: fromParticipantId, ...result });
+      if (result.retried && result.retryTaskId) {
+        sendBrokerRequestTasks(resolved.projectId, [result.retryTaskId]).catch(() => {});
       }
       break;
     }
     case 'submit_result': {
-      const projectId = findProjectByTask(taskId);
-      if (projectId) {
-        hub.handleSubmitResult(projectId, taskId, payload, fromParticipantId);
-        log('info', `Task submitted: ${taskId}`, { worker: fromParticipantId, projectId });
-        broadcast({ type: 'task_update', projectId, taskId, status: 'submitted', agent: fromParticipantId });
+      const resolved = resolveIncomingTask(taskId, payload);
+      if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
+      const result = hub.handleSubmitResult(resolved.projectId, resolved.taskId, payload, fromParticipantId, payload?.runId);
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId: resolved.projectId });
+      log('info', `Task submitted: ${resolved.taskId}`, { worker: fromParticipantId, projectId: resolved.projectId });
+      broadcast({ type: 'task_update', projectId: resolved.projectId, taskId: resolved.taskId, status: 'submitted', agent: fromParticipantId });
 
-        // Notify PO to review this submission
-        const project = hub.getProject(projectId);
-        if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
-          brokerClient.sendTo(project.poAgent, 'review_submission', {
-            taskId,
-            payload: { projectId, taskId, fromWorker: fromParticipantId, result: payload },
-          }).catch(() => {});
-        }
+      // Notify PO to review this submission
+      const project = hub.getProject(resolved.projectId);
+      if (brokerClient && brokerClient.isConnected() && project?.poAgent && !result.alreadySubmitted) {
+        brokerClient.sendTo(project.poAgent, 'review_submission', {
+          taskId: resolved.taskId,
+          payload: { projectId: resolved.projectId, taskId: resolved.taskId, fromWorker: fromParticipantId, result: payload },
+        }).catch(() => {});
       }
       break;
     }
   }
 }
 
-function findProjectByTask(taskId) {
+function resolveIncomingTask(taskId, payload = {}) {
+  const payloadProjectId = payload?.projectId;
+  const parsed = parseTaskId(taskId);
+
+  if (payloadProjectId) {
+    if (parsed.global && parsed.projectId !== payloadProjectId) {
+      return { ok: false, error: 'project_task_mismatch', projectId: payloadProjectId, taskId };
+    }
+    const board = hub.getBoard(payloadProjectId);
+    if (!board) return { ok: false, error: 'project_not_found', projectId: payloadProjectId, taskId };
+    const task = board.getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found', projectId: payloadProjectId, taskId };
+    return { ok: true, projectId: payloadProjectId, taskId: task.id };
+  }
+
+  if (parsed.global) {
+    const board = hub.getBoard(parsed.projectId);
+    if (!board) return { ok: false, error: 'project_not_found', projectId: parsed.projectId, taskId };
+    const task = board.getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found', projectId: parsed.projectId, taskId };
+    return { ok: true, projectId: parsed.projectId, taskId: task.id };
+  }
+
+  const matches = [];
   for (const project of hub.listProjects()) {
     const board = hub.getBoard(project.id);
-    if (board && board.getTask(taskId)) return project.id;
+    const task = board?.getTask(taskId);
+    if (task) matches.push({ projectId: project.id, taskId: task.id });
   }
-  return null;
+  if (matches.length === 1) return { ok: true, ...matches[0], legacy: true };
+  if (matches.length > 1) return { ok: false, error: 'ambiguous_task_id', taskId, matches };
+  return { ok: false, error: 'task_not_found', taskId };
+}
+
+function emitTaskIntentError(kind, taskId, worker, result) {
+  log('warn', `Task intent error: ${kind}`, { taskId, worker, error: result.error, projectId: result.projectId, matches: result.matches });
+  broadcast({
+    type: 'task_intent_error',
+    kind,
+    taskId,
+    worker,
+    projectId: result.projectId || null,
+    error: result.error || 'unknown_error',
+    matches: result.matches || [],
+  });
 }
 
 // ─── Auto-start agent helper ──────────────────────────────────────
@@ -407,10 +591,10 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, poAgent, members, workFolder } = body;
+      const { name, goal, requirements, poAgent, members, workFolder, enableSummary } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
       const id = `proj-${Date.now()}`;
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', poAgent, members: members || [] });
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', poAgent, members: members || [], enableSummary });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
@@ -457,7 +641,29 @@ async function handleRequest(req, res) {
       const ws = getProjectWorkspace(project.id);
       const artifacts = listProjectArtifacts(project.id);
       const planProgress = board ? board.getPlanProgress() : null;
-      return json(res, { project: { ...project, workFolder: ws.path }, tasks, activities, humanActions, workspace: { path: ws.path, custom: ws.custom, artifacts }, plan: project.plan || null, planProgress });
+      const dispatchPlan = hub.getDispatchPlan(project.id);
+      const projectHealth = hub.getProjectHealth(project.id);
+      return json(res, {
+        project: { ...project, workFolder: ws.path },
+        tasks,
+        activities,
+        humanActions,
+        workspace: { path: ws.path, custom: ws.custom, artifacts },
+        plan: project.plan || null,
+        planProgress,
+        dispatchPlan,
+        projectHealth,
+      });
+    }
+
+    // ── Delete project (Human only) ──
+    if (projectMatch && req.method === 'DELETE') {
+      const result = hub.deleteProject(projectMatch[1]);
+      if (result.ok) {
+        log('info', `Human deleted project: ${projectMatch[1]}`);
+        broadcast({ type: 'project_closed', projectId: projectMatch[1] });
+      }
+      return json(res, result);
     }
 
     // ── Project approve (Human action) ──
@@ -600,11 +806,19 @@ async function handleRequest(req, res) {
 
       const result = hub.handleQualityReview(projectId, taskId, review, fromAgent);
       if (result.ok) {
+        if (result.alreadyReviewed) {
+          log('info', `Ignored duplicate review for task ${taskId}`, { projectId, passed: review.passed });
+          return json(res, result);
+        }
+
         log('info', `PO reviewed task ${taskId}: ${review.passed ? 'PASSED' : 'FAILED'}`, { projectId, feedback: review.feedback });
         broadcast({ type: 'task_reviewed', projectId, taskId, passed: review.passed, feedback: review.feedback });
+        if (result.blocked) {
+          broadcast({ type: 'task_blocked', projectId, taskId, failureClass: result.failureClass, nextActions: result.nextActions || [] });
+        }
 
         // If passed, auto-dispatch next available tasks
-        if (review.passed && !result.alreadyReviewed) {
+        if (review.passed) {
           const dispatchResult = hub.handleRequestDispatch(projectId, fromAgent);
           if (dispatchResult.ok && dispatchResult.dispatched.length > 0) {
             log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched });
@@ -616,8 +830,16 @@ async function handleRequest(req, res) {
                 const task = board?.getTask(tid);
                 if (task?.assignedAgent) {
                   brokerClient.sendTo(task.assignedAgent, 'request_task', {
-                    taskId: tid, threadId: `thread-${projectId}`,
-                    payload: { projectId, title: task.title, brief: task.brief },
+                    taskId: task.id, threadId: `thread-${task.id}`,
+                    payload: {
+                      projectId,
+                      taskId: task.id,
+                      localTaskId: task.localTaskId,
+                      runId: task.activeRunId,
+                      attempt: task.attempt || 1,
+                      title: task.title,
+                      brief: task.brief,
+                    },
                   }).catch(err => log('warn', `Failed to send request_task to ${task.assignedAgent}`, { error: err.message }));
                 }
               }
@@ -631,10 +853,64 @@ async function handleRequest(req, res) {
           const task = board?.getTask(taskId);
           if (task?.assignedAgent) {
             brokerClient.sendTo(task.assignedAgent, 'rework', {
-              taskId, threadId: `thread-${projectId}`,
+              taskId: task.id, threadId: `thread-${projectId}`,
               payload: { reason: review.feedback, projectId },
             }).catch(() => {});
           }
+        }
+      }
+      return json(res, result);
+    }
+
+    // ── Recover an already-written artifact as a task submission ──
+    const recoverMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/recover-submission$/);
+    if (recoverMatch && req.method === 'POST') {
+      const [, projectId, taskId] = recoverMatch;
+      const body = await parseBody(req);
+      const fromAgent = body.fromAgent || 'human';
+      const artifactNames = Array.isArray(body.artifacts) ? body.artifacts : [];
+      if (artifactNames.length === 0) return json(res, { ok: false, error: 'artifacts_required' }, 400);
+
+      const ws = getProjectWorkspace(projectId);
+      const artifacts = [];
+      for (const filename of artifactNames) {
+        if (!filename || filename !== basename(filename) || filename.includes('..')) {
+          return json(res, { ok: false, error: 'invalid_artifact_filename', filename }, 400);
+        }
+        const artifactPath = join(ws.artifacts, filename);
+        if (!existsSync(artifactPath)) {
+          return json(res, { ok: false, error: 'artifact_not_found', filename }, 404);
+        }
+        const content = readFileSync(artifactPath, 'utf-8');
+        if (content.trim().length < 100) {
+          return json(res, { ok: false, error: 'artifact_too_small', filename }, 400);
+        }
+        const ext = extname(filename);
+        artifacts.push({
+          filename,
+          url: `/projects/${projectId}/artifacts/${filename}`,
+          previewable: getPreviewable(ext),
+          mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+        });
+      }
+
+      const resultPayload = {
+        summary: body.summary || `Recovered submission for ${taskId}`,
+        participantId: fromAgent,
+        artifacts,
+        recovered: true,
+      };
+      const result = hub.handleRecoverSubmission(projectId, taskId, resultPayload, fromAgent);
+      if (result.ok) {
+        log('info', `Recovered task submission: ${result.taskId}`, { projectId, fromAgent, artifacts: artifactNames });
+        broadcast({ type: 'task_update', projectId, taskId: result.taskId, status: 'submitted', agent: fromAgent, recovered: true });
+
+        const project = hub.getProject(projectId);
+        if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
+          brokerClient.sendTo(project.poAgent, 'review_submission', {
+            taskId: result.taskId,
+            payload: { projectId, taskId: result.taskId, fromWorker: fromAgent, result: resultPayload },
+          }).catch(() => {});
         }
       }
       return json(res, result);
@@ -658,8 +934,20 @@ async function handleRequest(req, res) {
         log('info', `PO synthesized and delivered project: ${projectId}`);
         broadcast({ type: 'project_synthesized', projectId });
 
-        // Aggregate delivery package
+        // Parse and persist project summary
         const project = hub.getProject(projectId);
+        if (project && project.enableSummary !== false) {
+          try {
+            const { extractSummarySection, extractSummaryScore } = await import('../core/summary-parser.js');
+            project.summary = extractSummarySection(synthesis);
+            project.summaryScore = extractSummaryScore(synthesis);
+            hub.persistState();
+          } catch (e) {
+            log('warn', 'Failed to parse project summary', { projectId, error: String(e) });
+          }
+        }
+
+        // Aggregate delivery package
         const delivery = aggregateDelivery(ws.path, {
           name: project?.name,
           goal: project?.goal,
@@ -694,10 +982,10 @@ async function handleRequest(req, res) {
       // Transition to pending based on current status
       let result;
       if (task.status === 'in_progress') {
-        result = board.transition(taskId, 'failed', { reason: reason || 'reassigned' });
-        if (result.ok) result = board.transition(taskId, 'pending', {});
+        result = board.transition(task.id, 'failed', { reason: reason || 'reassigned' });
+        if (result.ok) result = board.transition(task.id, 'pending', {});
       } else if (['dispatched', 'accepted'].includes(task.status)) {
-        result = board.transition(taskId, 'pending', {});
+        result = board.transition(task.id, 'pending', {});
       } else if (task.status === 'pending') {
         result = { ok: true }; // already pending
       } else {
@@ -707,21 +995,22 @@ async function handleRequest(req, res) {
       if (!result?.ok) return json(res, { error: result?.error || 'transition failed' }, 400);
 
       // Update assignment
-      const updatedTask = board.getTask(taskId);
+      const updatedTask = board.getTask(task.id);
       if (updatedTask) updatedTask.assignedAgent = newAgent;
 
-      log('info', `Task reassigned: ${taskId} → ${newAgent} (reason: ${reason})`, { projectId, fromPO });
-      broadcast({ type: 'task_reassigned', projectId, taskId, newAgent, reason });
+      log('info', `Task reassigned: ${task.id} → ${newAgent} (reason: ${reason})`, { projectId, fromPO });
+      broadcast({ type: 'task_reassigned', projectId, taskId: task.id, newAgent, reason });
 
       // Auto-dispatch the reassigned task
       try {
-        const dispatchRes = hub.handleDispatch(projectId, fromPO || 'system');
+        const dispatchRes = hub.handleRequestDispatch(projectId, fromPO || 'system');
         if (dispatchRes.ok) {
           broadcast({ type: 'tasks_dispatched', projectId, tasks: dispatchRes.dispatched });
+          await sendBrokerRequestTasks(projectId, dispatchRes.dispatched);
         }
       } catch (_) {}
 
-      return json(res, { ok: true, taskId, newAgent, previousStatus: task.status });
+      return json(res, { ok: true, taskId: task.id, newAgent, previousStatus: task.status });
     }
 
     // ── Human adds tasks (any time, no PO restriction) ──
@@ -774,14 +1063,18 @@ async function handleRequest(req, res) {
             const task = board.getTask(taskId);
             if (task && task.assignedAgent) {
               brokerClient.sendTo(task.assignedAgent, 'request_task', {
-                taskId, threadId: `thread-${projectId}`,
+                taskId: task.id, threadId: `thread-${task.id}`,
                 payload: {
+                  projectId,
+                  taskId: task.id,
+                  localTaskId: task.localTaskId,
+                  runId: task.activeRunId,
+                  attempt: task.attempt || 1,
                   title: task.title,
                   brief: task.brief,
                   projectName: project?.name,
                   projectGoal: project?.goal || '',
                   projectRequirements: project?.requirements || '',
-                  projectId,
                   workFolder: ws.path,
                 },
               }).catch(err => log('warn', `Failed to send request_task to ${task.assignedAgent}`, { error: err.message }));
@@ -798,8 +1091,8 @@ async function handleRequest(req, res) {
       const body = await parseBody(req);
       const result = hub.handleMarkDone(doneMatch[1], doneMatch[2], body.fromAgent);
       if (result.ok) {
-        log('info', `PO confirmed task done: ${doneMatch[2]}`, { projectId: doneMatch[1] });
-        broadcast({ type: 'task_done', projectId: doneMatch[1], taskId: doneMatch[2] });
+        log('info', `PO confirmed task done: ${result.taskId || doneMatch[2]}`, { projectId: doneMatch[1] });
+        broadcast({ type: 'task_done', projectId: doneMatch[1], taskId: result.taskId || doneMatch[2] });
       }
       return json(res, result);
     }
@@ -810,7 +1103,7 @@ async function handleRequest(req, res) {
       const body = await parseBody(req);
       const result = hub.handleRework(reworkMatch[1], reworkMatch[2], body.reason || '', body.fromAgent);
       if (result.ok) {
-        broadcast({ type: 'task_rework', projectId: reworkMatch[1], taskId: reworkMatch[2] });
+        broadcast({ type: 'task_rework', projectId: reworkMatch[1], taskId: result.taskId || reworkMatch[2] });
       }
       return json(res, result);
     }
@@ -823,10 +1116,10 @@ async function handleRequest(req, res) {
       if (!board) return json(res, { ok: false, error: 'project_not_found' });
       const task = board.getTask(taskId);
       if (!task) return json(res, { ok: false, error: 'task_not_found' });
-      const result = board.transition(taskId, 'cancelled');
+      const result = board.transition(task.id, 'cancelled');
       if (result.ok) {
-        log('info', `Task cancelled: ${taskId}`, { projectId });
-        broadcast({ type: 'task_cancelled', projectId, taskId });
+        log('info', `Task cancelled: ${task.id}`, { projectId });
+        broadcast({ type: 'task_cancelled', projectId, taskId: task.id });
       }
       return json(res, result);
     }
@@ -840,6 +1133,9 @@ async function handleRequest(req, res) {
       if (result.ok) {
         log('info', `Task failed: ${taskId}`, { projectId, failureReason: result.failureReason, retried: result.retried });
         broadcast({ type: 'task_failed', projectId, taskId, ...result });
+        if (result.retried && result.retryTaskId) {
+          await sendBrokerRequestTasks(projectId, [result.retryTaskId]);
+        }
       }
       return json(res, result);
     }
@@ -1381,8 +1677,16 @@ server.listen(PORT, () => {
   log('info', `KSwarm API server started on port ${PORT}`);
   connectBroker();
 
-  // Start watchdog for timeout detection & auto-recovery
-  const watchdog = createWatchdog({
+  // If broker is slow/unavailable, still run local recovery before watchdog.
+  setTimeout(() => {
+    runStartupRecovery().finally(startWatchdog);
+  }, 2_000);
+});
+
+function startWatchdog() {
+  if (watchdogStarted) return;
+  watchdogStarted = true;
+  watchdog = createWatchdog({
     listProjects: () => hub.listProjects(),
     getBoard: (id) => hub.getBoard(id),
     onTimeout: (projectId, task, action) => {
@@ -1394,4 +1698,4 @@ server.listen(PORT, () => {
     maxRetries: 2,
   });
   watchdog.start();
-});
+}

@@ -4,8 +4,9 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, FileText, LayoutGrid, Activity, Package, CheckCircle2, Send, XCircle, Archive, RefreshCw } from 'lucide-react';
+import { ArrowLeft, FileText, LayoutGrid, Activity, Package, CheckCircle2, Send, XCircle, Archive, RefreshCw, AlertTriangle, Clock3 } from 'lucide-react';
 import { useKSwarm } from '../../hooks/useKSwarm';
+import { deriveAgentStatuses } from '../../utils/agent-status';
 import { PlanView } from './PlanView';
 import { KanbanBoard } from './KanbanBoard';
 import { ActivityTimeline } from './ActivityTimeline';
@@ -26,7 +27,7 @@ const STATUS_LABELS = {
 export function ProjectDetailPage() {
   const { projectId } = useParams();
   const navigate = useNavigate();
-  const { getProjectFullDetail, approveProject, dispatchTasks, deliverProject, closeProject, retryPlan, connected } = useKSwarm();
+  const { getProjectFullDetail, approveProject, dispatchTasks, deliverProject, closeProject, retryPlan, connected, agents, participants, logs } = useKSwarm();
   const [detail, setDetail] = useState(null);
   const [activeTab, setActiveTab] = useState('board');
   const [loading, setLoading] = useState(true);
@@ -73,7 +74,7 @@ export function ProjectDetailPage() {
     );
   }
 
-  const { project, tasks, activities, humanActions, workspace, plan, planProgress } = detail;
+  const { project, tasks, activities, humanActions, workspace, plan, planProgress, projectHealth, dispatchPlan } = detail;
   const showApprove = project.status === 'created' || project.status === 'draft' || project.status === 'planning';
   const showDispatch = project.status === 'active' && tasks.some(t => t.status === 'pending');
   const showDeliver = project.status === 'active' && tasks.every(t => t.status === 'done' || t.status === 'cancelled');
@@ -154,6 +155,9 @@ export function ProjectDetailPage() {
         </div>
       </div>
 
+      <ProjectHealthBanner health={projectHealth} dispatchPlan={dispatchPlan} />
+      <AgentStatusStrip project={project} tasks={tasks} agents={agents} participants={participants} logs={logs} />
+
       <div className="flex items-center gap-1 border-b border-gray-200 px-6">
         {TABS.map(tab => {
           const Icon = tab.icon;
@@ -173,6 +177,83 @@ export function ProjectDetailPage() {
         {activeTab === 'board' && <KanbanBoard project={{ ...project, tasks }} />}
         {activeTab === 'activity' && <ActivityTimeline project={project} activities={activities} humanActions={humanActions} />}
         {activeTab === 'deliverables' && <DeliverableView project={project} tasks={tasks} />}
+      </div>
+    </div>
+  );
+}
+
+const HEALTH_STYLES = {
+  blocked: { icon: AlertTriangle, label: '阻塞', cls: 'border-red-200 bg-red-50 text-red-700' },
+  waiting: { icon: Clock3, label: '等待', cls: 'border-yellow-200 bg-yellow-50 text-yellow-700' },
+  needs_review: { icon: CheckCircle2, label: '待审核', cls: 'border-green-200 bg-green-50 text-green-700' },
+  running: { icon: Activity, label: '运行中', cls: 'border-blue-200 bg-blue-50 text-blue-700' },
+  dispatchable: { icon: Send, label: '可派发', cls: 'border-indigo-200 bg-indigo-50 text-indigo-700' },
+  complete: { icon: CheckCircle2, label: '已完成', cls: 'border-green-200 bg-green-50 text-green-700' },
+  idle: { icon: Clock3, label: '空闲', cls: 'border-gray-200 bg-gray-50 text-gray-600' },
+};
+
+function ProjectHealthBanner({ health, dispatchPlan }) {
+  if (!health) return null;
+  const style = HEALTH_STYLES[health.state] || HEALTH_STYLES.idle;
+  const Icon = style.icon;
+  const reason = health.reasons?.[0];
+  const message = reason?.message || health.gate || (dispatchPlan?.projectGate ? dispatchPlan.projectGate : '');
+  return (
+    <div className={`border-b px-6 py-2 ${style.cls}`}>
+      <div className="flex min-w-0 items-center gap-2 text-[11px]">
+        <Icon size={13} className="shrink-0" />
+        <span className="font-medium">{style.label}</span>
+        {message && <span className="truncate opacity-80">{message}</span>}
+        {health.counts && (
+          <span className="ml-auto shrink-0 opacity-75">
+            运行 {health.counts.dispatched + health.counts.accepted + health.counts.inProgress} / 待审 {health.counts.submitted} / 阻塞 {health.counts.blocked}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const AGENT_STATUS_STYLES = {
+  working: { dot: 'bg-blue-500 animate-pulse', chip: 'border-blue-200 bg-blue-50 text-blue-700' },
+  reviewing: { dot: 'bg-green-500 animate-pulse', chip: 'border-green-200 bg-green-50 text-green-700' },
+  waiting_review: { dot: 'bg-green-500', chip: 'border-green-200 bg-green-50 text-green-700' },
+  waiting: { dot: 'bg-gray-400', chip: 'border-gray-200 bg-gray-50 text-gray-600' },
+  blocked: { dot: 'bg-yellow-500', chip: 'border-yellow-200 bg-yellow-50 text-yellow-700' },
+  failed: { dot: 'bg-red-500', chip: 'border-red-200 bg-red-50 text-red-700' },
+  error: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-200 bg-red-50 text-red-700' },
+  cancelled: { dot: 'bg-gray-400', chip: 'border-gray-200 bg-gray-50 text-gray-500' },
+  done: { dot: 'bg-green-500', chip: 'border-green-200 bg-green-50 text-green-700' },
+  offline: { dot: 'bg-gray-300', chip: 'border-gray-200 bg-gray-50 text-gray-400' },
+};
+
+function AgentStatusStrip({ project, tasks, agents, participants, logs }) {
+  const statuses = deriveAgentStatuses({ project, tasks, agents, participants, logs });
+  if (!statuses.length) return null;
+
+  return (
+    <div className="border-b border-gray-200 bg-white px-6 py-2">
+      <div className="flex items-center gap-2 overflow-x-auto">
+        {statuses.map(status => {
+          const style = AGENT_STATUS_STYLES[status.status] || AGENT_STATUS_STYLES.waiting;
+          return (
+            <div
+              key={status.id}
+              title={status.taskTitle ? `${status.detail}: ${status.taskTitle}` : status.detail}
+              className={`min-w-[150px] max-w-[220px] rounded-md border px-2.5 py-1.5 ${style.chip}`}
+            >
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className={`h-2 w-2 shrink-0 rounded-full ${style.dot}`} />
+                <span className="truncate text-[11px] font-medium">{status.name}</span>
+                <span className="shrink-0 text-[9px] opacity-60">{status.role}</span>
+                <span className="ml-auto shrink-0 text-[10px]">{status.label}</span>
+              </div>
+              <div className="mt-0.5 truncate text-[9px] opacity-65">
+                {status.taskTitle || status.detail}
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

@@ -20,8 +20,8 @@ function scenario(name, fn) {
   fn();
 }
 
-function createTestBoard(tasks) {
-  const board = createTaskBoard();
+function createTestBoard(tasks, projectId = 'p1') {
+  const board = createTaskBoard(projectId);
   board.addTasks(tasks);
   return board;
 }
@@ -120,7 +120,8 @@ scenario('重试计数 — 达到 maxRetries 后永久失败', () => {
   board.transition('t1', 'in_progress');
   board.getTask('t1').updatedAt = Date.now() - 700_000;
   watchdog.check();
-  assert(watchdog.getRetryCount('t1') === 1, `重试次数=1: ${watchdog.getRetryCount('t1')}`);
+  const taskId = board.getTask('t1').id;
+  assert(watchdog.getRetryCount(taskId) === 1, `重试次数=1: ${watchdog.getRetryCount(taskId)}`);
   assert(board.getTask('t1').status === 'pending', '回到 pending');
 
   // Retry 2
@@ -129,7 +130,7 @@ scenario('重试计数 — 达到 maxRetries 后永久失败', () => {
   board.transition('t1', 'in_progress');
   board.getTask('t1').updatedAt = Date.now() - 700_000;
   watchdog.check();
-  assert(watchdog.getRetryCount('t1') === 2, `重试次数=2: ${watchdog.getRetryCount('t1')}`);
+  assert(watchdog.getRetryCount(taskId) === 2, `重试次数=2: ${watchdog.getRetryCount(taskId)}`);
   assert(board.getTask('t1').status === 'pending', '回到 pending');
 
   // Retry 3 — should fail permanently
@@ -210,7 +211,7 @@ scenario('onTimeout 回调被调用', () => {
   watchdog.check();
   assert(callbacks.length === 1, `回调被调用: ${callbacks.length}`);
   assert(callbacks[0].pid === 'p1', `项目 ID 正确: ${callbacks[0].pid}`);
-  assert(callbacks[0].taskId === 't1', `任务 ID 正确: ${callbacks[0].taskId}`);
+  assert(callbacks[0].taskId === 'p1__t1', `任务 ID 正确: ${callbacks[0].taskId}`);
 });
 
 // ── start/stop ──────────────────────────────────────────────────────────────

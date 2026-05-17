@@ -113,6 +113,21 @@ export function useKSwarm() {
         fetchProjects();
         setLastTaskEvent({ type: msg.type, projectId: msg.projectId, taskId: msg.taskId, ts: Date.now() });
         break;
+      case 'task_intent_error':
+        setLogs(prev => [...prev, {
+          ts: new Date().toISOString(),
+          level: 'warn',
+          msg: `Task intent error: ${msg.kind || 'unknown'}`,
+          data: {
+            projectId: msg.projectId,
+            taskId: msg.taskId,
+            worker: msg.worker,
+            error: msg.error,
+            matches: msg.matches || [],
+          },
+        }].slice(-200));
+        setLastTaskEvent({ type: msg.type, projectId: msg.projectId, taskId: msg.taskId, ts: Date.now() });
+        break;
       case 'agents_offline':
         setAgents(prev => prev.map(a =>
           msg.agentIds?.includes(a.id) ? { ...a, status: 'offline' } : a

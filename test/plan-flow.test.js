@@ -87,12 +87,12 @@ test('full flow: plan → approve → phase dispatch → review → rework → n
   assert.ok(approveResult.ok);
   assert.equal(hub.getProject('proj-flow').status, 'active');
 
-  // 3. First dispatch: only Phase 1 tasks
+  // 3. First dispatch: dependency-ready tasks
   const dispatch1 = hub.handleRequestDispatch('proj-flow', 'po-1');
   assert.ok(dispatch1.ok);
-  assert.deepEqual(dispatch1.dispatched.sort(), ['item-1', 'item-2']);
+  assert.deepEqual(dispatch1.dispatched.sort(), ['proj-flow__item-1', 'proj-flow__item-2']);
 
-  // Phase 2 tasks should NOT be dispatched
+  // Phase 2 tasks with explicit dependencies should NOT be dispatched
   const board = hub.getBoard('proj-flow');
   assert.equal(board.getTask('item-3').status, 'pending');
   assert.equal(board.getTask('item-4').status, 'pending');
@@ -134,11 +134,11 @@ test('full flow: plan → approve → phase dispatch → review → rework → n
   assert.ok(review1b.ok);
   assert.equal(board.getTask('item-1').status, 'done');
 
-  // 9. Phase 1 all done → dispatch Phase 2
+  // 9. Dependencies satisfied → dispatch next ready task
   const dispatch2 = hub.handleRequestDispatch('proj-flow', 'po-1');
   assert.ok(dispatch2.ok);
   // item-3 has no dependency issues (Write draft is done), but item-4 depends on Review draft
-  assert.deepEqual(dispatch2.dispatched, ['item-3']);
+  assert.deepEqual(dispatch2.dispatched, ['proj-flow__item-3']);
 
   // 10. Complete Phase 2
   board.transition('item-3', 'accepted');
@@ -149,7 +149,7 @@ test('full flow: plan → approve → phase dispatch → review → rework → n
 
   // Now item-4 should be dispatchable
   const dispatch3 = hub.handleRequestDispatch('proj-flow', 'po-1');
-  assert.deepEqual(dispatch3.dispatched, ['item-4']);
+  assert.deepEqual(dispatch3.dispatched, ['proj-flow__item-4']);
 
   board.transition('item-4', 'accepted');
   board.transition('item-4', 'in_progress');
@@ -258,7 +258,7 @@ test('backward compat: projects without plan work normally', () => {
   // Dispatch works without plan (no phase filtering)
   const d = hub.handleRequestDispatch('proj-legacy', 'po-1');
   assert.ok(d.ok);
-  assert.deepEqual(d.dispatched, ['t1']); // t2 has dependency
+  assert.deepEqual(d.dispatched, ['proj-legacy__t1']); // t2 has dependency
 
   // Complete t1 → t2 becomes dispatchable
   const board = hub.getBoard('proj-legacy');
@@ -268,7 +268,7 @@ test('backward compat: projects without plan work normally', () => {
   board.transition('t1', 'done');
 
   const d2 = hub.handleRequestDispatch('proj-legacy', 'po-1');
-  assert.deepEqual(d2.dispatched, ['t2']);
+  assert.deepEqual(d2.dispatched, ['proj-legacy__t2']);
 });
 
 test('quality review: non-PO rejected', () => {

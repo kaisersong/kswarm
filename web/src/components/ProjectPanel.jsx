@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
 import { useT } from '../i18n';
+import { deriveAgentStatuses } from '../utils/agent-status.js';
 
 export function ProjectPanel({ kswarm }) {
   const { t } = useT();
   const { projects, agents, participants, createProject, approveProject, getProjectDetail,
     humanAddTasks, createTasks, dispatchTasks, markTaskDone, cancelTask, deliverProject,
-    closeProject, lastTaskEvent } = kswarm;
+    closeProject, lastTaskEvent, logs } = kswarm;
   const [showCreate, setShowCreate] = useState(false);
   const [selectedProject, setSelectedProject] = useState(null);
   const [projectDetail, setProjectDetail] = useState(null);
@@ -90,6 +91,9 @@ export function ProjectPanel({ kswarm }) {
               t={t}
               data={projectDetail}
               availableAgents={availableAgents}
+              agents={managedAgents}
+              participants={participants}
+              logs={logs}
               agentName={agentName}
               onHumanAddTasks={(tasks) => humanAddTasks(selectedProject, tasks)}
               onCreateTasks={(tasks) => createTasks(selectedProject, tasks, projectDetail.project.poAgent)}
@@ -279,7 +283,7 @@ function ProjectCard({ t, project, selected, agentName, onView }) {
 
 // ─── Project Detail ───────────────────────────────────────────────
 
-function ProjectDetail({ t, data, availableAgents, agentName, onHumanAddTasks, onCreateTasks, onDispatch, onApprove, onMarkDone, onCancel, onDeliver, onClose, onRefresh, onClosePanel }) {
+function ProjectDetail({ t, data, availableAgents, agents, participants, logs, agentName, onHumanAddTasks, onCreateTasks, onDispatch, onApprove, onMarkDone, onCancel, onDeliver, onClose, onRefresh, onClosePanel }) {
   const { project, tasks, activities = [], humanActions = [], workspace, plan, planProgress } = data;
   const [showAddTasks, setShowAddTasks] = useState(false);
   const [detailTab, setDetailTab] = useState(plan ? 'plan' : 'board');
@@ -353,6 +357,14 @@ function ProjectDetail({ t, data, availableAgents, agentName, onHumanAddTasks, o
           <button onClick={onClosePanel} className="px-2 py-1 text-[11px] text-zinc-500 hover:text-zinc-300">{t('projects.actions.close')}</button>
         </div>
       </div>
+
+      <AgentStatusStrip
+        project={project}
+        tasks={tasks}
+        agents={agents}
+        participants={participants}
+        logs={logs}
+      />
 
       {/* Close confirm dialog */}
       {closeConfirm && (
@@ -429,6 +441,49 @@ function ActionBtn({ color, onClick, children }) {
     <button onClick={onClick} className={`px-2.5 py-1 text-[11px] rounded-md border ${colors[color] || colors.blue}`}>
       {children}
     </button>
+  );
+}
+
+const AGENT_STATUS_STYLES = {
+  working: { dot: 'bg-blue-400 animate-pulse', chip: 'border-blue-500/30 bg-blue-500/10 text-blue-300' },
+  reviewing: { dot: 'bg-cyan-400 animate-pulse', chip: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300' },
+  waiting_review: { dot: 'bg-cyan-400', chip: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300' },
+  waiting: { dot: 'bg-zinc-500', chip: 'border-zinc-700 bg-zinc-900/60 text-zinc-300' },
+  blocked: { dot: 'bg-yellow-400', chip: 'border-yellow-500/30 bg-yellow-500/10 text-yellow-300' },
+  failed: { dot: 'bg-red-500', chip: 'border-red-500/30 bg-red-500/10 text-red-300' },
+  error: { dot: 'bg-red-500 animate-pulse', chip: 'border-red-500/40 bg-red-500/15 text-red-200' },
+  cancelled: { dot: 'bg-zinc-500', chip: 'border-zinc-600/50 bg-zinc-800/50 text-zinc-400' },
+  done: { dot: 'bg-green-400', chip: 'border-green-500/30 bg-green-500/10 text-green-300' },
+  offline: { dot: 'bg-zinc-700', chip: 'border-zinc-800 bg-zinc-950/50 text-zinc-500' },
+};
+
+function AgentStatusStrip({ project, tasks, agents, participants, logs }) {
+  const statuses = deriveAgentStatuses({ project, tasks, agents, participants, logs });
+  if (!statuses.length) return null;
+
+  return (
+    <div className="px-4 py-2 border-b border-zinc-800/50 bg-zinc-950/30 shrink-0">
+      <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
+        {statuses.map(status => {
+          const style = AGENT_STATUS_STYLES[status.status] || AGENT_STATUS_STYLES.waiting;
+          return (
+            <div key={status.id}
+              title={status.taskTitle ? `${status.detail}: ${status.taskTitle}` : status.detail}
+              className={`min-w-[150px] max-w-[220px] rounded-md border px-2.5 py-1.5 ${style.chip}`}>
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span className={`w-2 h-2 rounded-full shrink-0 ${style.dot}`} />
+                <span className="text-[11px] font-medium truncate text-zinc-100">{status.name}</span>
+                <span className="text-[9px] text-zinc-500 shrink-0">{status.role}</span>
+                <span className="ml-auto text-[10px] shrink-0">{status.label}</span>
+              </div>
+              <div className="mt-0.5 text-[9px] text-zinc-500 truncate">
+                {status.taskTitle || status.detail}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -592,14 +647,19 @@ const BOARD_COLUMNS = [
   { id: 'in_progress', color: 'text-yellow-400' },
   { id: 'submitted', color: 'text-cyan-400' },
   { id: 'done', color: 'text-green-400' },
+  { id: 'failed_cancelled', color: 'text-red-400' },
 ];
 
 function BoardView({ t, tasks, project, availableAgents, showAddTasks, setShowAddTasks, onHumanAddTasks, onMarkDone, onCancel, onRefresh, onPreview, isClosed, agentName }) {
-  const activeTasks = tasks.filter(t => t.status !== 'cancelled');
+  const visibleTasks = tasks;
   const grouped = {};
   for (const col of BOARD_COLUMNS) grouped[col.id] = [];
-  for (const task of activeTasks) {
-    const col = ['accepted', 'dispatched'].includes(task.status) ? 'in_progress' : task.status;
+  for (const task of visibleTasks) {
+    const col = ['accepted', 'dispatched'].includes(task.status)
+      ? 'in_progress'
+      : ['failed', 'cancelled'].includes(task.status)
+      ? 'failed_cancelled'
+      : task.status;
     if (grouped[col]) grouped[col].push(task);
     else grouped['pending'].push(task);
   }
@@ -609,6 +669,7 @@ function BoardView({ t, tasks, project, availableAgents, showAddTasks, setShowAd
     in_progress: t('projects.board.inProgress'),
     submitted: t('projects.board.review'),
     done: t('projects.board.done'),
+    failed_cancelled: '异常',
   };
 
   return (
@@ -634,15 +695,15 @@ function BoardView({ t, tasks, project, availableAgents, showAddTasks, setShowAd
           onCancel={() => setShowAddTasks(false)} />
       )}
 
-      {activeTasks.length === 0 && !showAddTasks && (
+      {visibleTasks.length === 0 && !showAddTasks && (
         <div className="border border-dashed border-zinc-800 rounded-lg p-6 text-center">
           <p className="text-sm text-zinc-500">{t('projects.tasks.empty')}</p>
           <p className="text-[11px] text-zinc-600 mt-1">{t('projects.tasks.emptyHint')}</p>
         </div>
       )}
 
-      {activeTasks.length > 0 && (
-        <div className="grid grid-cols-4 gap-2 min-h-[250px]">
+      {visibleTasks.length > 0 && (
+        <div className="grid grid-cols-5 gap-2 min-h-[250px]">
           {BOARD_COLUMNS.map(col => (
             <div key={col.id} className="flex flex-col">
               <div className="flex items-center gap-1.5 mb-2 px-1">

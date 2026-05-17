@@ -9,18 +9,20 @@ import { ArtifactPreviewModal } from './ArtifactPreviewModal';
 
 const COLUMNS = [
   { id: 'pending', label: '待处理', color: 'border-t-zinc-500', icon: Circle, statuses: ['pending'] },
-  { id: 'active', label: '进行中', color: 'border-t-yellow-400', icon: Loader2, statuses: ['dispatched', 'in_progress'] },
-  { id: 'review', label: '待审核', color: 'border-t-green-400', icon: Eye, statuses: ['review'] },
-  { id: 'done', label: '已完成', color: 'border-t-green-400', icon: CheckCircle2, statuses: ['done', 'failed', 'cancelled'] },
+  { id: 'active', label: '进行中', color: 'border-t-yellow-400', icon: Loader2, statuses: ['dispatched', 'accepted', 'in_progress'] },
+  { id: 'review', label: '待审核', color: 'border-t-green-400', icon: Eye, statuses: ['submitted'] },
+  { id: 'blocked', label: '异常', color: 'border-t-red-400', icon: AlertCircle, statuses: ['blocked', 'failed'] },
+  { id: 'done', label: '已完成', color: 'border-t-green-400', icon: CheckCircle2, statuses: ['done', 'cancelled'] },
 ];
 
 function TaskCard({ task, projectId, onPreviewArtifact }) {
   const { cancelTask, markTaskDone, agents } = useKSwarm();
   const [acting, setActing] = useState(false);
   const isFailed = task.status === 'failed';
+  const isBlocked = task.status === 'blocked';
   const isCancelled = task.status === 'cancelled';
   const canCancel = task.status === 'pending';
-  const canMarkDone = task.status === 'review' || task.status === 'in_progress';
+  const canMarkDone = task.status === 'submitted' || task.status === 'in_progress';
   const result = task.result || {};
   const hasArtifacts = result.artifacts && result.artifacts.length > 0;
   const review = task.reviewResult;
@@ -48,7 +50,7 @@ function TaskCard({ task, projectId, onPreviewArtifact }) {
   return (
     <>
       <div className={`group rounded-lg border border-gray-200 bg-gray-50 p-3 transition-colors hover:bg-gray-50 ${
-        isFailed ? 'border-red-400/30' : isCancelled ? 'opacity-50' : ''
+        (isFailed || isBlocked) ? 'border-red-400/30' : isCancelled ? 'opacity-50' : ''
       }`}>
         <div className="flex items-start justify-between gap-1">
           <p className="text-[12px] font-medium text-gray-900 line-clamp-2 flex-1">{task.title}</p>
@@ -79,6 +81,22 @@ function TaskCard({ task, projectId, onPreviewArtifact }) {
             <span className="font-medium">{review.passed ? 'PASSED' : 'REWORK'}</span>
             {review.feedback && <p className="mt-0.5 text-gray-500 line-clamp-2">{review.feedback}</p>}
           </div>
+        )}
+        {isBlocked && (
+          <div className="mt-2 rounded-lg border border-red-400/20 bg-red-400/5 px-2 py-1.5 text-[10px] text-red-500">
+            <span className="font-medium">BLOCKED</span>
+            {task.blockedReason && <p className="mt-0.5 line-clamp-2 text-gray-500">{task.blockedReason}</p>}
+            {task.nextActions?.length > 0 && <p className="mt-0.5 line-clamp-2 text-gray-500">{task.nextActions[0]}</p>}
+          </div>
+        )}
+        {task.status === 'dispatched' && (
+          <span className="mt-1.5 inline-block rounded-full bg-yellow-500/10 px-1.5 py-0.5 text-[10px] text-yellow-600">等待接收</span>
+        )}
+        {task.status === 'accepted' && (
+          <span className="mt-1.5 inline-block rounded-full bg-blue-500/10 px-1.5 py-0.5 text-[10px] text-blue-600">已接收</span>
+        )}
+        {task.status === 'submitted' && (
+          <span className="mt-1.5 inline-block rounded-full bg-green-500/10 px-1.5 py-0.5 text-[10px] text-green-600">待 PO 审核</span>
         )}
         {hasArtifacts && (
           <div className="mt-2 flex flex-wrap gap-1">
@@ -126,8 +144,8 @@ function AddTaskForm({ projectId, onDone }) {
       <div className="flex flex-col gap-2">
         {rows.map((row, idx) => (
           <div key={idx} className="flex items-center gap-1.5">
-            <input type="text" value={row.title} onChange={e => updateRow(idx, 'title', e.target.value)} placeholder="任务标题..."
-              className="flex-1 rounded-lg border border-gray-300 bg-gray-50 px-2.5 py-1.5 text-[12px] text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500" autoFocus={idx === 0} placeholder="需求内容..." />
+            <input type="text" value={row.title} onChange={e => updateRow(idx, 'title', e.target.value)} placeholder="需求内容..."
+              className="flex-1 rounded-lg border border-gray-300 bg-gray-50 px-2.5 py-1.5 text-[12px] text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500" autoFocus={idx === 0} />
             <select value={row.assignedAgent} onChange={e => updateRow(idx, 'assignedAgent', e.target.value)}
               className="w-28 rounded-lg border border-gray-300 bg-gray-50 px-2 py-1.5 text-[11px] text-gray-900 outline-none">
               <option value="">自动分配</option>

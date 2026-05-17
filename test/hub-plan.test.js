@@ -154,7 +154,7 @@ test('approve: full realistic sequence — create → plan → tasks → approve
   // 5. Dispatch — only Phase 1
   const d = hub.handleRequestDispatch('proj-plan-1', 'po-1');
   assert.ok(d.ok);
-  assert.deepEqual(d.dispatched, ['item-1']);
+  assert.deepEqual(d.dispatched, ['proj-plan-1__item-1']);
   assert.equal(hub.getBoard('proj-plan-1').getTask('item-2').status, 'pending');
 });
 
@@ -318,7 +318,7 @@ test('revisePlan: modifies item field', () => {
 
 // ─── Phase-aware dispatch ────────────────────────────────────────────
 
-test('dispatch: phase-aware — only dispatches from earliest incomplete phase', () => {
+test('dispatch: dependency-aware — independent later phases can dispatch', () => {
   const hub = setup();
   createTestProject(hub);
 
@@ -340,17 +340,17 @@ test('dispatch: phase-aware — only dispatches from earliest incomplete phase',
   ], 'po-1');
   hub.handleApprove('proj-plan-1');
 
-  // Dispatch — should only dispatch phase 1 tasks
+  // Dispatch — independent tasks from later phases can run without a phase gate.
   const result = hub.handleRequestDispatch('proj-plan-1', 'po-1');
   assert.ok(result.ok);
-  assert.deepEqual(result.dispatched, ['item-1']);
+  assert.deepEqual(result.dispatched.sort(), ['proj-plan-1__item-1', 'proj-plan-1__item-2']);
 
-  // Phase 2 task should still be pending
+  // Phase 2 task should no longer be held back just because phase 1 exists.
   const board = hub.getBoard('proj-plan-1');
-  assert.equal(board.getTask('item-2').status, 'pending');
+  assert.equal(board.getTask('item-2').status, 'dispatched');
 });
 
-test('dispatch: after phase 1 done, phase 2 becomes dispatchable', () => {
+test('dispatch: explicit dependencies still gate later phase work', () => {
   const hub = setup();
   createTestProject(hub);
 
@@ -358,13 +358,13 @@ test('dispatch: after phase 1 done, phase 2 becomes dispatchable', () => {
     analysis: 'test',
     phases: [
       { id: 'p1', name: 'Phase 1', items: [{ id: 'item-1', title: 'T1', brief: 'P1', status: 'planned', assignedAgent: 'w-1', dependencies: [] }] },
-      { id: 'p2', name: 'Phase 2', items: [{ id: 'item-2', title: 'T2', brief: 'P2', status: 'planned', assignedAgent: 'w-2', dependencies: [] }] },
+      { id: 'p2', name: 'Phase 2', items: [{ id: 'item-2', title: 'T2', brief: 'P2', status: 'planned', assignedAgent: 'w-2', dependencies: ['item-1'] }] },
     ],
   }, 'po-1');
 
   hub.handleCreateTasks('proj-plan-1', [
     { id: 'item-1', title: 'T1', brief: 'P1', assignedAgent: 'w-1', phaseId: 'p1', dependencies: [] },
-    { id: 'item-2', title: 'T2', brief: 'P2', assignedAgent: 'w-2', phaseId: 'p2', dependencies: [] },
+    { id: 'item-2', title: 'T2', brief: 'P2', assignedAgent: 'w-2', phaseId: 'p2', dependencies: ['item-1'] },
   ], 'po-1');
   hub.handleApprove('proj-plan-1');
 
@@ -376,10 +376,10 @@ test('dispatch: after phase 1 done, phase 2 becomes dispatchable', () => {
   board.transition('item-1', 'submitted');
   board.transition('item-1', 'done');
 
-  // Now phase 2 should be dispatchable
+  // Now the explicit dependency is satisfied and phase 2 can dispatch.
   const result2 = hub.handleRequestDispatch('proj-plan-1', 'po-1');
   assert.ok(result2.ok);
-  assert.deepEqual(result2.dispatched, ['item-2']);
+  assert.deepEqual(result2.dispatched, ['proj-plan-1__item-2']);
 });
 
 test('dispatch: without plan, dispatches all (backward compat)', () => {
@@ -467,7 +467,7 @@ test('submitPlan: rejects duplicate plan submission', () => {
   assert.equal(r2.error, 'plan_already_exists');
 });
 
-test('addTasks: skips duplicate task IDs', () => {
+test('addTasks: rejects duplicate task IDs without overwriting existing task', () => {
   const hub = setup();
   createTestProject(hub);
   hub.handleCreateTasks('proj-plan-1', [
@@ -479,16 +479,17 @@ test('addTasks: skips duplicate task IDs', () => {
   board.transition('t1', 'accepted');
   board.transition('t1', 'in_progress');
 
-  // Try to re-add same ID — should not overwrite
-  hub.handleCreateTasks('proj-plan-1', [
+  // Try to re-add same ID — should reject the batch and not overwrite
+  const result = hub.handleCreateTasks('proj-plan-1', [
     { id: 't1', title: 'Duplicate', brief: 'Should be ignored' },
     { id: 't2', title: 'New task', brief: 'Should be added' },
   ], 'po-1');
 
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'duplicate_local_task_id');
   assert.equal(board.getTask('t1').title, 'Original');
   assert.equal(board.getTask('t1').status, 'in_progress');
-  assert.equal(board.getTask('t2').title, 'New task');
-  assert.equal(board.getTask('t2').status, 'pending');
+  assert.equal(board.getTask('t2'), undefined);
 });
 
 test('qualityReview: double-review race returns alreadyReviewed', () => {

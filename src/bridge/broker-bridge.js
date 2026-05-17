@@ -88,7 +88,7 @@ export function createBrokerBridge({ brokerUrl = DEFAULT_BROKER_URL, hubParticip
 
   // ─── Intent senders (Hub → Broker) ──────────────────────────────────
 
-  function requestTask({ taskId, title, brief, targetAlias, targetParticipantId, projectName }) {
+  function requestTask({ taskId, title, brief, targetAlias, targetParticipantId, projectName, projectId, localTaskId, runId, attempt }) {
     send({
       type: 'intent',
       kind: 'request_task',
@@ -96,6 +96,11 @@ export function createBrokerBridge({ brokerUrl = DEFAULT_BROKER_URL, hubParticip
       fromParticipantId: hubParticipantId,
       toParticipantId: targetParticipantId || null,
       payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        attempt,
         title,
         brief,
         targetAlias,

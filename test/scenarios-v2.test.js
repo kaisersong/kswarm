@@ -21,6 +21,10 @@ function scenario(name, fn) {
   fn();
 }
 
+function currentRun(hub, projectId, taskId) {
+  return hub.getBoard(projectId).getTask(taskId)?.activeRunId;
+}
+
 /** Mock bridge that records all messages */
 function createMockBridge() {
   const sent = [];
@@ -105,8 +109,9 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
 
   // ── Step 6: Workers 执行并提交结果
   console.log('    [@qoder] 接受 t1，开始调研...');
-  hub.handleAcceptTask('proj-001', 't1', 'qoder-default');
-  hub.handleProgress('proj-001', 't1', 'started', 'qoder-default');
+  const t1Run = currentRun(hub, 'proj-001', 't1');
+  hub.handleAcceptTask('proj-001', 't1', 'qoder-default', t1Run);
+  hub.handleProgress('proj-001', 't1', 'started', 'qoder-default', t1Run);
   assert(board.getTask('t1').status === 'in_progress', 't1 状态 = in_progress');
 
   // PO 应该收到通知
@@ -118,7 +123,7 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
     success: true,
     summary: 'CRDT 方案更适合，推荐 Yjs',
     artifacts: [{ name: 'tech-research.md', type: 'text' }],
-  }, 'qoder-default');
+  }, 'qoder-default', t1Run);
   assert(board.getTask('t1').status === 'submitted', 't1 状态 = submitted（等 PO 确认）');
 
   // PO 收到结果通知
@@ -130,38 +135,42 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
   assert(board.getTask('t1').status === 'done', 't1 状态 = done（PO 确认）');
 
   // 同时 xiaok 自己完成 t2
-  hub.handleAcceptTask('proj-001', 't2', 'xiaok-default');
-  hub.handleProgress('proj-001', 't2', 'started', 'xiaok-default');
-  hub.handleSubmitResult('proj-001', 't2', { success: true, summary: '需求清单完成' }, 'xiaok-default');
+  const t2Run = currentRun(hub, 'proj-001', 't2');
+  hub.handleAcceptTask('proj-001', 't2', 'xiaok-default', t2Run);
+  hub.handleProgress('proj-001', 't2', 'started', 'xiaok-default', t2Run);
+  hub.handleSubmitResult('proj-001', 't2', { success: true, summary: '需求清单完成' }, 'xiaok-default', t2Run);
   hub.handleMarkDone('proj-001', 't2', 'xiaok-default');
   assert(board.getTask('t2').status === 'done', 't2 done');
 
   // ── Step 8: t1, t2 都 done → t3 的依赖满足
   console.log('    [PO @xiaok] t1+t2 完成，请求派发 t3...');
   const dispatch2 = hub.handleRequestDispatch('proj-001', 'xiaok-default');
-  assert(dispatch2.dispatched.includes('t3'), 't3 现在可以派发了（依赖满足）');
+  assert(dispatch2.dispatched.includes('proj-001__t3'), 't3 现在可以派发了（依赖满足）');
   assert(!dispatch2.dispatched.includes('t4'), 't4 还不能派（等 t3）');
 
   // 完成 t3
-  hub.handleAcceptTask('proj-001', 't3', 'claude-code-default');
-  hub.handleProgress('proj-001', 't3', 'started', 'claude-code-default');
-  hub.handleSubmitResult('proj-001', 't3', { success: true, summary: '架构设计完成' }, 'claude-code-default');
+  const t3Run = currentRun(hub, 'proj-001', 't3');
+  hub.handleAcceptTask('proj-001', 't3', 'claude-code-default', t3Run);
+  hub.handleProgress('proj-001', 't3', 'started', 'claude-code-default', t3Run);
+  hub.handleSubmitResult('proj-001', 't3', { success: true, summary: '架构设计完成' }, 'claude-code-default', t3Run);
   hub.handleMarkDone('proj-001', 't3', 'xiaok-default');
 
   // 完成 t4
   const dispatch3 = hub.handleRequestDispatch('proj-001', 'xiaok-default');
-  assert(dispatch3.dispatched.includes('t4'), 't4 可以派发');
-  hub.handleAcceptTask('proj-001', 't4', 'codex-default');
-  hub.handleProgress('proj-001', 't4', 'started', 'codex-default');
-  hub.handleSubmitResult('proj-001', 't4', { success: true, summary: 'API 定义完成' }, 'codex-default');
+  assert(dispatch3.dispatched.includes('proj-001__t4'), 't4 可以派发');
+  const t4Run = currentRun(hub, 'proj-001', 't4');
+  hub.handleAcceptTask('proj-001', 't4', 'codex-default', t4Run);
+  hub.handleProgress('proj-001', 't4', 'started', 'codex-default', t4Run);
+  hub.handleSubmitResult('proj-001', 't4', { success: true, summary: 'API 定义完成' }, 'codex-default', t4Run);
   hub.handleMarkDone('proj-001', 't4', 'xiaok-default');
 
   // 完成 t5 (依赖 t3 + t4)
   const dispatch4 = hub.handleRequestDispatch('proj-001', 'xiaok-default');
-  assert(dispatch4.dispatched.includes('t5'), 't5 可以派发（t3+t4 done）');
-  hub.handleAcceptTask('proj-001', 't5', 'xiaok-default');
-  hub.handleProgress('proj-001', 't5', 'started', 'xiaok-default');
-  hub.handleSubmitResult('proj-001', 't5', { success: true, summary: '最终方案文档整合完成' }, 'xiaok-default');
+  assert(dispatch4.dispatched.includes('proj-001__t5'), 't5 可以派发（t3+t4 done）');
+  const t5Run = currentRun(hub, 'proj-001', 't5');
+  hub.handleAcceptTask('proj-001', 't5', 'xiaok-default', t5Run);
+  hub.handleProgress('proj-001', 't5', 'started', 'xiaok-default', t5Run);
+  hub.handleSubmitResult('proj-001', 't5', { success: true, summary: '最终方案文档整合完成' }, 'xiaok-default', t5Run);
   hub.handleMarkDone('proj-001', 't5', 'xiaok-default');
 
   // ── Step 9: PO 确认全部完成，提交交付
@@ -226,15 +235,16 @@ scenario('3. 返工 — PO review 不通过，要求重做', () => {
 
   hub.createProject({ id: 'proj-003', name: 'rework test', goal: 'test', poAgent: 'xiaok-default' });
   hub.handleCreateTasks('proj-003', [
-    { id: 'r1', title: '写方案', brief: 'test', dependencies: [], requiredCapabilities: [] },
+    { id: 'r1', title: '写方案', brief: 'test', assignedAgent: 'codex-default', dependencies: [], requiredCapabilities: [] },
   ], 'xiaok-default');
   hub.handleApprove('proj-003');
   hub.handleRequestDispatch('proj-003', 'xiaok-default');
 
   // Worker 提交了一个质量不好的结果
-  hub.handleAcceptTask('proj-003', 'r1', 'codex-default');
-  hub.handleProgress('proj-003', 'r1', 'started', 'codex-default');
-  hub.handleSubmitResult('proj-003', 'r1', { success: true, summary: '草率的结果' }, 'codex-default');
+  const r1Run = currentRun(hub, 'proj-003', 'r1');
+  hub.handleAcceptTask('proj-003', 'r1', 'codex-default', r1Run);
+  hub.handleProgress('proj-003', 'r1', 'started', 'codex-default', r1Run);
+  hub.handleSubmitResult('proj-003', 'r1', { success: true, summary: '草率的结果' }, 'codex-default', r1Run);
 
   const board = hub.getBoard('proj-003');
   assert(board.getTask('r1').status === 'submitted', '提交后 status = submitted');
@@ -322,16 +332,17 @@ scenario('6. 交付门控 — 任务没做完不能交付', () => {
 
   hub.createProject({ id: 'proj-006', name: 'delivery gate', goal: 'test', poAgent: 'po-1' });
   hub.handleCreateTasks('proj-006', [
-    { id: 'd1', title: 't1', brief: 'test', dependencies: [], requiredCapabilities: [] },
-    { id: 'd2', title: 't2', brief: 'test', dependencies: [], requiredCapabilities: [] },
+    { id: 'd1', title: 't1', brief: 'test', assignedAgent: 'worker-1', dependencies: [], requiredCapabilities: [] },
+    { id: 'd2', title: 't2', brief: 'test', assignedAgent: 'worker-1', dependencies: [], requiredCapabilities: [] },
   ], 'po-1');
   hub.handleApprove('proj-006');
 
   // 只完成 d1，尝试交付
   hub.handleRequestDispatch('proj-006', 'po-1');
-  hub.handleAcceptTask('proj-006', 'd1', 'worker-1');
-  hub.handleProgress('proj-006', 'd1', 'started', 'worker-1');
-  hub.handleSubmitResult('proj-006', 'd1', { success: true }, 'worker-1');
+  const d1Run = currentRun(hub, 'proj-006', 'd1');
+  hub.handleAcceptTask('proj-006', 'd1', 'worker-1', d1Run);
+  hub.handleProgress('proj-006', 'd1', 'started', 'worker-1', d1Run);
+  hub.handleSubmitResult('proj-006', 'd1', { success: true }, 'worker-1', d1Run);
   hub.handleMarkDone('proj-006', 'd1', 'po-1');
 
   const r = hub.handleDeliver('proj-006', { summary: 'done' }, 'po-1');
@@ -339,9 +350,12 @@ scenario('6. 交付门控 — 任务没做完不能交付', () => {
   assert(r.error === 'tasks_not_all_done', `错误: ${r.error}`);
 
   // 完成 d2 后可以
-  hub.handleAcceptTask('proj-006', 'd2', 'worker-1');
-  hub.handleProgress('proj-006', 'd2', 'started', 'worker-1');
-  hub.handleSubmitResult('proj-006', 'd2', { success: true }, 'worker-1');
+  const d2Dispatch = hub.handleRequestDispatch('proj-006', 'po-1');
+  assert(d2Dispatch.dispatched.includes('proj-006__d2'), 'd2 在 d1 完成后被派发');
+  const d2Run = currentRun(hub, 'proj-006', 'd2');
+  hub.handleAcceptTask('proj-006', 'd2', 'worker-1', d2Run);
+  hub.handleProgress('proj-006', 'd2', 'started', 'worker-1', d2Run);
+  hub.handleSubmitResult('proj-006', 'd2', { success: true }, 'worker-1', d2Run);
   hub.handleMarkDone('proj-006', 'd2', 'po-1');
 
   const r2 = hub.handleDeliver('proj-006', { summary: 'done' }, 'po-1');
