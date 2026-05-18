@@ -699,10 +699,12 @@ async function handleRequest(req, res) {
         const board = hub.getBoard(p.id);
         const tasks = board ? board.getAllTasks() : [];
         const done = tasks.filter(t => t.status === 'done').length;
+        const cancelled = tasks.filter(t => t.status === 'cancelled').length;
         return {
           ...p,
           taskCount: tasks.length,
           doneCount: done,
+          cancelledCount: cancelled,
           updatedAt: p.updatedAt || p.createdAt || 0,
           projectIntervention: hub.getProjectIntervention(p.id),
         };
@@ -812,6 +814,17 @@ async function handleRequest(req, res) {
           dispatched: result.dispatched || [],
         });
         broadcast({ type: 'project_continue', projectId, result });
+        if (result.recovered && brokerClient && brokerClient.isConnected()) {
+          const project = hub.getProject(projectId);
+          const task = hub.getBoard(projectId)?.getTask(result.taskId);
+          const fromWorker = task?.recoveredBy || task?.assignedAgent || 'continue_project';
+          if (project?.poAgent && result.taskId) {
+            brokerClient.sendTo(project.poAgent, 'review_submission', {
+              taskId: result.taskId,
+              payload: { projectId, taskId: result.taskId, fromWorker, result: result.result },
+            }).catch(() => {});
+          }
+        }
         if ((result.dispatched || []).length > 0) {
           await sendBrokerRequestTasks(projectId, result.dispatched || []);
         }
