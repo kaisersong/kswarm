@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { planDispatch } from '../src/core/dispatch-policy.js';
 import { createUnknownRuntimeHealth, recordProbeResult } from '../src/core/runtime-health.js';
+import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -27,6 +28,27 @@ test('dispatch planning treats busy agents as global across projects', () => {
     { taskId: 'proj-b__task-1', reason: 'agent_busy', agent: 'worker' },
   ]);
   assert.equal(plan.projectGate, 'waiting_for_busy_agents');
+});
+
+test('dispatch planning does not mark preferred agent busy for active local executor runs', () => {
+  const plan = planDispatch({
+    projectId: 'proj-b',
+    tasks: [
+      { id: 'proj-b__task-1', title: 'B task', status: 'pending', assignedAgent: 'worker', dependencies: [] },
+    ],
+    allActiveTasks: [
+      {
+        id: 'proj-a__deck',
+        projectId: 'proj-a',
+        status: 'in_progress',
+        assignedAgent: 'worker',
+        assignedExecutor: PRESENTATION_PPTX_EXECUTOR_ID,
+      },
+    ],
+  });
+
+  assert.deepEqual(plan.dispatchedTasks.map(task => task.id), ['proj-b__task-1']);
+  assert.deepEqual(plan.skipped, []);
 });
 
 test('dispatch planning allows independent tasks from later phases when dependencies are satisfied', () => {

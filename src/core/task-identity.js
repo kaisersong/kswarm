@@ -53,7 +53,6 @@ export function makeRunId(taskId, attempt = 1, now = Date.now()) {
 export function normalizeTasksForProject(projectId, taskList, existingTasks = []) {
   const allByGlobal = new Map();
   const aliases = new Map();
-  const titleCounts = new Map();
 
   for (const task of existingTasks) {
     const normalized = normalizeExistingTask(projectId, task);
@@ -62,9 +61,6 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
     addAlias(aliases, normalized.localTaskId, normalized.id);
     if (normalized.legacyTaskId) addAlias(aliases, normalized.legacyTaskId, normalized.id);
     if (normalized.planItemId) addAlias(aliases, normalized.planItemId, normalized.id);
-    if (normalized.title) {
-      titleCounts.set(normalized.title, (titleCounts.get(normalized.title) || 0) + 1);
-    }
   }
 
   const prepared = [];
@@ -101,16 +97,9 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
     addAlias(aliases, task.displayTaskId, id);
     addAlias(aliases, task.legacyTaskId, id);
     addAlias(aliases, task.planItemId, id);
-    if (task.title) {
-      titleCounts.set(task.title, (titleCounts.get(task.title) || 0) + 1);
-    }
   }
 
-  for (const task of allByGlobal.values()) {
-    if (task.title && titleCounts.get(task.title) === 1) {
-      addAlias(aliases, task.title, task.id);
-    }
-  }
+  addResolvableTitleAliases(projectId, aliases, allByGlobal.values());
 
   for (const task of prepared) {
     const normalizedDeps = [];
@@ -151,7 +140,6 @@ export function normalizeExistingTask(projectId, task) {
 
 export function buildTaskAliases(projectId, tasks) {
   const aliases = new Map();
-  const titleCounts = new Map();
   const normalized = tasks.map(t => normalizeExistingTask(projectId, t));
   for (const task of normalized) {
     addAlias(aliases, task.id, task.id);
@@ -159,13 +147,8 @@ export function buildTaskAliases(projectId, tasks) {
     addAlias(aliases, task.displayTaskId, task.id);
     addAlias(aliases, task.legacyTaskId, task.id);
     addAlias(aliases, task.planItemId, task.id);
-    if (task.title) titleCounts.set(task.title, (titleCounts.get(task.title) || 0) + 1);
   }
-  for (const task of normalized) {
-    if (task.title && titleCounts.get(task.title) === 1) {
-      addAlias(aliases, task.title, task.id);
-    }
-  }
+  addResolvableTitleAliases(projectId, aliases, normalized);
   return aliases;
 }
 
@@ -186,6 +169,57 @@ function resolveTaskRefFromAliases(projectId, taskRef, aliases) {
   const byNormalized = aliases.get(normalized);
   if (byNormalized) return { taskId: byNormalized, via: 'normalized' };
   return null;
+}
+
+function addResolvableTitleAliases(projectId, aliases, tasks) {
+  const groups = new Map();
+  for (const task of tasks) {
+    if (!task.title) continue;
+    const group = groups.get(task.title) || [];
+    group.push(task);
+    groups.set(task.title, group);
+  }
+
+  for (const [title, group] of groups.entries()) {
+    const target = resolveTitleAliasTarget(projectId, group);
+    if (target) addAlias(aliases, title, target.id);
+  }
+}
+
+function resolveTitleAliasTarget(projectId, group) {
+  if (group.length === 1) return group[0];
+
+  const roots = group.filter(task => !isRetryChild(projectId, task));
+  if (roots.length !== 1) return null;
+
+  const root = roots[0];
+  const rootId = makeTaskId(projectId, root.id);
+  const allRetryChildrenOfRoot = group.every(task => (
+    task.id === rootId || isRetryChildOf(projectId, task, rootId)
+  ));
+
+  return allRetryChildrenOfRoot ? root : null;
+}
+
+function isRetryChild(projectId, task) {
+  return Boolean(getRetryParentId(projectId, task) && isRetryLikeTask(task));
+}
+
+function isRetryChildOf(projectId, task, parentTaskId) {
+  return getRetryParentId(projectId, task) === parentTaskId && isRetryLikeTask(task);
+}
+
+function getRetryParentId(projectId, task) {
+  const parentRef = task.parentTaskId || task.retryOfTaskId;
+  return parentRef ? makeTaskId(projectId, parentRef) : null;
+}
+
+function isRetryLikeTask(task) {
+  return Boolean(
+    task.retryOfTaskId ||
+    String(task.id || '').includes('-retry-') ||
+    Number(task.attempt || 1) > 1,
+  );
 }
 
 function addAlias(aliases, key, taskId) {

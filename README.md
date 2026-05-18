@@ -72,7 +72,7 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 - **Runtime Watchdogs** — Heartbeats, stdout/stderr telemetry, and stale-run detection prevent silent CLI hangs
 - **Deliverable Contracts** — Explicit PPTX/HTML/Markdown tasks are validated before review
 - **Plan Retry Recovery** — Projects interrupted during PO planning can be restarted safely
-- **Local PPTX Fallback** — Presentation tasks can use a deterministic local executor when no agent can produce PPTX
+- **Local Executor Registry** — Explicit PPTX presentation tasks can use a deterministic registered executor when no agent can produce PPTX
 - **Persistence** — Projects survive server restarts (debounced JSON state file)
 
 ### Web UI
@@ -218,7 +218,7 @@ npm run test:e2e-p0   # P0 integration scenarios
 
 ## Version History
 
-**v0.7.0** — Reliable execution hardening: runtime probes and health cooldowns, capability-aware dispatch/retry routing, stalled-run watchdogs with heartbeat/stdout/stderr telemetry, strict deliverable contracts for PPTX/HTML/Markdown tasks, deterministic local PPTX fallback, restart recovery for active runs, and retryable planning when the PO planning phase is interrupted.
+**v0.7.0** — Reliable execution hardening: runtime probes and health cooldowns, capability-aware dispatch/retry routing, stalled-run watchdogs with heartbeat/stdout/stderr telemetry, strict deliverable contracts for PPTX/HTML/Markdown tasks, deterministic local executor fallback for explicit PPTX presentation tasks, restart recovery for active runs, and retryable planning when the PO planning phase is interrupted.
 
 **v0.6.0** — Plan-Do execution model: structured planning with phases, quality review with artifact content reading, phase-aware dispatch, offline worker fallback (PO auto-takes-over), rework loop, persistence across restarts.
 

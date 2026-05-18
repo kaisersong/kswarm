@@ -79,6 +79,43 @@ test('legacy agents loaded without runtimeHealth receive defaults on read', asyn
   }
 });
 
+test('setOnline clears stale degraded health so restarted agents can route', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'kswarm-agent-store-'));
+  try {
+    const { createAgentStore } = await importFreshAgentStore(home);
+    const store = createAgentStore();
+    store.create({
+      id: 'worker',
+      name: 'Worker',
+      runtimeType: 'xiaok',
+      capabilities: ['planning'],
+    });
+    store.updateRuntimeHealth('worker', {
+      state: 'stalled',
+      lastFailureClass: 'runtime_stalled',
+      lastError: 'heartbeat_timeout',
+      outputCapabilities: ['markdown', 'html'],
+      taskCapabilities: ['planning'],
+    });
+
+    store.setOnline('worker', 'pid-123');
+    const online = store.get('worker');
+    assert.equal(online.status, 'idle');
+    assert.equal(online.runtimeId, 'pid-123');
+    assert.equal(online.runtimeHealth.state, 'healthy');
+    assert.equal(online.runtimeHealth.lastFailureClass, null);
+    assert.deepEqual(online.runtimeHealth.taskCapabilities, ['planning']);
+
+    store.setOffline('worker');
+    const offline = store.get('worker');
+    assert.equal(offline.status, 'offline');
+    assert.equal(offline.runtimeId, null);
+    assert.equal(offline.runtimeHealth.state, 'unknown');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

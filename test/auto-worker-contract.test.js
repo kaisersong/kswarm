@@ -66,6 +66,13 @@ test('worker emits runtime telemetry and supports owner-checked cancel_run', () 
   assert.match(source, /activeChild\.kill\(['"]SIGTERM['"]\)/);
 });
 
+test('worker prompt and submission path support declared artifact files', () => {
+  assert.match(source, /extractDeclaredArtifacts/);
+  assert.match(source, /artifact path=/);
+  assert.match(source, /declaredArtifacts\.artifacts/);
+  assert.match(source, /declaredArtifacts\.artifacts\.map/);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

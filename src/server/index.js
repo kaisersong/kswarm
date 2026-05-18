@@ -15,7 +15,7 @@ import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { createBrokerClient } from '../net/broker-client.js';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { basename, join, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { listProviders } from '../llm/index.js';
@@ -27,21 +27,28 @@ import { parseTaskId } from '../core/task-identity.js';
 import { planProjectRecovery } from '../core/recovery-planner.js';
 import { readRunJournals } from '../core/recovery-store.js';
 import { executeRecoveryAction } from '../core/recovery-executor.js';
-import { normalizeProjectForPlanRetry } from '../core/plan-retry-recovery.js';
+import {
+  buildPlanRetryAssignPoIntent,
+  normalizeProjectForPlanRetry,
+  resolvePlanRetryPoAgent,
+} from '../core/plan-retry-recovery.js';
 import { probeAgentRuntime } from '../core/runtime-probe.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
-import {
-  executePresentationPptxTask,
-  PRESENTATION_PPTX_EXECUTOR_ID,
-} from '../executors/presentation-pptx-executor.js';
+import { createBuiltInLocalExecutorRegistry } from '../executors/registry.js';
 import {
   initProjectWorkspace as initProjectWorkspaceRecord,
   setProjectWorkspace as setProjectWorkspaceRecord,
 } from './project-workspace.js';
+import {
+  createAutoWorkerSpawnConfig,
+  spawnAutoWorkerProcess,
+} from './auto-worker-process.js';
+import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
+const localExecutorRegistry = createBuiltInLocalExecutorRegistry();
 
 // Project workspace base — each project gets its own folder
 const KSWARM_HOME = join(homedir(), '.kswarm');
@@ -72,13 +79,7 @@ if (resetCount > 0) console.log(`[KSwarm] Reset ${resetCount} stale agent(s) to 
 const projectWorkspaces = new Map(); // projectId → { path, artifacts, custom }
 
 function listLocalExecutors() {
-  return [
-    {
-      id: PRESENTATION_PPTX_EXECUTOR_ID,
-      taskCapabilities: ['presentation_generation'],
-      outputCapabilities: ['pptx'],
-    },
-  ];
+  return localExecutorRegistry.list();
 }
 
 function initProjectWorkspace(projectId, customPath) {
@@ -98,14 +99,33 @@ function setProjectWorkspace(projectId, newPath) {
 
 function listProjectArtifacts(projectId) {
   const ws = getProjectWorkspace(projectId);
-  if (!existsSync(ws.artifacts)) return [];
-  return readdirSync(ws.artifacts).map(f => {
-    const ext = extname(f);
+  return listArtifactRecords({
+    artifactsDir: ws.artifacts,
+    projectId,
+    getPreviewable,
+    mimeTypes: MIME_TYPES,
+  });
+}
+
+function enrichProjectTaskArtifacts(projectId, tasks) {
+  const ws = getProjectWorkspace(projectId);
+  return tasks.map(task => {
+    const result = task?.result;
+    const artifacts = result && typeof result === 'object' && Array.isArray(result.artifacts)
+      ? result.artifacts
+      : null;
+    if (!artifacts) return task;
     return {
-      filename: f,
-      url: `/projects/${projectId}/artifacts/${f}`,
-      previewable: getPreviewable(ext),
-      mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+      ...task,
+      result: {
+        ...result,
+        artifacts: artifacts.map(artifact => enrichArtifactRecordFromFile({
+          artifact,
+          artifactsDir: ws.artifacts,
+          getPreviewable,
+          mimeTypes: MIME_TYPES,
+        })),
+      },
     };
   });
 }
@@ -151,9 +171,10 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
     if (!task?.assignedAgent) continue;
-    if (task.selectedRoute?.selectedExecutorId === PRESENTATION_PPTX_EXECUTOR_ID || task.assignedAgent === PRESENTATION_PPTX_EXECUTOR_ID) {
-      executeLocalPptxTask(projectId, task.id).catch(err => {
-        log('error', `Local PPTX executor failed for ${task.id}`, { projectId, error: err.message });
+    const localExecutorId = task.assignedExecutor || task.selectedRoute?.selectedExecutorId || null;
+    if (localExecutorId && localExecutorRegistry.has(localExecutorId)) {
+      executeLocalExecutorTask(projectId, task.id, localExecutorId).catch(err => {
+        log('error', `Local executor failed for ${task.id}`, { projectId, executorId: localExecutorId, error: err.message });
       });
       continue;
     }
@@ -181,14 +202,13 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   }
 }
 
-async function executeLocalPptxTask(projectId, taskId) {
+async function executeLocalExecutorTask(projectId, taskId, executorId) {
   const project = hub.getProject(projectId);
   const board = hub.getBoard(projectId);
   const task = board?.getTask(taskId);
   if (!project || !task) return;
   const ws = getProjectWorkspace(projectId);
   const runId = task.activeRunId;
-  const executorId = PRESENTATION_PPTX_EXECUTOR_ID;
 
   hub.handleAcceptTask(projectId, task.id, executorId, runId);
   hub.handleProgress(projectId, task.id, 'started', executorId, runId, {
@@ -196,13 +216,13 @@ async function executeLocalPptxTask(projectId, taskId) {
     lastHeartbeatAt: Date.now(),
   });
 
-  const generated = await executePresentationPptxTask({
+  const generated = await localExecutorRegistry.execute(executorId, {
     projectId,
     task,
     workspacePath: ws.path,
   });
   if (!generated.ok) {
-    hub.handleWorkerFailure(projectId, task.id, executorId, runId, 'runtime_generation_unavailable', generated.error || 'pptx executor failed');
+    hub.handleWorkerFailure(projectId, task.id, executorId, runId, 'runtime_generation_unavailable', generated.error || 'local executor failed');
     return;
   }
 
@@ -483,6 +503,36 @@ async function isAgentOnBroker(agentId) {
   }
 }
 
+function buildAgentChildEnv(agent, agentId) {
+  const childEnv = { ...process.env, ...agent.customEnv };
+  if (agent.provider) {
+    if (agent.provider === 'openai') {
+      if (agent.apiKey) childEnv.OPENAI_API_KEY = agent.apiKey;
+      if (agent.baseUrl) childEnv.OPENAI_BASE_URL = agent.baseUrl;
+      if (agent.model) childEnv.OPENAI_MODEL = agent.model;
+    } else if (agent.provider === 'anthropic') {
+      if (agent.apiKey) childEnv.ANTHROPIC_API_KEY = agent.apiKey;
+      if (agent.model) childEnv.ANTHROPIC_MODEL = agent.model;
+    } else if (agent.provider === 'ollama') {
+      if (agent.baseUrl) childEnv.OLLAMA_BASE_URL = agent.baseUrl;
+      if (agent.model) childEnv.OLLAMA_MODEL = agent.model;
+    }
+  }
+  childEnv.KSWARM_AGENT_ID = agentId;
+  return childEnv;
+}
+
+function autoWorkerSpawnConfig(agentId, alias, customArgs = [], env = process.env) {
+  return createAutoWorkerSpawnConfig({
+    scriptPath: join(import.meta.dirname, '../../scripts/auto-worker.js'),
+    agentId,
+    alias,
+    customArgs,
+    cwd: join(import.meta.dirname, '../..'),
+    env,
+  });
+}
+
 async function autoStartAgent(agentId) {
   const agent = agentStore.get(agentId);
   if (!agent) {
@@ -507,40 +557,24 @@ async function autoStartAgent(agentId) {
   }
 
   try {
-    const { spawn } = await import('node:child_process');
-    const scriptPath = join(import.meta.dirname, '../../scripts/auto-worker.js');
-
-    // Build env: merge process.env + agent's LLM config + customEnv
-    const childEnv = { ...process.env, ...agent.customEnv };
-    if (agent.provider) {
-      if (agent.provider === 'openai') {
-        if (agent.apiKey) childEnv.OPENAI_API_KEY = agent.apiKey;
-        if (agent.baseUrl) childEnv.OPENAI_BASE_URL = agent.baseUrl;
-        if (agent.model) childEnv.OPENAI_MODEL = agent.model;
-      } else if (agent.provider === 'anthropic') {
-        if (agent.apiKey) childEnv.ANTHROPIC_API_KEY = agent.apiKey;
-        if (agent.model) childEnv.ANTHROPIC_MODEL = agent.model;
-      } else if (agent.provider === 'ollama') {
-        if (agent.baseUrl) childEnv.OLLAMA_BASE_URL = agent.baseUrl;
-        if (agent.model) childEnv.OLLAMA_MODEL = agent.model;
-      }
-    }
-    childEnv.KSWARM_AGENT_ID = agentId;
-
-    const args = [scriptPath, agentId, agent.name, ...(agent.customArgs || [])];
-    const child = spawn('node', args, {
-      cwd: join(import.meta.dirname, '../..'),
-      env: childEnv,
-      stdio: 'ignore',
-      detached: true,
+    const childEnv = buildAgentChildEnv(agent, agentId);
+    const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
+      onError: err => {
+        agentStore.setOffline(agentId);
+        log('error', `Auto-worker process error for ${agentId}: ${err.message}`);
+      },
     });
-    child.unref();
+    if (!spawned.ok) {
+      agentStore.setOffline(agentId);
+      log('error', `Failed to auto-start agent ${agentId}: ${spawned.error}`);
+      return false;
+    }
 
-    const runtimeId = `pid-${child.pid}`;
+    const runtimeId = `pid-${spawned.pid}`;
     agentStore.setOnline(agentId, runtimeId);
 
-    log('info', `Auto-started agent: ${agent.name} (${agentId})`, { pid: child.pid, runtimeId });
-    broadcast({ type: 'agent_started', agentId, runtimeId, pid: child.pid });
+    log('info', `Auto-started agent: ${agent.name} (${agentId})`, { pid: spawned.pid, runtimeId });
+    broadcast({ type: 'agent_started', agentId, runtimeId, pid: spawned.pid });
     return true;
   } catch (err) {
     log('error', `Failed to auto-start agent ${agentId}: ${err.message}`);
@@ -675,18 +709,27 @@ async function handleRequest(req, res) {
       const body = await parseBody(req);
       const { name, goal, requirements, poAgent, members, workFolder, enableSummary } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
+      const poResolution = resolvePlanRetryPoAgent({ poAgent }, agentStore.list({ includeArchived: false }));
+      const resolvedPoAgent = poResolution.poAgent || poAgent;
+      const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== resolvedPoAgent) : [];
       const id = `proj-${Date.now()}`;
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', poAgent, members: members || [], enableSummary });
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
       project.workFolder = ws.path;
       
-      log('info', `Project created: ${name}`, { id, po: poAgent, workspace: ws.path });
+      log('info', `Project created: ${name}`, {
+        id,
+        po: resolvedPoAgent,
+        requestedPo: poAgent,
+        poReassigned: poResolution.changed,
+        workspace: ws.path,
+      });
       broadcast({ type: 'project_created', project });
 
       // Auto-start PO agent and member agents if they are in agent store and offline
-      const agentsToStart = [poAgent, ...(members || [])];
+      const agentsToStart = [resolvedPoAgent, ...resolvedMembers];
       for (const agentId of agentsToStart) {
         await autoStartAgent(agentId);
       }
@@ -694,7 +737,7 @@ async function handleRequest(req, res) {
       // Send assign_po immediately so PO can start generating the Plan
       if (brokerClient && brokerClient.isConnected()) {
         setTimeout(() => {
-          brokerClient.sendTo(poAgent, 'assign_po', {
+          brokerClient.sendTo(resolvedPoAgent, 'assign_po', {
             taskId: id,
             threadId: `thread-${id}`,
             payload: {
@@ -702,7 +745,7 @@ async function handleRequest(req, res) {
               projectName: name,
               goal: goal || '',
               requirements: requirements || '',
-              members: members || [],
+              members: resolvedMembers,
             },
           }).catch(err => log('warn', 'Failed to send assign_po on create', { error: err.message }));
         }, 1000);
@@ -717,7 +760,7 @@ async function handleRequest(req, res) {
       const project = hub.getProject(projectMatch[1]);
       if (!project) return json(res, { error: 'not_found' }, 404);
       const board = hub.getBoard(project.id);
-      const tasks = board ? board.getAllTasks() : [];
+      const tasks = board ? enrichProjectTaskArtifacts(project.id, board.getAllTasks()) : [];
       const activities = hub.getEventLog().getEvents().filter(e => e.projectId === project.id);
       const humanActions = hub.getHumanActions(project.id);
       const ws = getProjectWorkspace(project.id);
@@ -796,10 +839,34 @@ async function handleRequest(req, res) {
       const board = hub.getBoard(projectId);
       const normalized = normalizeProjectForPlanRetry(project, board?.getAllTasks() || []);
       if (!normalized.ok) return json(res, { ok: false, error: normalized.error }, 409);
+      let poResolution = resolvePlanRetryPoAgent(project, agentStore.list({ includeArchived: false }));
+      const originalPoAgent = poResolution.previousPoAgent;
+      if (poResolution.changed && poResolution.poAgent) {
+        project.poAgent = poResolution.poAgent;
+      }
 
       // Auto-start PO and member agents
+      let poStarted = false;
       if (project?.poAgent) {
-        await autoStartAgent(project.poAgent);
+        poStarted = await autoStartAgent(project.poAgent);
+        if (!poStarted) {
+          const failedPoAgent = project.poAgent;
+          const fallbackResolution = resolvePlanRetryPoAgent(
+            { ...project, poAgent: null },
+            agentStore.list({ includeArchived: false }),
+          );
+          if (fallbackResolution.poAgent && fallbackResolution.poAgent !== failedPoAgent) {
+            project.poAgent = fallbackResolution.poAgent;
+            poResolution = {
+              ...fallbackResolution,
+              previousPoAgent: originalPoAgent,
+              changed: true,
+              reason: 'current_po_start_failed',
+              failedPoAgent,
+            };
+            poStarted = await autoStartAgent(project.poAgent);
+          }
+        }
         for (const memberId of (project.members || [])) {
           await autoStartAgent(memberId);
         }
@@ -809,15 +876,23 @@ async function handleRequest(req, res) {
 
       // Send assign_po intent via brokerClient
       if (brokerClient && brokerClient.isConnected() && project.poAgent) {
-        brokerClient.sendTo(project.poAgent, 'assign_po', {
-          projectId,
-          payload: { name: project.name, goal: project.goal },
-        }).catch(err => log('warn', 'Failed to send assign_po intent', { error: err.message }));
+        brokerClient.sendTo(project.poAgent, 'assign_po', buildPlanRetryAssignPoIntent(project))
+          .catch(err => log('warn', 'Failed to send assign_po intent', { error: err.message }));
       }
 
-      log('info', `Plan retry triggered for project: ${projectId}`, { po: project.poAgent, previousStatus: normalized.previousStatus, status: project.status });
-      broadcast({ type: 'plan_retry', projectId, po: project.poAgent, previousStatus: normalized.previousStatus, status: project.status });
-      return json(res, { ok: true, retried: true, ...normalized });
+      const retryInfo = {
+        po: project.poAgent,
+        poAgent: project.poAgent,
+        previousPoAgent: originalPoAgent,
+        poReassigned: Boolean(poResolution.changed),
+        poResolutionReason: poResolution.reason,
+        poStarted,
+        previousStatus: normalized.previousStatus,
+        status: project.status,
+      };
+      log('info', `Plan retry triggered for project: ${projectId}`, retryInfo);
+      broadcast({ type: 'plan_retry', projectId, ...retryInfo });
+      return json(res, { ok: true, retried: true, ...normalized, ...retryInfo });
     }
     const planSubmitMatch = path.match(/^\/projects\/([^/]+)\/plan$/);
     if (planSubmitMatch && req.method === 'POST') {
@@ -929,8 +1004,11 @@ async function handleRequest(req, res) {
           }
         }
 
-        // If rework, notify worker via broker
-        if (result.rework && brokerClient && brokerClient.isConnected()) {
+        // If rework created a fresh run, notify through the normal request_task path.
+        if (result.rework && result.dispatch?.ok && (result.dispatched || []).length > 0) {
+          broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
+          await sendBrokerRequestTasks(projectId, result.dispatched || []);
+        } else if (result.rework && brokerClient && brokerClient.isConnected()) {
           const board = hub.getBoard(projectId);
           const task = board?.getTask(taskId);
           if (task?.assignedAgent) {
@@ -1061,38 +1139,18 @@ async function handleRequest(req, res) {
       const task = board.getTask(taskId);
       if (!task) return json(res, { error: 'task not found' }, 404);
 
-      // Transition to pending based on current status
-      let result;
-      if (task.status === 'in_progress') {
-        result = board.transition(task.id, 'failed', { reason: reason || 'reassigned' });
-        if (result.ok) result = board.transition(task.id, 'pending', {});
-      } else if (['dispatched', 'accepted'].includes(task.status)) {
-        result = board.transition(task.id, 'pending', {});
-      } else if (task.status === 'pending') {
-        result = { ok: true }; // already pending
-      } else {
-        return json(res, { error: `cannot reassign from status: ${task.status}` }, 400);
-      }
-
+      const result = hub.handleReassignTask(projectId, task.id, { newAgent, reason, fromPO });
       if (!result?.ok) return json(res, { error: result?.error || 'transition failed' }, 400);
-
-      // Update assignment
-      const updatedTask = board.getTask(task.id);
-      if (updatedTask) updatedTask.assignedAgent = newAgent;
 
       log('info', `Task reassigned: ${task.id} → ${newAgent} (reason: ${reason})`, { projectId, fromPO });
       broadcast({ type: 'task_reassigned', projectId, taskId: task.id, newAgent, reason });
 
-      // Auto-dispatch the reassigned task
-      try {
-        const dispatchRes = hub.handleRequestDispatch(projectId, fromPO || 'system');
-        if (dispatchRes.ok) {
-          broadcast({ type: 'tasks_dispatched', projectId, tasks: dispatchRes.dispatched });
-          await sendBrokerRequestTasks(projectId, dispatchRes.dispatched);
-        }
-      } catch (_) {}
+      if (result.dispatch?.ok) {
+        broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
+        await sendBrokerRequestTasks(projectId, result.dispatched || []);
+      }
 
-      return json(res, { ok: true, taskId: task.id, newAgent, previousStatus: task.status });
+      return json(res, result);
     }
 
     // ── Human adds tasks (any time, no PO restriction) ──
@@ -1291,15 +1349,16 @@ async function handleRequest(req, res) {
 
       const ext = extname(safeName);
       log('info', `Artifact saved: ${safeName}`, { projectId: projectId || 'global', path: filePath });
+      const artifact = createArtifactRecord({
+        filename: safeName,
+        url: artifactUrl,
+        path: filePath,
+        previewable: getPreviewable(ext),
+        mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+      });
       return json(res, {
         ok: true,
-        artifact: {
-          filename: safeName,
-          url: artifactUrl,
-          path: filePath,
-          previewable: getPreviewable(ext),
-          mimeType: MIME_TYPES[ext] || 'application/octet-stream',
-        },
+        artifact,
       }, 201);
     }
 
@@ -1427,16 +1486,15 @@ async function handleRequest(req, res) {
       if (!workerId) return json(res, { error: 'workerId required' }, 400);
 
       try {
-        const { spawn } = await import('node:child_process');
-        const scriptPath = join(import.meta.dirname, '../../scripts/auto-worker.js');
-        const child = spawn('node', [scriptPath, workerId, workerAlias || 'Worker'], {
-          cwd: join(import.meta.dirname, '../..'),
-          stdio: 'ignore',
-          detached: true,
+        const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(workerId, workerAlias || 'Worker'), {
+          onError: err => log('error', `Auto-worker process error for ${workerId}: ${err.message}`),
         });
-        child.unref();
-        log('info', `Spawned auto-worker: ${workerId}`, { alias: workerAlias, pid: child.pid });
-        return json(res, { ok: true, workerId, pid: child.pid }, 201);
+        if (!spawned.ok) {
+          log('error', `Failed to spawn worker ${workerId}: ${spawned.error}`);
+          return json(res, { error: spawned.error }, 500);
+        }
+        log('info', `Spawned auto-worker: ${workerId}`, { alias: workerAlias, pid: spawned.pid });
+        return json(res, { ok: true, workerId, pid: spawned.pid }, 201);
       } catch (err) {
         log('error', `Failed to spawn worker: ${err.message}`);
         return json(res, { error: err.message }, 500);
@@ -1576,42 +1634,25 @@ async function handleRequest(req, res) {
       if (agent.status !== 'offline') return json(res, { error: 'agent already running', status: agent.status }, 409);
 
       try {
-        const { spawn } = await import('node:child_process');
-        const scriptPath = join(import.meta.dirname, '../../scripts/auto-worker.js');
-
-        // Build env: merge process.env + agent's LLM config + customEnv
-        const childEnv = { ...process.env, ...agent.customEnv };
-        if (agent.provider) {
-          if (agent.provider === 'openai') {
-            if (agent.apiKey) childEnv.OPENAI_API_KEY = agent.apiKey;
-            if (agent.baseUrl) childEnv.OPENAI_BASE_URL = agent.baseUrl;
-            if (agent.model) childEnv.OPENAI_MODEL = agent.model;
-          } else if (agent.provider === 'anthropic') {
-            if (agent.apiKey) childEnv.ANTHROPIC_API_KEY = agent.apiKey;
-            if (agent.model) childEnv.ANTHROPIC_MODEL = agent.model;
-          } else if (agent.provider === 'ollama') {
-            if (agent.baseUrl) childEnv.OLLAMA_BASE_URL = agent.baseUrl;
-            if (agent.model) childEnv.OLLAMA_MODEL = agent.model;
-          }
-        }
-        // Pass agent ID so worker can fetch full config
-        childEnv.KSWARM_AGENT_ID = agentId;
-
-        const args = [scriptPath, agentId, agent.name, ...(agent.customArgs || [])];
-        const child = spawn('node', args, {
-          cwd: join(import.meta.dirname, '../..'),
-          env: childEnv,
-          stdio: 'ignore',
-          detached: true,
+        const childEnv = buildAgentChildEnv(agent, agentId);
+        const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
+          onError: err => {
+            agentStore.setOffline(agentId);
+            log('error', `Auto-worker process error for ${agentId}: ${err.message}`);
+          },
         });
-        child.unref();
+        if (!spawned.ok) {
+          agentStore.setOffline(agentId);
+          log('error', `Failed to start agent ${agentId}: ${spawned.error}`);
+          return json(res, { error: spawned.error }, 500);
+        }
 
-        const runtimeId = `pid-${child.pid}`;
+        const runtimeId = `pid-${spawned.pid}`;
         agentStore.setOnline(agentId, runtimeId);
 
-        log('info', `Agent started: ${agent.name} (${agentId})`, { pid: child.pid, runtimeId });
-        broadcast({ type: 'agent_started', agentId, runtimeId, pid: child.pid });
-        return json(res, { ok: true, agentId, pid: child.pid, runtimeId }, 201);
+        log('info', `Agent started: ${agent.name} (${agentId})`, { pid: spawned.pid, runtimeId });
+        broadcast({ type: 'agent_started', agentId, runtimeId, pid: spawned.pid });
+        return json(res, { ok: true, agentId, pid: spawned.pid, runtimeId }, 201);
       } catch (err) {
         log('error', `Failed to start agent: ${err.message}`);
         return json(res, { error: err.message }, 500);

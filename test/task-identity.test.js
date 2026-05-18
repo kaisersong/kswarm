@@ -108,6 +108,18 @@ test('buildTaskAliases omits duplicate title aliases', () => {
   assert.equal(aliases.get('item-1'), 'proj-a__item-1');
 });
 
+test('buildTaskAliases resolves duplicate retry title to original parent', () => {
+  const tasks = normalizeTasksForProject('proj-a', [
+    { id: 'item-1', title: 'Research', dependencies: [] },
+    { id: 'item-1-retry-1', title: 'Research', parentTaskId: 'proj-a__item-1', dependencies: [] },
+    { id: 'item-2', title: 'Draft', dependencies: ['Research'] },
+  ]).tasks;
+  const aliases = buildTaskAliases('proj-a', tasks);
+
+  assert.equal(aliases.get('Research'), 'proj-a__item-1');
+  assert.deepEqual(tasks[2].dependencies, ['proj-a__item-1']);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

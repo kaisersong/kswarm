@@ -42,7 +42,8 @@ test('technical talk incident routes around degraded workers and blocks markdown
 
   assert.equal(dispatch.ok, true);
   assert.equal(item7.assignedAgent !== '2de19e7a-cfc', true);
-  assert.equal(item8.assignedAgent, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(item8.assignedAgent, 'cli-qoder');
+  assert.equal(item8.assignedExecutor, PRESENTATION_PPTX_EXECUTOR_ID);
   assert.equal(item8.selectedRoute.selectedExecutorId, PRESENTATION_PPTX_EXECUTOR_ID);
 
   const rejected = hub.handleSubmitResult('talk', 'item-8', {

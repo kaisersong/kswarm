@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../src/core/hub.js';
+import { createTaskBoard } from '../src/core/task-board.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -177,6 +178,204 @@ test('worker failure requires active runId and creates a retry run', () => {
   assert.equal(retry.status, 'dispatched');
   assert.ok(retry.activeRunId);
   assert.notEqual(retry.activeRunId, runId);
+});
+
+test('retry child completion marks failed parent done and unblocks dependents', () => {
+  const hub = createHub({ silent: true });
+  setupProject(hub, 'proj-a');
+  hub.handleRequestDispatch('proj-a', 'po');
+  const board = hub.getBoard('proj-a');
+  const runId = board.getTask('item-1').activeRunId;
+
+  const failed = hub.handleWorkerFailure('proj-a', 'item-1', 'worker', runId, 'agent_error', 'no output');
+  assert.equal(failed.ok, true);
+
+  const retry = board.getTask(failed.retryTaskId);
+  const retryRunId = retry.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-a', retry.id, 'worker', retryRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-a', retry.id, 'started', 'worker', retryRunId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-a', retry.id, { summary: 'retry produced a usable result' }, 'worker', retryRunId).ok, true);
+
+  const reviewed = hub.handleQualityReview('proj-a', retry.id, { passed: true, feedback: 'OK' }, 'po');
+  assert.equal(reviewed.ok, true);
+
+  const original = board.getTask('item-1');
+  const completedRetry = board.getTask(retry.id);
+  assert.equal(completedRetry.status, 'done');
+  assert.equal(original.status, 'done');
+  assert.equal(original.completedBy, 'retry_child');
+  assert.equal(original.completedByTaskId, retry.id);
+
+  const dispatch = hub.handleRequestDispatch('proj-a', 'po');
+  assert.deepEqual(dispatch.dispatched, ['proj-a__item-2']);
+});
+
+test('retry child with duplicate title does not break title dependency after reload', () => {
+  const hub = createHub({ silent: true });
+  setupProject(hub, 'proj-a');
+  hub.handleRequestDispatch('proj-a', 'po');
+  const board = hub.getBoard('proj-a');
+  const runId = board.getTask('item-1').activeRunId;
+
+  const failed = hub.handleWorkerFailure('proj-a', 'item-1', 'worker', runId, 'agent_error', 'no output');
+  assert.equal(failed.ok, true);
+
+  const retry = board.getTask(failed.retryTaskId);
+  const retryRunId = retry.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-a', retry.id, 'worker', retryRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-a', retry.id, 'started', 'worker', retryRunId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-a', retry.id, { summary: 'retry produced a usable result' }, 'worker', retryRunId).ok, true);
+  assert.equal(hub.handleQualityReview('proj-a', retry.id, { passed: true, feedback: 'OK' }, 'po').ok, true);
+
+  const reloaded = createTaskBoard('proj-a');
+  reloaded.loadTasks(board.getAllTasks().map(task => ({ ...task })));
+
+  const dependent = reloaded.getTask('item-2');
+  assert.deepEqual(dependent.dependencies, ['proj-a__item-1']);
+  assert.deepEqual(dependent.unresolvedDependencies, []);
+  assert.deepEqual(reloaded.getDispatchable().map(task => task.id), ['proj-a__item-2']);
+});
+
+test('reassign reopens failed and blocked tasks for redispatch', () => {
+  const hub = createHub({ silent: true });
+  setupProject(hub, 'proj-a');
+  hub.handleRequestDispatch('proj-a', 'po');
+  const board = hub.getBoard('proj-a');
+  const runId = board.getTask('item-1').activeRunId;
+
+  const failed = hub.handleWorkerFailure('proj-a', 'item-1', 'worker', runId, 'agent_error', 'no output');
+  const retry = board.getTask(failed.retryTaskId);
+  const retryRunId = retry.activeRunId;
+  assert.equal(hub.handleWorkerFailure('proj-a', retry.id, 'worker', retryRunId, 'runtime_stalled', 'heartbeat timeout').ok, true);
+  assert.equal(board.getTask(retry.id).status, 'failed');
+
+  const reopenedFailed = hub.handleReassignTask('proj-a', retry.id, {
+    newAgent: 'worker-2',
+    reason: 'manual recovery',
+    fromPO: 'po',
+  });
+  assert.equal(reopenedFailed.ok, true);
+  assert.equal(board.getTask(retry.id).status, 'dispatched');
+  assert.equal(board.getTask(retry.id).assignedAgent, 'worker-2');
+  assert.ok(board.getTask(retry.id).activeRunId);
+
+  hub.createProject({ id: 'proj-b', name: 'B', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  hub.handleCreateTasks('proj-b', [{ id: 'blocked', title: 'Blocked', assignedAgent: 'worker', dependencies: [] }], 'po');
+  hub.handleApprove('proj-b');
+  const boardB = hub.getBoard('proj-b');
+  assert.equal(boardB.blockTask('blocked', { blockedReason: 'needs manual recovery' }).ok, true);
+
+  const reopenedBlocked = hub.handleReassignTask('proj-b', 'blocked', {
+    newAgent: 'worker-3',
+    reason: 'manual recovery',
+    fromPO: 'po',
+  });
+  assert.equal(reopenedBlocked.ok, true);
+  assert.equal(boardB.getTask('blocked').status, 'dispatched');
+  assert.equal(boardB.getTask('blocked').assignedAgent, 'worker-3');
+  assert.equal(boardB.getTask('blocked').blockedReason, null);
+});
+
+test('quality review rework redispatches with a fresh run id', () => {
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+  hub.createProject({ id: 'proj-quality', name: 'Quality', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-quality', [
+    { id: 'item-1', title: 'Draft', assignedAgent: 'worker', dependencies: [] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-quality').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-quality', 'po').dispatched, ['proj-quality__item-1']);
+
+  const board = hub.getBoard('proj-quality');
+  const firstRunId = board.getTask('item-1').activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-quality', 'item-1', 'worker', firstRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-quality', 'item-1', 'started', 'worker', firstRunId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-quality', 'item-1', { summary: 'too vague' }, 'worker', firstRunId).ok, true);
+
+  const review = hub.handleQualityReview('proj-quality', 'item-1', {
+    passed: false,
+    feedback: 'needs concrete story text',
+  }, 'po');
+
+  const task = board.getTask('item-1');
+  assert.equal(review.ok, true);
+  assert.equal(review.rework, true);
+  assert.deepEqual(review.dispatched, ['proj-quality__item-1']);
+  assert.equal(task.status, 'dispatched');
+  assert.ok(task.activeRunId);
+  assert.notEqual(task.activeRunId, firstRunId);
+  assert.equal(task.failureReason, 'needs concrete story text');
+
+  const requests = bridge.getSentOf('request_task');
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].runId, task.activeRunId);
+});
+
+test('manual dispatch recovers rework-ready in-progress task without active run', () => {
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+  hub.createProject({ id: 'proj-rework', name: 'Rework', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-rework', [
+    { id: 'item-1', title: 'Draft', assignedAgent: 'worker', dependencies: [] },
+    { id: 'item-2', title: 'Review', assignedAgent: 'worker', dependencies: ['Draft'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-rework').ok, true);
+
+  const board = hub.getBoard('proj-rework');
+  const task = board.getTask('item-1');
+  task.status = 'in_progress';
+  task.activeRunId = null;
+  task.runLease = null;
+  task.qualityFailureCount = 1;
+  task.reviewResult = { passed: false, feedback: 'needs actual story text' };
+  task.failureReason = 'needs actual story text';
+
+  const dispatch = hub.handleRequestDispatch('proj-rework', 'po');
+  const updated = board.getTask('item-1');
+
+  assert.equal(dispatch.ok, true);
+  assert.deepEqual(dispatch.dispatched, ['proj-rework__item-1']);
+  assert.equal(updated.status, 'dispatched');
+  assert.ok(updated.activeRunId);
+  assert.deepEqual(dispatch.blocked, [
+    { taskId: 'proj-rework__item-2', reason: 'dependency_pending', dependencies: ['proj-rework__item-1'] },
+  ]);
+  assert.equal(bridge.getSentOf('request_task').length, 1);
+});
+
+test('manual dispatch recovers quality-gate blocked task for another attempt', () => {
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+  hub.createProject({ id: 'proj-blocked-rework', name: 'Blocked Rework', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-blocked-rework', [
+    { id: 'item-1', title: 'Draft', assignedAgent: 'worker', dependencies: [] },
+    { id: 'item-2', title: 'Review', assignedAgent: 'worker', dependencies: ['Draft'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-blocked-rework').ok, true);
+
+  const board = hub.getBoard('proj-blocked-rework');
+  assert.equal(board.blockTask('item-1', {
+    blockKind: 'quality_gate_blocked',
+    blockedReason: 'submitted a report instead of the actual story',
+    failureClass: 'quality_content_failed',
+    qualityFailureCount: 2,
+  }).ok, true);
+  const task = board.getTask('item-1');
+  task.reviewResult = { passed: false, feedback: 'submitted a report instead of the actual story' };
+
+  const dispatch = hub.handleRequestDispatch('proj-blocked-rework', 'po');
+  const updated = board.getTask('item-1');
+
+  assert.equal(dispatch.ok, true);
+  assert.deepEqual(dispatch.dispatched, ['proj-blocked-rework__item-1']);
+  assert.equal(updated.status, 'dispatched');
+  assert.equal(updated.blockedReason, null);
+  assert.equal(updated.blockKind, null);
+  assert.ok(updated.activeRunId);
+  assert.deepEqual(dispatch.blocked, [
+    { taskId: 'proj-blocked-rework__item-2', reason: 'dependency_pending', dependencies: ['proj-blocked-rework__item-1'] },
+  ]);
+  assert.equal(bridge.getSentOf('request_task').length, 1);
 });
 
 let passed = 0;

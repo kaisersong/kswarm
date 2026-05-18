@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import {
+  buildPlanRetryAssignPoIntent,
   canRetryPlanForProject,
   normalizeProjectForPlanRetry,
+  resolvePlanRetryPoAgent,
 } from '../src/core/plan-retry-recovery.js';
 
 const tests = [];
@@ -45,6 +47,60 @@ test('blocks delivered and closed projects', () => {
     assert.equal(result.error, 'plan_retry_not_allowed');
     assert.equal(p.status, status);
   }
+});
+
+test('reassigns legacy xiaok PO to the dedicated xiaok-po seed during plan retry', () => {
+  const result = resolvePlanRetryPoAgent(
+    { ...project('created'), poAgent: 'xiaok' },
+    [
+      { id: 'xiaok', name: 'xiaok', runtimeType: 'xiaok', roles: ['project_owner', 'worker'], status: 'idle' },
+      { id: 'xiaok-po', name: 'PO-Agent', runtimeType: 'xiaok', roles: ['project_owner'], status: 'offline' },
+      { id: 'xiaok-worker', name: 'Worker-Agent', runtimeType: 'xiaok', roles: ['worker'], status: 'offline' },
+    ],
+  );
+
+  assert.equal(result.poAgent, 'xiaok-po');
+  assert.equal(result.previousPoAgent, 'xiaok');
+  assert.equal(result.changed, true);
+  assert.equal(result.reason, 'preferred_xiaok_po');
+});
+
+test('preserves a healthy custom project owner PO during plan retry', () => {
+  const result = resolvePlanRetryPoAgent(
+    { ...project('created'), poAgent: 'custom-po' },
+    [
+      { id: 'custom-po', name: 'Custom PO', runtimeType: 'codex', roles: ['project_owner'], status: 'offline' },
+      { id: 'xiaok-po', name: 'PO-Agent', runtimeType: 'xiaok', roles: ['project_owner'], status: 'offline' },
+    ],
+  );
+
+  assert.equal(result.poAgent, 'custom-po');
+  assert.equal(result.previousPoAgent, 'custom-po');
+  assert.equal(result.changed, false);
+  assert.equal(result.reason, 'current_po_usable');
+});
+
+test('builds retry assign_po intent with the same project context as project creation', () => {
+  const intent = buildPlanRetryAssignPoIntent({
+    id: 'proj-test',
+    name: 'Test Project',
+    goal: 'Ship the report',
+    requirements: 'Use markdown',
+    members: ['xiaok-worker'],
+  });
+
+  assert.deepEqual(intent, {
+    taskId: 'proj-test',
+    threadId: 'thread-proj-test',
+    payload: {
+      projectId: 'proj-test',
+      projectName: 'Test Project',
+      name: 'Test Project',
+      goal: 'Ship the report',
+      requirements: 'Use markdown',
+      members: ['xiaok-worker'],
+    },
+  });
 });
 
 let passed = 0;

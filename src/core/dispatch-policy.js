@@ -8,6 +8,8 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
   const busyAgents = new Set(
     allActiveTasks
       .filter(task => ACTIVE_TASK_STATUSES.has(task.status))
+      .filter(task => !isReworkReadyForDispatch(task))
+      .filter(task => !task.assignedExecutor)
       .map(task => task.assignedAgent)
       .filter(Boolean)
   );
@@ -17,7 +19,7 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
   const blocked = [];
 
   for (const task of tasks) {
-    if (task.status !== 'pending' || task.isCompositeParent) continue;
+    if (!isDispatchCandidate(task) || task.isCompositeParent) continue;
 
     const pendingDeps = getPendingDependencies(task, taskMap);
     if (pendingDeps.length > 0) {
@@ -43,15 +45,16 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
         skipped.push({ taskId: task.id, reason: route.reason, agent: task.assignedAgent });
         continue;
       }
-      const selectedAgent = route.selectedAgentId || route.selectedExecutorId;
+      const selectedAgent = route.selectedAgentId;
       const routedTask = {
         ...task,
-        assignedAgent: selectedAgent,
+        assignedAgent: selectedAgent || task.assignedAgent,
+        assignedExecutor: route.selectedExecutorId || null,
         preferredAssignedAgent: task.assignedAgent,
         selectedRoute: route,
       };
       dispatchedTasks.push(routedTask);
-      busyAgents.add(selectedAgent);
+      if (selectedAgent) busyAgents.add(selectedAgent);
       continue;
     }
 
@@ -66,6 +69,35 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
     blocked,
     projectGate: deriveProjectGate({ dispatchedTasks, skipped, blocked, tasks }),
   };
+}
+
+export function isReworkReadyForDispatch(task = {}) {
+  const hasQualityFailureContext = (
+    task.reviewResult?.passed === false ||
+    Number(task.qualityFailureCount || 0) > 0 ||
+    task.lastFailureClass === 'quality_content_failed' ||
+    task.lastFailureClass === 'quality_evidence_missing'
+  );
+
+  if (
+    task.status === 'blocked' &&
+    task.blockKind === 'quality_gate_blocked' &&
+    !task.activeRunId &&
+    !task.runLease
+  ) {
+    return hasQualityFailureContext;
+  }
+
+  return (
+    task.status === 'in_progress' &&
+    !task.activeRunId &&
+    !task.runLease &&
+    hasQualityFailureContext
+  );
+}
+
+function isDispatchCandidate(task = {}) {
+  return task.status === 'pending' || isReworkReadyForDispatch(task);
 }
 
 function listAgentProfiles(agentProfiles) {

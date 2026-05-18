@@ -72,7 +72,7 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 - **Runtime Watchdog** — 通过 heartbeat、stdout/stderr telemetry 和 stale-run 检测避免 CLI 静默卡死
 - **交付物合同** — 显式 PPTX/HTML/Markdown 任务会在验收前校验产物类型
 - **计划重试恢复** — PO 制定计划阶段中断的项目可安全重新启动规划
-- **本地 PPTX 兜底** — 没有 agent 能生成 PPTX 时，演示任务可使用确定性本地执行器
+- **本地执行器注册表** — 明确要求 PPTX 的演示任务在没有 agent 能生成 PPTX 时，可使用确定性注册执行器
 - **持久化** — 项目数据在服务器重启后保留（防抖 JSON 状态文件）
 
 ### Web UI
@@ -218,7 +218,7 @@ npm run test:e2e-p0   # P0 集成场景
 
 ## 版本历史
 
-**v0.7.0** — 可靠执行加固：runtime 探测与健康冷却、基于能力的派发/重试路由、带 heartbeat/stdout/stderr telemetry 的卡住运行 watchdog、PPTX/HTML/Markdown 强交付物合同、确定性本地 PPTX fallback、active run 重启恢复，以及 PO 制定计划中断后的重试入口。
+**v0.7.0** — 可靠执行加固：runtime 探测与健康冷却、基于能力的派发/重试路由、带 heartbeat/stdout/stderr telemetry 的卡住运行 watchdog、PPTX/HTML/Markdown 强交付物合同、显式 PPTX 演示任务的确定性本地执行器兜底、active run 重启恢复，以及 PO 制定计划中断后的重试入口。
 
 **v0.6.0** — Plan-Do 执行模式：结构化计划含阶段、质量验收读取产物内容、阶段感知派发、离线 worker 自动接管（PO 代执行）、返工循环、重启后持久化。
 

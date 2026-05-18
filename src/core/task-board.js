@@ -27,8 +27,8 @@ const VALID_TRANSITIONS = {
   pending: ['dispatched', 'failed', 'blocked', 'cancelled'],
   dispatched: ['accepted', 'pending', 'failed', 'blocked', 'cancelled'],  // pending = 超时退回
   accepted: ['in_progress', 'pending', 'failed', 'blocked', 'cancelled'],  // pending = agent 放弃
-  in_progress: ['submitted', 'failed', 'blocked', 'cancelled'],
-  submitted: ['done', 'in_progress', 'blocked', 'cancelled'],    // in_progress = PO 要求返工
+  in_progress: ['submitted', 'pending', 'failed', 'blocked', 'cancelled'],  // pending = rework redispatch
+  submitted: ['done', 'in_progress', 'pending', 'blocked', 'cancelled'],    // pending = PO 要求返工并重新派发
   done: ['in_progress'],  // PO quality review can reopen for rework
   failed: ['pending', 'blocked'],  // 可重新派发或人工阻塞
   blocked: ['pending', 'cancelled'],
@@ -67,6 +67,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         ...task,
         status: 'pending',
         assignedAgent: task.assignedAgent || null,
+        assignedExecutor: task.assignedExecutor || null,
         result: null,
         attempt: task.attempt || 1,
         maxAttempts: task.maxAttempts || 2,
@@ -119,6 +120,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     task.updatedAt = now;
 
     if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
+    if (Object.prototype.hasOwnProperty.call(meta, 'assignedExecutor')) task.assignedExecutor = meta.assignedExecutor || null;
     if (Object.prototype.hasOwnProperty.call(meta, 'result')) task.result = meta.result;
     if (meta.failureReason) task.failureReason = meta.failureReason;
     if (meta.failureClass) task.lastFailureClass = meta.failureClass;
@@ -141,6 +143,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         projectId,
         taskId: task.id,
         assignedAgent: task.assignedAgent || null,
+        assignedExecutor: task.assignedExecutor || null,
         attempt: task.attempt || 1,
         status: 'dispatched',
         createdAt: now,
@@ -156,6 +159,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     if (newStatus === 'accepted' && task.runLease) {
       task.runLease.status = 'accepted';
       task.runLease.assignedAgent = task.assignedAgent || meta.assignedAgent || task.runLease.assignedAgent || null;
+      task.runLease.assignedExecutor = task.assignedExecutor || meta.assignedExecutor || task.runLease.assignedExecutor || null;
       task.runLease.lastHeartbeatAt = now;
       task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
     }
@@ -171,6 +175,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.runLease = null;
       task.runTelemetry = null;
       task.selectedRoute = null;
+      task.assignedExecutor = null;
       task.activeRunId = null;
       task.blockedAt = null;
       task.blockedReason = null;
@@ -244,11 +249,42 @@ export function createTaskBoard(projectId = 'legacy-project') {
     return { ok: true, taskId: parent.id, from: oldStatus, to: 'done' };
   }
 
+  function completeRetryParent(parentTaskId, result = null, meta = {}) {
+    const parent = getTask(parentTaskId);
+    if (!parent) return { ok: false, error: 'task_not_found' };
+    if (parent.isCompositeParent) return { ok: false, error: 'composite_parent_not_retry_parent' };
+    if (parent.status === 'done') return { ok: true, taskId: parent.id, alreadyDone: true };
+
+    const now = Date.now();
+    const oldStatus = parent.status;
+    parent.status = 'done';
+    parent.result = result;
+    parent.completedAt = now;
+    parent.updatedAt = now;
+    parent.completedBy = meta.completedBy || 'retry_child';
+    parent.completedByTaskId = meta.completedByTaskId || null;
+    parent.recoveredFromStatus = oldStatus;
+    parent.recoveredAt = now;
+    parent.recoveredBy = meta.recoveredBy || 'retry_child';
+    parent.recoveryStatus = 'completed_by_retry';
+    parent.recoveryReason = meta.recoveryReason || 'retry_child_completed';
+    parent.activeRunId = null;
+    parent.runLease = null;
+    parent.runTelemetry = null;
+    return { ok: true, taskId: parent.id, from: oldStatus, to: 'done' };
+  }
+
   function validateRun(taskId, runId, workerAgent) {
     const task = getTask(taskId);
     if (!task) return { ok: false, error: 'task_not_found' };
-    if (workerAgent && task.assignedAgent && task.assignedAgent !== workerAgent) {
-      return { ok: false, error: 'wrong_assigned_agent', assignedAgent: task.assignedAgent };
+    const assignedActor = task.assignedExecutor || task.assignedAgent;
+    if (workerAgent && assignedActor && assignedActor !== workerAgent) {
+      return {
+        ok: false,
+        error: 'wrong_assigned_agent',
+        assignedAgent: task.assignedAgent,
+        assignedExecutor: task.assignedExecutor || null,
+      };
     }
     if (task.activeRunId && runId && task.activeRunId !== runId) {
       return { ok: false, error: 'stale_task_run', activeRunId: task.activeRunId, runId };
@@ -438,6 +474,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     transition,
     blockTask,
     completeCompositeParent,
+    completeRetryParent,
     validateRun,
     recoverSubmission,
     resetStaleRun,

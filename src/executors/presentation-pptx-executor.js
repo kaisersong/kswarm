@@ -1,7 +1,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-export const PRESENTATION_PPTX_EXECUTOR_ID = 'local_pptx_executor_v1';
+export const PRESENTATION_PPTX_EXECUTOR_ID = 'kswarm.executor.presentation.pptx.v1';
+export const PRESENTATION_PPTX_EXECUTOR_LEGACY_IDS = ['local_pptx_executor_v1'];
 
 export function probePresentationPptxExecutor() {
   return {
@@ -11,6 +12,13 @@ export function probePresentationPptxExecutor() {
     outputCapabilities: ['pptx'],
   };
 }
+
+export const presentationPptxExecutor = {
+  id: PRESENTATION_PPTX_EXECUTOR_ID,
+  aliases: PRESENTATION_PPTX_EXECUTOR_LEGACY_IDS,
+  manifest: probePresentationPptxExecutor,
+  execute: executePresentationPptxTask,
+};
 
 export async function executePresentationPptxTask({
   projectId,
@@ -32,7 +40,7 @@ export async function executePresentationPptxTask({
     ok: true,
     projectId,
     taskId: task.id || null,
-    summary: `Fallback PPTX executor generated ${slideCount} slides for ${task.title || task.id || 'presentation task'}.`,
+    summary: `Registered presentation executor generated ${slideCount} slides for ${task.title || task.id || 'presentation task'}.`,
     slideCount,
     deliveryMode: 'fallback_executor',
     artifacts: [{

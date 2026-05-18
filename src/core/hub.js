@@ -17,7 +17,7 @@ import { createEventLog } from './event-log.js';
 import { createPersistence } from './persistence.js';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
-import { getActiveTasksAcrossBoards, planDispatch } from './dispatch-policy.js';
+import { getActiveTasksAcrossBoards, isReworkReadyForDispatch, planDispatch } from './dispatch-policy.js';
 import { superviseTaskFailure } from './failure-supervisor.js';
 import { deriveProjectHealth } from './project-health.js';
 import { validateTaskResultAgainstContract } from './execution-contract.js';
@@ -80,10 +80,22 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return planDispatch({
       projectId,
       tasks: board.getAllTasks(),
-      allActiveTasks: getActiveTasksAcrossBoards(boards),
+      allActiveTasks: getActiveTasksAcrossLiveProjects(),
       agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
       executors: typeof getExecutors === 'function' ? getExecutors() : [],
     });
+  }
+
+  function getActiveTasksAcrossLiveProjects() {
+    const liveBoards = new Map();
+    for (const [projectId, board] of boards.entries()) {
+      if (isLiveProject(projects.get(projectId))) liveBoards.set(projectId, board);
+    }
+    return getActiveTasksAcrossBoards(liveBoards);
+  }
+
+  function isLiveProject(project) {
+    return Boolean(project && project.status !== 'closed' && project.status !== 'delivered');
   }
 
   function updatePlanItemCompleted(project, task) {
@@ -111,6 +123,32 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         taskId: parent.id,
         taskTitle: parent.title,
         confirmedBy: 'composite_children',
+      });
+    }
+    return result;
+  }
+
+  function maybeCompleteRetryParent(projectId, retryTask) {
+    if (!retryTask?.parentTaskId) return null;
+    const board = boards.get(projectId);
+    const parent = board?.getTask(retryTask.parentTaskId);
+    if (!parent || parent.isCompositeParent || parent.status === 'done') return null;
+    if (retryTask.status !== 'done') return null;
+    const result = board.completeRetryParent(parent.id, retryTask.result || null, {
+      completedBy: 'retry_child',
+      completedByTaskId: retryTask.id,
+      recoveredBy: retryTask.completedBy || 'retry_child',
+      recoveryReason: 'retry_child_completed',
+    });
+    if (result.ok && !result.alreadyDone) {
+      const project = projects.get(projectId);
+      updatePlanItemCompleted(project, parent);
+      eventLog.emit('task.done', {
+        projectId,
+        taskId: parent.id,
+        taskTitle: parent.title,
+        confirmedBy: 'retry_child',
+        retryTaskId: retryTask.id,
       });
     }
     return result;
@@ -319,6 +357,57 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true };
   }
 
+  function handleReassignTask(projectId, taskId, { newAgent, reason = 'reassigned', fromPO = null } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    if (!newAgent) return { ok: false, error: 'new_agent_required' };
+
+    const board = boards.get(projectId);
+    const task = board?.getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+
+    const previousStatus = task.status;
+    let result = { ok: true };
+    if (task.status === 'in_progress') {
+      result = board.transition(task.id, 'failed', { failureReason: reason || 'reassigned' });
+      if (result.ok) result = board.transition(task.id, 'pending');
+    } else if (['dispatched', 'accepted', 'failed', 'blocked'].includes(task.status)) {
+      result = board.transition(task.id, 'pending');
+    } else if (task.status !== 'pending') {
+      return { ok: false, error: `cannot_reassign_from_status: ${task.status}` };
+    }
+
+    if (!result?.ok) return result;
+
+    const updatedTask = board.getTask(task.id);
+    updatedTask.assignedAgent = newAgent;
+    updatedTask.recoveryStatus = 'redispatch_ready';
+    updatedTask.recoveryReason = reason || 'manual_reassign';
+
+    eventLog.emit('task.reassigned', {
+      projectId,
+      taskId: updatedTask.id,
+      taskTitle: updatedTask.title,
+      newAgent,
+      previousStatus,
+      reason,
+      by: fromPO || project.poAgent || 'system',
+    });
+
+    const dispatch = project.status === 'active'
+      ? handleRequestDispatch(projectId, project.poAgent)
+      : { ok: false, dispatched: [], error: 'project_not_active' };
+
+    return {
+      ok: true,
+      taskId: updatedTask.id,
+      newAgent,
+      previousStatus,
+      dispatched: dispatch.ok ? dispatch.dispatched : [],
+      dispatch,
+    };
+  }
+
   function handleRequestDispatch(projectId, fromAgent) {
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
@@ -330,13 +419,23 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const dispatched = [];
 
     for (const task of dispatchPlan.dispatchedTasks) {
+      const currentTask = board.getTask(task.id);
+      if (isReworkReadyForDispatch(currentTask)) {
+        const reset = board.transition(task.id, 'pending', {
+          failureReason: currentTask.failureReason,
+          failureClass: currentTask.lastFailureClass,
+          qualityFailureCount: currentTask.qualityFailureCount,
+        });
+        if (!reset.ok) continue;
+      }
       const result = board.transition(task.id, 'dispatched', {
         assignedAgent: task.assignedAgent,
+        assignedExecutor: task.assignedExecutor || null,
         selectedRoute: task.selectedRoute || null,
       });
       if (!result.ok) continue;
 
-      if (bridge) {
+      if (bridge && !task.assignedExecutor) {
         bridge.requestTask({
           taskId: task.id, title: task.title, brief: task.brief,
           projectId,
@@ -379,6 +478,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         projectId, taskId: result.taskId, taskTitle: task?.title, confirmedBy: fromAgent,
       });
       maybeCompleteCompositeParent(projectId, task);
+      maybeCompleteRetryParent(projectId, task);
     }
     return result;
   }
@@ -438,7 +538,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       const retryDispatchPlan = storedRetryTask ? planDispatch({
         projectId,
         tasks: [storedRetryTask],
-        allActiveTasks: getActiveTasksAcrossBoards(boards),
+        allActiveTasks: getActiveTasksAcrossLiveProjects(),
         agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
         executors: typeof getExecutors === 'function' ? getExecutors() : [],
       }) : { dispatchedTasks: [], skipped: [] };
@@ -449,6 +549,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       if (routedRetry) {
         const dispatchedRetry = board.transition(routedRetry.id, 'dispatched', {
           assignedAgent: routedRetry.assignedAgent,
+          assignedExecutor: routedRetry.assignedExecutor || null,
           preferredAssignedAgent: routedRetry.preferredAssignedAgent || null,
           selectedRoute: routedRetry.selectedRoute || null,
         });
@@ -832,6 +933,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         updatePlanItemCompleted(project, task);
         eventLog.emit('task.quality_reviewed', { projectId, taskId: task.id, passed: true, feedback: review.feedback });
         maybeCompleteCompositeParent(projectId, task);
+        maybeCompleteRetryParent(projectId, task);
       }
       return result;
     }
@@ -843,57 +945,76 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         failureClass: failedReview.failureClass || 'quality_content_failed',
         feedback: failedReview.feedback || '',
       });
-      failedTask.qualityFailureCount = decision.qualityFailureCount;
-      failedTask.lastFailureClass = decision.failureClass;
+      const effectiveDecision = shouldBlockQualityFailure(failedTask)
+        ? {
+            ...decision,
+            action: 'block',
+            blockKind: 'executor_quality_blocked',
+            blockedReason: decision.feedback || failedReview.feedback || '质量验收未通过',
+            nextActions: [
+              '人工检查本地执行器产物是否符合任务语义',
+              ...(Array.isArray(decision.nextActions) ? decision.nextActions : []),
+            ],
+          }
+        : decision;
+      failedTask.qualityFailureCount = effectiveDecision.qualityFailureCount;
+      failedTask.lastFailureClass = effectiveDecision.failureClass;
 
       eventLog.emit('task.quality_reviewed', {
         projectId,
         taskId: failedTask.id,
         passed: false,
         feedback: failedReview.feedback,
-        failureClass: decision.failureClass,
-        action: decision.action,
+        failureClass: effectiveDecision.failureClass,
+        action: effectiveDecision.action,
       });
 
-      if (decision.action === 'block') {
-        const blocked = board.blockTask(failedTask.id, decision);
+      if (effectiveDecision.action === 'block') {
+        const blocked = board.blockTask(failedTask.id, effectiveDecision);
         if (blocked.ok) {
           eventLog.emit('task.blocked', {
             projectId,
             taskId: failedTask.id,
             taskTitle: failedTask.title,
-            blockKind: decision.blockKind,
-            failureClass: decision.failureClass,
-            reason: decision.blockedReason,
-            nextActions: decision.nextActions,
+            blockKind: effectiveDecision.blockKind,
+            failureClass: effectiveDecision.failureClass,
+            reason: effectiveDecision.blockedReason,
+            nextActions: effectiveDecision.nextActions,
           });
         }
         return {
           ok: blocked.ok,
           blocked: true,
-          failureClass: decision.failureClass,
-          nextActions: decision.nextActions,
+          failureClass: effectiveDecision.failureClass,
+          nextActions: effectiveDecision.nextActions,
         };
       }
 
-      const result = board.transition(failedTask.id, 'in_progress', {
+      const result = board.transition(failedTask.id, 'pending', {
         failureReason: failedReview.feedback,
-        failureClass: decision.failureClass,
-        qualityFailureCount: decision.qualityFailureCount,
+        failureClass: effectiveDecision.failureClass,
+        qualityFailureCount: effectiveDecision.qualityFailureCount,
       });
-      if (result.ok && bridge && failedTask.assignedAgent) {
-        bridge.send({
-          type: 'intent', kind: 'rework',
-          taskId: failedTask.id, toParticipantId: failedTask.assignedAgent,
-          payload: { reason: failedReview.feedback, projectId, nextActions: decision.nextActions },
-        });
-      }
+      const dispatch = result.ok && project.status === 'active'
+        ? handleRequestDispatch(projectId, project.poAgent)
+        : { ok: false, dispatched: [], error: project.status === 'active' ? 'transition_failed' : 'project_not_active' };
       return {
         ok: result.ok,
         rework: true,
+        dispatched: dispatch.ok ? dispatch.dispatched : [],
+        dispatch,
         feedback: failedReview.feedback,
-        nextActions: decision.nextActions,
+        nextActions: effectiveDecision.nextActions,
       };
+    }
+
+    function shouldBlockQualityFailure(failedTask) {
+      return Boolean(
+        failedTask?.assignedExecutor ||
+        failedTask?.lastRunLease?.assignedExecutor ||
+        failedTask?.selectedRoute?.selectedExecutorId ||
+        failedTask?.result?.deliveryMode === 'fallback_executor'
+      );
     }
   }
 
@@ -929,6 +1050,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     deleteProject,
     handleCreateTasks,
     handleAssignTask,
+    handleReassignTask,
     handleRequestDispatch,
     handleMarkDone,
     handleRework,

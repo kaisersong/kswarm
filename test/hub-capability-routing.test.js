@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../src/core/hub.js';
+import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -85,6 +86,44 @@ test('runtime failure retry is redispatched through capability routing instead o
   assert.equal(retry.status, 'dispatched');
   assert.equal(retry.assignedAgent, 'worker-b');
   assert.equal(retry.preferredAssignedAgent, 'worker-a');
+});
+
+test('runtime failure retry for generic task does not fall back to presentation executor', () => {
+  const hub = createHub({
+    silent: true,
+    getAgentProfiles: () => [
+      { id: 'worker-a', runtimeHealth: { state: 'limited', taskCapabilities: ['analysis'], outputCapabilities: ['markdown'] } },
+    ],
+    getExecutors: () => [
+      { id: PRESENTATION_PPTX_EXECUTOR_ID, taskCapabilities: ['presentation_generation'], outputCapabilities: ['pptx'] },
+    ],
+  });
+
+  hub.createProject({ id: 'proj-generic-retry', name: 'Generic Retry', goal: 'goal', poAgent: 'po', members: ['worker-a'] });
+  hub.handleCreateTasks('proj-generic-retry', [
+    { id: 'sources', title: '定义真实性基准并收集素材', assignedAgent: 'worker-a' },
+  ], 'po');
+
+  const board = hub.getBoard('proj-generic-retry');
+  board.transition('sources', 'dispatched', { assignedAgent: 'worker-a' });
+  const original = board.getTask('sources');
+
+  const failed = hub.handleWorkerFailure(
+    'proj-generic-retry',
+    original.id,
+    'worker-a',
+    original.activeRunId,
+    'agent_error',
+    'CLI and LLM both failed'
+  );
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.retried, true);
+  assert.equal(failed.retryDispatched, false);
+  const retry = board.getTask(failed.retryTaskId);
+  assert.equal(retry.status, 'pending');
+  assert.notEqual(retry.assignedAgent, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(retry.selectedRoute?.selectedExecutorId ?? null, null);
 });
 
 let passed = 0;

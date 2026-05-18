@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../src/core/hub.js';
+import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -40,6 +41,27 @@ test('one worker cannot receive concurrent active runs across projects', () => {
   assert.equal(hub.getBoard('proj-b').getTask('b1').status, 'pending');
 });
 
+test('closed project active tasks do not reserve workers for new active projects', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-old', name: 'Old', goal: 'goal', poAgent: 'po-old', members: ['worker'] });
+  hub.handleCreateTasks('proj-old', [{ id: 'old-task', title: 'Old task', assignedAgent: 'worker' }], 'po-old');
+  hub.handleApprove('proj-old');
+  assert.deepEqual(hub.handleRequestDispatch('proj-old', 'po-old').dispatched, ['proj-old__old-task']);
+  const oldRunId = hub.getBoard('proj-old').getTask('old-task').activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-old', 'old-task', 'worker', oldRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-old', 'old-task', 'started', 'worker', oldRunId).ok, true);
+  assert.equal(hub.handleCloseProject('proj-old').ok, true);
+
+  hub.createProject({ id: 'proj-new', name: 'New', goal: 'goal', poAgent: 'po-new', members: ['worker'] });
+  hub.handleCreateTasks('proj-new', [{ id: 'new-task', title: 'New task', assignedAgent: 'worker' }], 'po-new');
+  hub.handleApprove('proj-new');
+
+  const dispatch = hub.handleRequestDispatch('proj-new', 'po-new');
+  assert.deepEqual(dispatch.dispatched, ['proj-new__new-task']);
+  assert.deepEqual(dispatch.skipped, []);
+  assert.equal(hub.getBoard('proj-new').getTask('new-task').status, 'dispatched');
+});
+
 test('quality review failure can block a task directly after rework budget is exhausted', () => {
   const bridge = createMockBridge();
   const hub = createHub({ bridge, silent: true });
@@ -66,12 +88,18 @@ test('quality review failure can block a task directly after rework budget is ex
   }, 'po');
   assert.equal(firstReview.ok, true);
   assert.equal(firstReview.rework, true);
-  assert.equal(board.getTask('review-report').status, 'in_progress');
+  assert.deepEqual(firstReview.dispatched, ['proj-a__review-report']);
+  assert.equal(board.getTask('review-report').status, 'dispatched');
+  const secondRunId = board.getTask('review-report').activeRunId;
+  assert.ok(secondRunId);
+  assert.notEqual(secondRunId, firstRunId);
 
+  assert.equal(hub.handleAcceptTask('proj-a', 'review-report', 'worker', secondRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-a', 'review-report', 'started', 'worker', secondRunId).ok, true);
   assert.equal(hub.handleSubmitResult('proj-a', 'review-report', {
     summary: '仍然没有证据',
     artifacts: [],
-  }, 'worker', firstRunId).ok, true);
+  }, 'worker', secondRunId).ok, true);
   const secondReview = hub.handleQualityReview('proj-a', 'review-report', {
     passed: false,
     feedback: '仍然没有 review-evidence.json',
@@ -84,6 +112,42 @@ test('quality review failure can block a task directly after rework budget is ex
   assert.equal(board.getTask('review-report').lastFailureClass, 'quality_evidence_missing');
   const blockedEvents = hub.getEventLog().getEvents().filter(e => e.type === 'task.blocked');
   assert.equal(blockedEvents.length, 1);
+});
+
+test('quality review failure blocks local executor output instead of leaving it in progress', () => {
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+  hub.createProject({ id: 'proj-local-executor', name: 'Local Executor', goal: 'goal', poAgent: 'po', members: [] });
+  hub.handleCreateTasks('proj-local-executor', [
+    { id: 'story-source', title: '定义真实性基准并收集素材', assignedAgent: 'worker' },
+  ], 'po');
+  hub.handleApprove('proj-local-executor');
+
+  const board = hub.getBoard('proj-local-executor');
+  board.transition('story-source', 'dispatched', { assignedExecutor: PRESENTATION_PPTX_EXECUTOR_ID });
+  assert.equal(board.getTask('story-source').assignedAgent, 'worker');
+  assert.equal(board.getTask('story-source').assignedExecutor, PRESENTATION_PPTX_EXECUTOR_ID);
+  const runId = board.getTask('story-source').activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-local-executor', 'story-source', PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
+  assert.equal(hub.handleProgress('proj-local-executor', 'story-source', 'started', PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-local-executor', 'story-source', {
+    summary: 'Registered presentation executor generated 16 slides for 定义真实性基准并收集素材.',
+    artifacts: [{ filename: 'story-source-deck.pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }],
+  }, PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
+
+  const review = hub.handleQualityReview('proj-local-executor', 'story-source', {
+    passed: false,
+    feedback: '产出物仅包含 PPTX 文件头部结构，缺少实际内容。',
+    failureClass: 'quality_content_failed',
+  }, 'po');
+
+  const task = board.getTask('story-source');
+  assert.equal(review.ok, true);
+  assert.equal(review.blocked, true);
+  assert.equal(task.status, 'blocked');
+  assert.equal(task.lastFailureClass, 'quality_content_failed');
+  assert.match(task.blockedReason, /缺少实际内容/);
+  assert.equal(bridge.getSentOf('rework').length, 0);
 });
 
 test('composite task creation is atomic and parent is not dispatched as ordinary work', () => {

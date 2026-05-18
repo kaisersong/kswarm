@@ -13,7 +13,7 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
-import { createUnknownRuntimeHealth } from './runtime-health.js';
+import { createUnknownRuntimeHealth, recordRuntimeSuccess } from './runtime-health.js';
 
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const AGENTS_FILE = join(KSWARM_HOME, 'agents.json');
@@ -346,11 +346,30 @@ export function createAgentStore() {
   }
 
   function setOnline(id, runtimeId) {
-    setStatus(id, 'idle', runtimeId);
+    const agent = agents.get(id);
+    if (!agent) return;
+    agent.status = 'idle';
+    agent.runtimeId = runtimeId;
+    agent.runtimeHealth = recordRuntimeSuccess(
+      normalizeRuntimeHealth(agent, agent.runtimeHealth),
+      {
+        taskCapabilities: agent.taskCapabilities || agent.capabilities || AGENT_DEFAULTS.capabilities,
+        outputCapabilities: defaultOutputCapabilities(agent),
+      }
+    );
+    _save();
   }
 
   function setOffline(id) {
-    setStatus(id, 'offline', null);
+    const agent = agents.get(id);
+    if (!agent) return;
+    agent.status = 'offline';
+    agent.runtimeId = null;
+    agent.runtimeHealth = createUnknownRuntimeHealth({
+      outputCapabilities: defaultOutputCapabilities(agent),
+      taskCapabilities: agent.taskCapabilities || agent.capabilities || AGENT_DEFAULTS.capabilities,
+    });
+    _save();
   }
 
   function updateRuntimeHealth(id, runtimeHealth) {

@@ -22,6 +22,7 @@ import {
   enrichTaskWithExecutionContract,
   validateTaskResultAgainstContract,
 } from '../src/core/execution-contract.js';
+import { extractDeclaredArtifacts } from '../src/core/artifact-extractor.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -2048,8 +2049,14 @@ async function doTask(taskId, payload) {
     return;
   }
 
+  const declaredArtifacts = extractDeclaredArtifacts(artifactContent, { taskId });
+  if (declaredArtifacts.artifacts.length > 0) {
+    artifactContent = declaredArtifacts.cleanedContent || artifactContent;
+  }
+
   const artifactFiles = [
     { filename: artifactFilename, content: artifactContent, previewable: true, mimeType: 'text/markdown' },
+    ...declaredArtifacts.artifacts,
   ];
   let reviewEvidence = null;
   if (taskContract.evidenceContract?.kind === 'review_iteration_v1') {
@@ -2107,12 +2114,17 @@ async function doTask(taskId, payload) {
     });
   }
 
+  const summarySource = [
+    artifactContent,
+    ...declaredArtifacts.artifacts.map(artifact => artifact.content),
+  ].filter(Boolean).join('\n\n');
+
   const resultPayload = {
     projectId,
     taskId,
     localTaskId,
     runId,
-    summary: buildResultSummary(title, artifactContent),
+    summary: buildResultSummary(title, summarySource),
     participantId: AGENT_ID,
     artifacts: submittedArtifacts,
     delivery: { semantic: 'document', source: ALIAS },
@@ -2264,6 +2276,11 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`4. 如果是对抗性评审：必须提出至少 5 个具体质疑点，每个要说明为什么是问题、建议如何改进`);
     parts.push(`5. 如果是修订：必须逐条回应评审意见，说明采纳/不采纳的理由和对应修改`);
     parts.push(`6. 禁止输出"已完成"、"模拟"、"假设完成"等敷衍内容`);
+    parts.push(`7. 如果任务要求交付具体文件（例如 JSON、CSV、HTML、故事正文、修订稿、变更日志），必须使用独立产物块输出核心文件，格式如下：
+~~~artifact path=filename.ext
+文件完整内容
+~~~
+只写交付报告不算完成；核心产物必须放进 artifact path= 产物块中。`);
   } else {
     parts.push(`You are a professional technical agent executing a task. You must produce substantive, in-depth deliverables.`);
     parts.push(`\n## Task`);
@@ -2285,6 +2302,11 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`4. For adversarial reviews: at least 5 specific critique points with rationale and suggestions`);
     parts.push(`5. For revisions: address each review point explicitly with accept/reject reasoning`);
     parts.push(`6. Never output placeholder text like "completed" or "simulated"`);
+    parts.push(`7. If the task requires concrete files such as JSON, CSV, HTML, a story draft, a revised draft, or a change log, output the core files as separate artifact blocks:
+~~~artifact path=filename.ext
+full file content
+~~~
+A delivery report alone is not enough; the core deliverables must be inside artifact path= blocks.`);
   }
 
   if (workFolderContext) {
@@ -2299,8 +2321,8 @@ async function llmGenerateReport(title, projectName, brief, goal, requirements, 
   const langInstr = getLanguageInstruction(lang);
 
   const systemPrompt = agentInstructions
-    ? `${agentInstructions}\n\n你刚刚完成了一项任务，需要生成一份交付报告。`
-    : '你是一个专业的技术 worker agent。你刚刚完成了一项任务，需要生成一份交付报告。';
+    ? `${agentInstructions}\n\n你正在执行一项任务，需要直接生成任务要求的核心交付产物。`
+    : '你是一个专业的技术 worker agent。你正在执行一项任务，需要直接生成任务要求的核心交付产物。';
 
   const messages = [
     {
@@ -2309,17 +2331,21 @@ async function llmGenerateReport(title, projectName, brief, goal, requirements, 
 
 ${langInstr}
 
-报告要求：
+交付要求：
 1. 使用 Markdown 格式
-2. 包含：摘要、具体工作内容、技术方案、交付物清单、注意事项
-3. 内容要具体、专业，像真正完成了这项工作一样
-4. 长度适中（300-600 字）
-5. 不要写"模拟"或"假设"之类的词，就像真正完成了工作一样
-6. 严格遵循项目目标和要求中的原则与约束${workFolderContext ? '\n7. 基于项目目录中的参考文件内容进行工作' : ''}`
+2. 内容要具体、专业，像真正完成了这项工作一样
+3. 如果任务要求具体文件，必须使用如下产物块输出文件：
+~~~artifact path=filename.ext
+文件完整内容
+~~~
+4. 只写交付报告不算完成；核心产物必须放进 artifact path= 产物块中
+5. 可以附简短摘要，但不能用摘要替代核心文件
+6. 不要写"模拟"或"假设"之类的词，就像真正完成了工作一样
+7. 严格遵循项目目标和要求中的原则与约束${workFolderContext ? '\n8. 基于项目目录中的参考文件内容进行工作' : ''}`
     },
     {
       role: 'user',
-      content: `请为以下已完成的任务生成交付报告：
+      content: `请直接完成以下任务并输出核心交付产物：
 
 项目：${projectName}
 ${goal ? `项目目标：${goal}` : ''}

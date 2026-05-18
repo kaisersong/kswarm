@@ -8,7 +8,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { executePresentationPptxTask, probePresentationPptxExecutor } from '../src/executors/presentation-pptx-executor.js';
+import { executePresentationPptxTask, PRESENTATION_PPTX_EXECUTOR_ID, PRESENTATION_PPTX_EXECUTOR_LEGACY_IDS, probePresentationPptxExecutor } from '../src/executors/presentation-pptx-executor.js';
+import { createBuiltInLocalExecutorRegistry } from '../src/executors/registry.js';
 import { validateDeliverableContract } from '../src/core/deliverable-contract.js';
 
 const tests = [];
@@ -17,7 +18,16 @@ function test(name, fn) { tests.push({ name, fn }); }
 test('pptx executor reports available without network dependencies', () => {
   const probe = probePresentationPptxExecutor();
   assert.equal(probe.available, true);
-  assert.equal(probe.id, 'local_pptx_executor_v1');
+  assert.equal(probe.id, PRESENTATION_PPTX_EXECUTOR_ID);
+});
+
+test('local executor registry exposes only primary executor ids', async () => {
+  const registry = createBuiltInLocalExecutorRegistry();
+  const manifests = registry.list();
+  assert.equal(manifests.length, 1);
+  assert.equal(manifests[0].id, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(registry.has(PRESENTATION_PPTX_EXECUTOR_ID), true);
+  assert.equal(registry.has(PRESENTATION_PPTX_EXECUTOR_LEGACY_IDS[0]), true);
 });
 
 test('pptx executor creates parseable fallback artifact with provenance', async () => {
