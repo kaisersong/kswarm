@@ -699,7 +699,13 @@ async function handleRequest(req, res) {
         const board = hub.getBoard(p.id);
         const tasks = board ? board.getAllTasks() : [];
         const done = tasks.filter(t => t.status === 'done').length;
-        return { ...p, taskCount: tasks.length, doneCount: done, updatedAt: p.updatedAt || p.createdAt || 0 };
+        return {
+          ...p,
+          taskCount: tasks.length,
+          doneCount: done,
+          updatedAt: p.updatedAt || p.createdAt || 0,
+          projectIntervention: hub.getProjectIntervention(p.id),
+        };
       }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       return json(res, { projects });
     }
@@ -768,6 +774,7 @@ async function handleRequest(req, res) {
       const planProgress = board ? board.getPlanProgress() : null;
       const dispatchPlan = hub.getDispatchPlan(project.id);
       const projectHealth = hub.getProjectHealth(project.id);
+      const projectIntervention = hub.getProjectIntervention(project.id);
       return json(res, {
         project: { ...project, workFolder: ws.path },
         tasks,
@@ -778,6 +785,7 @@ async function handleRequest(req, res) {
         planProgress,
         dispatchPlan,
         projectHealth,
+        projectIntervention,
       });
     }
 
@@ -789,6 +797,26 @@ async function handleRequest(req, res) {
         broadcast({ type: 'project_closed', projectId: projectMatch[1] });
       }
       return json(res, result);
+    }
+
+    // ── Project continue (Human action) ──
+    const continueMatch = path.match(/^\/projects\/([^/]+)\/continue$/);
+    if (continueMatch && req.method === 'POST') {
+      const projectId = continueMatch[1];
+      const body = await parseBody(req);
+      const result = hub.handleContinueProject(projectId, body || {});
+      if (result.ok) {
+        log('info', `Project continue requested`, {
+          projectId,
+          strategy: result.strategy,
+          dispatched: result.dispatched || [],
+        });
+        broadcast({ type: 'project_continue', projectId, result });
+        if ((result.dispatched || []).length > 0) {
+          await sendBrokerRequestTasks(projectId, result.dispatched || []);
+        }
+      }
+      return json(res, result, result.status || (result.ok ? 200 : 400));
     }
 
     // ── Project approve (Human action) ──

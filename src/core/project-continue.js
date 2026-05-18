@@ -1,0 +1,307 @@
+import { deriveProjectIntervention } from './project-intervention.js';
+
+const ACTIVE_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
+const MUTATING_RETRY_STRATEGIES = new Set(['retry_best_agent', 'retry_with_repair_instruction', 'restart_then_retry']);
+const MAX_SAME_STRATEGY_RECOVERIES = 1;
+
+export function handleContinueProjectCore({
+  project,
+  board,
+  agents = [],
+  request = {},
+  dispatchProjectTasks,
+  recoverSubmission,
+  emitEvent,
+  now = Date.now(),
+} = {}) {
+  if (!project || !board) return { ok: false, error: 'project_not_found' };
+
+  const idempotencyKey = String(request.idempotencyKey || '').trim();
+  if (!idempotencyKey) return { ok: false, error: 'idempotency_key_required', status: 400 };
+
+  project.continueIdempotency = project.continueIdempotency && typeof project.continueIdempotency === 'object'
+    ? project.continueIdempotency
+    : {};
+  if (project.continueIdempotency[idempotencyKey]) {
+    return { ...project.continueIdempotency[idempotencyKey], idempotent: true };
+  }
+
+  const intervention = deriveProjectIntervention({
+    project,
+    tasks: board.getAllTasks(),
+    agents,
+    now,
+  });
+
+  if (!intervention?.required) {
+    return remember(project, idempotencyKey, {
+      ok: false,
+      action: 'continue_project',
+      error: 'no_intervention_required',
+      strategy: null,
+      intervention,
+      xiaokContext: buildXiaokContext({ project, intervention }),
+    });
+  }
+
+  const task = board.getTask(intervention.primaryTaskId);
+  if (!task) {
+    return { ok: false, error: 'task_not_found', status: 404 };
+  }
+
+  const stale = validateExpectedState(task, request, intervention);
+  if (!stale.ok) return stale;
+
+  const strategy = intervention.primaryAction?.strategy || 'needs_conversation';
+  if (strategy === 'needs_conversation') {
+    return remember(project, idempotencyKey, {
+      ok: false,
+      action: 'continue_project',
+      error: 'needs_conversation',
+      strategy,
+      intervention,
+      xiaokContext: buildXiaokContext({ project, intervention, task }),
+    });
+  }
+
+  if (isRecoveryBudgetExceeded(task, strategy)) {
+    return remember(project, idempotencyKey, {
+      ok: false,
+      action: 'continue_project',
+      error: 'recovery_budget_exceeded',
+      strategy: 'needs_conversation',
+      blockedStrategy: strategy,
+      intervention,
+      xiaokContext: buildXiaokContext({
+        project,
+        intervention,
+        task,
+        reason: `同一恢复策略 ${strategy} 已失败过，需要先问小K确认下一步。`,
+      }),
+    });
+  }
+
+  let result;
+  if (strategy === 'recover_submission') {
+    result = recoverTaskSubmission({ project, task, intervention, recoverSubmission });
+  } else if (strategy === 'complete_retry_parent') {
+    result = completeRetryParent({ board, task });
+  } else if (MUTATING_RETRY_STRATEGIES.has(strategy)) {
+    result = retryTask({ board, task, strategy, agents, dispatchProjectTasks, intervention });
+  } else {
+    result = {
+      ok: false,
+      action: 'continue_project',
+      error: 'unsupported_continue_strategy',
+      strategy,
+      intervention,
+      xiaokContext: buildXiaokContext({ project, intervention, task }),
+    };
+  }
+
+  if (result.ok) {
+    recordRecoveryAttempt(task, strategy, now);
+    emitEvent?.('project.continue', {
+      projectId: project.id,
+      taskId: task.id,
+      strategy,
+      dispatched: result.dispatched || [],
+    });
+  }
+
+  return remember(project, idempotencyKey, {
+    action: 'continue_project',
+    strategy,
+    intervention,
+    ...result,
+  });
+}
+
+function validateExpectedState(task, request, intervention) {
+  if (request.expectedPrimaryTaskId && request.expectedPrimaryTaskId !== task.id) {
+    return {
+      ok: false,
+      error: 'task_state_changed',
+      status: 409,
+      currentPrimaryTaskId: task.id,
+      intervention,
+    };
+  }
+  if (
+    request.expectedTaskUpdatedAt !== undefined &&
+    Number(request.expectedTaskUpdatedAt) !== Number(task.updatedAt || 0)
+  ) {
+    return {
+      ok: false,
+      error: 'task_state_changed',
+      status: 409,
+      currentTaskUpdatedAt: task.updatedAt || null,
+      intervention,
+    };
+  }
+  return { ok: true };
+}
+
+function recoverTaskSubmission({ project, task, intervention, recoverSubmission }) {
+  const lease = task.lastRunLease || task.runLease || {};
+  const artifactManifest = Array.isArray(lease.artifactManifest) ? lease.artifactManifest : [];
+  const artifacts = Array.isArray(lease.artifacts) ? lease.artifacts : [];
+  if (artifactManifest.length === 0 && artifacts.length === 0) {
+    return {
+      ok: false,
+      error: 'no_recoverable_artifacts',
+      strategy: 'needs_conversation',
+      xiaokContext: buildXiaokContext({ project, intervention, task }),
+    };
+  }
+
+  const payload = {
+    summary: 'Recovered artifacts from interrupted run',
+    artifactManifest,
+    artifacts,
+    runId: lease.runId || task.recoveredRunId || null,
+  };
+  const recovered = recoverSubmission
+    ? recoverSubmission(task.id, payload, lease.assignedAgent || task.assignedAgent || 'system', {
+        runId: payload.runId,
+        recoveryReason: 'continue_project_recover_submission',
+      })
+    : { ok: false, error: 'recover_submission_unavailable' };
+  if (!recovered.ok) return recovered;
+  return { ok: true, recovered: true, dispatched: [], taskId: task.id, result: payload };
+}
+
+function completeRetryParent({ board, task }) {
+  const retryChild = board.getAllTasks()
+    .filter(candidate => candidate.parentTaskId === task.id && candidate.status === 'done')
+    .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))[0];
+  if (!retryChild?.result) {
+    return { ok: false, error: 'retry_child_result_missing' };
+  }
+  const completed = board.completeRetryParent(task.id, retryChild.result, {
+    completedBy: 'continue_project',
+    completedByTaskId: retryChild.id,
+    recoveredBy: retryChild.completedBy || 'retry_child',
+    recoveryReason: 'continue_project_complete_retry_parent',
+  });
+  if (!completed.ok) return completed;
+  return { ok: true, completed: true, dispatched: [], taskId: task.id };
+}
+
+function retryTask({ board, task, strategy, agents, dispatchProjectTasks, intervention }) {
+  const agentId = selectHealthyAgent(task, agents);
+  if (!agentId) {
+    return {
+      ok: false,
+      error: 'needs_conversation',
+      strategy: 'needs_conversation',
+      xiaokContext: buildXiaokContext({ intervention, task }),
+    };
+  }
+
+  if (strategy === 'retry_with_repair_instruction') {
+    task.repairInstruction = buildRepairInstruction(task);
+  }
+
+  let reset;
+  if (ACTIVE_STATUSES.has(task.status)) {
+    reset = board.resetStaleRun(task.id, 'continue_project_restart_then_retry');
+  } else {
+    reset = board.transition(task.id, 'pending', {
+      failureReason: task.failureReason,
+      failureClass: task.lastFailureClass,
+      qualityFailureCount: task.qualityFailureCount,
+    });
+  }
+  if (!reset.ok) return reset;
+
+  const pendingTask = board.getTask(task.id);
+  pendingTask.assignedAgent = agentId;
+  pendingTask.recoveryStatus = 'redispatch_ready';
+  pendingTask.recoveryReason = `continue_project:${strategy}`;
+  if (strategy === 'retry_with_repair_instruction') {
+    pendingTask.repairInstruction = buildRepairInstruction(task);
+  }
+
+  const dispatch = dispatchProjectTasks ? dispatchProjectTasks() : { ok: false, dispatched: [], error: 'dispatch_unavailable' };
+  if (!dispatch.ok) return dispatch;
+  return {
+    ok: true,
+    retried: true,
+    dispatched: dispatch.dispatched || [],
+    skipped: dispatch.skipped || [],
+    blocked: dispatch.blocked || [],
+    projectGate: dispatch.projectGate || null,
+    taskId: task.id,
+    assignedAgent: agentId,
+  };
+}
+
+function selectHealthyAgent(task, agents) {
+  const list = listAgents(agents);
+  const healthy = list.filter(isHealthyAgent);
+  if (healthy.length === 0) return list.length === 0 ? (task.assignedAgent || null) : null;
+  const previous = task.assignedAgent;
+  return (healthy.find(agent => agent.id !== previous) || healthy[0]).id || null;
+}
+
+function isHealthyAgent(agent = {}) {
+  if (!agent || agent.archived) return false;
+  if (['offline', 'error', 'failed', 'stopped', 'archived'].includes(String(agent.status || '').toLowerCase())) return false;
+  const state = String(agent.runtimeHealth?.state || 'healthy').toLowerCase();
+  return !['unhealthy', 'error', 'failed', 'offline', 'cooldown', 'degraded', 'stalled'].includes(state);
+}
+
+function buildRepairInstruction(task = {}) {
+  const latestReview = [...(task.qualityReviewHistory || [])].reverse().find(review => review?.passed === false);
+  return [
+    latestReview?.feedback,
+    task.reviewResult?.feedback,
+    task.blockedReason,
+    task.failureReason,
+  ].filter(Boolean).join('\n');
+}
+
+function isRecoveryBudgetExceeded(task, strategy) {
+  const history = Array.isArray(task.continueRecoveryHistory) ? task.continueRecoveryHistory : [];
+  return history.filter(item => item.strategy === strategy && item.result === 'started').length >= MAX_SAME_STRATEGY_RECOVERIES;
+}
+
+function recordRecoveryAttempt(task, strategy, now) {
+  task.continueRecoveryHistory = Array.isArray(task.continueRecoveryHistory) ? task.continueRecoveryHistory : [];
+  task.continueRecoveryHistory.push({
+    strategy,
+    result: 'started',
+    at: now,
+  });
+}
+
+function remember(project, idempotencyKey, result) {
+  project.continueIdempotency[idempotencyKey] = result;
+  return result;
+}
+
+export function buildXiaokContext({ project = {}, intervention = {}, task = null, reason = '' } = {}) {
+  const downstreamBlockedCount = Number(intervention.downstreamBlockedCount || 0);
+  const taskTitle = task?.title || intervention.primaryTaskTitle || '';
+  const failure = intervention.primaryFailure || {};
+  const lastFailure = reason || failure.feedback || failure.reason || task?.failureReason || task?.blockedReason || '任务失败';
+  return {
+    projectId: project.id || intervention.projectId || null,
+    projectName: project.name || '',
+    taskId: task?.id || intervention.primaryTaskId || null,
+    taskTitle,
+    summary: downstreamBlockedCount > 0
+      ? `${taskTitle || '当前任务'} 卡住，后续 ${downstreamBlockedCount} 个任务正在等待。`
+      : `${taskTitle || '当前任务'} 需要确认下一步。`,
+    lastFailure,
+    suggestedInstruction: '请检查失败原因，决定是否重试、改写任务要求，或调整执行 agent 后继续推进。',
+  };
+}
+
+function listAgents(agents) {
+  if (agents instanceof Map) return [...agents.values()];
+  if (Array.isArray(agents)) return agents;
+  if (agents && typeof agents === 'object') return Object.values(agents);
+  return [];
+}

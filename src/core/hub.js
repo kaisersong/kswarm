@@ -20,6 +20,8 @@ import { expandCompositeTasks } from './composite-task-expander.js';
 import { getActiveTasksAcrossBoards, isReworkReadyForDispatch, planDispatch } from './dispatch-policy.js';
 import { superviseTaskFailure } from './failure-supervisor.js';
 import { deriveProjectHealth } from './project-health.js';
+import { deriveProjectIntervention } from './project-intervention.js';
+import { handleContinueProjectCore } from './project-continue.js';
 import { validateTaskResultAgainstContract } from './execution-contract.js';
 import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
@@ -585,6 +587,23 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, taskId: task.id, retried: false, failureReason: reason };
   }
 
+  function handleContinueProject(projectId, request = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    const board = boards.get(projectId);
+    if (!board) return { ok: false, error: 'project_not_found' };
+
+    return handleContinueProjectCore({
+      project,
+      board,
+      agents: typeof getAgentProfiles === 'function' ? getAgentProfiles() : [],
+      request,
+      dispatchProjectTasks: () => handleRequestDispatch(projectId, project.poAgent),
+      recoverSubmission: (taskId, result, fromAgent, meta) => handleRecoverSubmission(projectId, taskId, result, fromAgent, meta),
+      emitEvent: (type, data) => eventLog.emit(type, data),
+    });
+  }
+
   /**
    * PO 提交项目交付物（但不关闭项目！只有 Human 能关闭）
    * 前置条件：所有任务必须已完成
@@ -1035,6 +1054,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       dispatchPlan: buildDispatchPlan(projectId),
     });
   }
+  function getProjectIntervention(projectId) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return null;
+    const dispatchPlan = buildDispatchPlan(projectId);
+    return deriveProjectIntervention({
+      project,
+      tasks: board.getAllTasks(),
+      agents: typeof getAgentProfiles === 'function' ? getAgentProfiles() : [],
+      dispatchPlan,
+    });
+  }
   function getHumanActions(projectId) {
     if (projectId) return humanActions.filter(a => a.projectId === projectId);
     return [...humanActions];
@@ -1065,6 +1096,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleRecoverSubmission,
     handleResetTaskForRecovery,
     handleTaskFail,
+    handleContinueProject,
   };
 
   const persisted = {};
@@ -1084,6 +1116,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     listProjects,
     getDispatchPlan,
     getProjectHealth,
+    getProjectIntervention,
     getHumanActions,
     persistState,
   };
