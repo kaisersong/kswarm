@@ -14,10 +14,10 @@ export function handleContinueProjectCore({
   emitEvent,
   now = Date.now(),
 } = {}) {
-  if (!project || !board) return { ok: false, error: 'project_not_found' };
+  if (!project || !board) return withOutcome({ ok: false, error: 'project_not_found' }, 'not_advanced');
 
   const idempotencyKey = String(request.idempotencyKey || '').trim();
-  if (!idempotencyKey) return { ok: false, error: 'idempotency_key_required', status: 400 };
+  if (!idempotencyKey) return withOutcome({ ok: false, error: 'idempotency_key_required', status: 400 }, 'not_advanced');
 
   project.continueIdempotency = project.continueIdempotency && typeof project.continueIdempotency === 'object'
     ? project.continueIdempotency
@@ -41,16 +41,17 @@ export function handleContinueProjectCore({
       strategy: null,
       intervention,
       xiaokContext: buildXiaokContext({ project, intervention }),
+      ...outcomeFields('not_advanced'),
     });
   }
 
   const task = board.getTask(intervention.primaryTaskId);
   if (!task) {
-    return { ok: false, error: 'task_not_found', status: 404 };
+    return withOutcome({ ok: false, error: 'task_not_found', status: 404 }, 'not_advanced');
   }
 
   const stale = validateExpectedState(task, request, intervention);
-  if (!stale.ok) return stale;
+  if (!stale.ok) return withOutcome(stale, 'not_advanced');
 
   const strategy = intervention.primaryAction?.strategy || 'needs_conversation';
   if (strategy === 'needs_conversation') {
@@ -61,6 +62,8 @@ export function handleContinueProjectCore({
       strategy,
       intervention,
       xiaokContext: buildXiaokContext({ project, intervention, task }),
+      ...outcomeFields('needs_user_action', { humanActionRequired: true }),
+      nextActions: buildNextActions({ project, task }),
     });
   }
 
@@ -76,8 +79,10 @@ export function handleContinueProjectCore({
         project,
         intervention,
         task,
-        reason: `同一恢复策略 ${strategy} 已失败过，需要先问小K确认下一步。`,
+        reason: `同一恢复策略 ${strategy} 已失败过，需要让小K帮忙确认下一步。`,
       }),
+      ...outcomeFields('needs_user_action', { humanActionRequired: true }),
+      nextActions: buildNextActions({ project, task }),
     });
   }
 
@@ -114,7 +119,46 @@ export function handleContinueProjectCore({
     strategy,
     intervention,
     ...result,
+    ...outcomeFields(result.ok
+      ? (result.recovered ? 'submitted_for_review' : 'advanced')
+      : (result.strategy === 'needs_conversation' ? 'needs_user_action' : 'not_advanced'), {
+        projectChanged: Boolean(result.ok),
+        humanActionRequired: !result.ok && result.strategy === 'needs_conversation',
+      }),
+    ...(!result.ok && result.strategy === 'needs_conversation'
+      ? { nextActions: buildNextActions({ project, task }) }
+      : {}),
   });
+}
+
+function outcomeFields(outcome, { projectChanged = false, humanActionRequired = false } = {}) {
+  return {
+    outcome,
+    projectChanged,
+    humanActionRequired,
+  };
+}
+
+function withOutcome(result, outcome, options = {}) {
+  return {
+    ...result,
+    ...outcomeFields(outcome, options),
+  };
+}
+
+function buildNextActions({ project = {}, task = null } = {}) {
+  if (!project?.id || !task?.id) return [];
+  return [{
+    id: 'repair_and_submit',
+    label: '修复并提交',
+    description: '补充或修正任务产物后，直接提交给项目审核流程。',
+    toolName: 'repair_project_task',
+    params: {
+      projectId: project.id,
+      expectedPrimaryTaskId: task.id,
+      expectedTaskUpdatedAt: task.updatedAt || null,
+    },
+  }];
 }
 
 function validateExpectedState(task, request, intervention) {
@@ -144,8 +188,7 @@ function validateExpectedState(task, request, intervention) {
 
 function recoverTaskSubmission({ project, task, intervention, recoverSubmission }) {
   const lease = task.lastRunLease || task.runLease || {};
-  const artifactManifest = Array.isArray(lease.artifactManifest) ? lease.artifactManifest : [];
-  const artifacts = Array.isArray(lease.artifacts) ? lease.artifacts : [];
+  const { artifactManifest, artifacts } = collectRecoverableArtifacts(task, lease);
   if (artifactManifest.length === 0 && artifacts.length === 0) {
     return {
       ok: false,
@@ -156,10 +199,10 @@ function recoverTaskSubmission({ project, task, intervention, recoverSubmission 
   }
 
   const payload = {
-    summary: 'Recovered artifacts from interrupted run',
+    summary: task.result?.summary || 'Recovered artifacts from interrupted run',
     artifactManifest,
     artifacts,
-    runId: lease.runId || task.recoveredRunId || null,
+    runId: lease.runId || task.result?.runId || task.recoveredRunId || null,
   };
   const recovered = recoverSubmission
     ? recoverSubmission(task.id, payload, lease.assignedAgent || task.assignedAgent || 'system', {
@@ -169,6 +212,42 @@ function recoverTaskSubmission({ project, task, intervention, recoverSubmission 
     : { ok: false, error: 'recover_submission_unavailable' };
   if (!recovered.ok) return recovered;
   return { ok: true, recovered: true, dispatched: [], taskId: task.id, result: payload };
+}
+
+function collectRecoverableArtifacts(task = {}, lease = {}) {
+  const sources = [
+    lease,
+    task.lastRunLease,
+    task.runLease,
+    task.result,
+    task,
+  ];
+  const artifactManifest = [];
+  const artifacts = [];
+  const seenManifest = new Set();
+  const seenArtifacts = new Set();
+
+  for (const source of sources) {
+    for (const item of Array.isArray(source?.artifactManifest) ? source.artifactManifest : []) {
+      const key = artifactKey(item);
+      if (seenManifest.has(key)) continue;
+      seenManifest.add(key);
+      artifactManifest.push(item);
+    }
+    for (const item of Array.isArray(source?.artifacts) ? source.artifacts : []) {
+      const key = artifactKey(item);
+      if (seenArtifacts.has(key)) continue;
+      seenArtifacts.add(key);
+      artifacts.push(item);
+    }
+  }
+
+  return { artifactManifest, artifacts };
+}
+
+function artifactKey(item) {
+  if (!item || typeof item !== 'object') return String(item);
+  return String(item.path || item.url || item.filename || JSON.stringify(item));
 }
 
 function completeRetryParent({ board, task }) {
@@ -295,7 +374,7 @@ export function buildXiaokContext({ project = {}, intervention = {}, task = null
       ? `${taskTitle || '当前任务'} 卡住，后续 ${downstreamBlockedCount} 个任务正在等待。`
       : `${taskTitle || '当前任务'} 需要确认下一步。`,
     lastFailure,
-    suggestedInstruction: '请检查失败原因，决定是否重试、改写任务要求，或调整执行 agent 后继续推进。',
+    suggestedInstruction: '请诊断失败原因；如需要提交修复产物，请调用 repair_project_task 将产物提交回项目审核。',
   };
 }
 

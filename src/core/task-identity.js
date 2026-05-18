@@ -68,6 +68,8 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
 
   for (let i = 0; i < taskList.length; i++) {
     const input = taskList[i] || {};
+    if (!isExecutableTaskInput(input)) continue;
+
     const parsed = parseTaskId(input.id);
     const rawLocalTaskId = parsed.global ? parsed.localTaskId : (input.id || input.planItemId || `item-${i + 1}`);
     const localTaskId = normalizeLocalTaskId(rawLocalTaskId, i + 1);
@@ -114,6 +116,11 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
   }
 
   return { ok: true, tasks: prepared };
+}
+
+export function isExecutableTaskInput(input = {}) {
+  if (!input || typeof input !== 'object') return false;
+  return [input.title, input.brief, input.description].some(value => String(value || '').trim().length > 0);
 }
 
 export function normalizeExistingTask(projectId, task) {

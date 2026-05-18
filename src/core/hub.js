@@ -22,6 +22,7 @@ import { superviseTaskFailure } from './failure-supervisor.js';
 import { deriveProjectHealth } from './project-health.js';
 import { deriveProjectIntervention } from './project-intervention.js';
 import { handleContinueProjectCore } from './project-continue.js';
+import { resolveProjectIntervention } from './project-intervention-resolution.js';
 import { validateTaskResultAgainstContract } from './execution-contract.js';
 import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
@@ -604,6 +605,32 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     });
   }
 
+  function handleResolveProjectIntervention(projectId, request = {}, runtime = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found', outcome: 'not_advanced', projectChanged: false, humanActionRequired: false };
+    const board = boards.get(projectId);
+    if (!board) return { ok: false, error: 'project_not_found', outcome: 'not_advanced', projectChanged: false, humanActionRequired: false };
+
+    return resolveProjectIntervention({
+      project,
+      board,
+      agents: typeof getAgentProfiles === 'function' ? getAgentProfiles() : [],
+      request,
+      writeArtifact: runtime.writeArtifact,
+      recoverSubmission: (taskId, result, fromAgent, meta) => handleRecoverSubmission(projectId, taskId, result, fromAgent, meta),
+      sendReviewSubmission: runtime.sendReviewSubmission || (bridge && project.poAgent ? (({ taskId, payload }) => {
+        bridge.send({
+          type: 'intent',
+          kind: 'review_submission',
+          taskId,
+          toParticipantId: project.poAgent,
+          payload,
+        });
+      }) : null),
+      emitEvent: (type, data) => eventLog.emit(type, data),
+    });
+  }
+
   /**
    * PO 提交项目交付物（但不关闭项目！只有 Human 能关闭）
    * 前置条件：所有任务必须已完成
@@ -795,6 +822,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       projectId, taskId: task.id, taskTitle: task.title, agent: fromAgent,
       output: result, recovered: true,
     });
+    const project = projects.get(projectId);
+    if (bridge && project) {
+      bridge.send({
+        type: 'intent', kind: 'result_submitted',
+        taskId: task.id, toParticipantId: project.poAgent,
+        payload: { result, agent: fromAgent, projectId, runId: meta.runId || result?.runId },
+      });
+    }
     return recovered;
   }
 
@@ -1097,6 +1132,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleResetTaskForRecovery,
     handleTaskFail,
     handleContinueProject,
+    handleResolveProjectIntervention,
   };
 
   const persisted = {};

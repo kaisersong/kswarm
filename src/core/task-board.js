@@ -307,6 +307,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     const oldStatus = task.status;
     task.status = 'submitted';
     task.result = result;
+    task.reviewResult = null;
     task.updatedAt = Date.now();
     if (task.runLease) {
       task.lastRunLease = { ...task.runLease, status: 'recovered', recoveredAt: task.updatedAt };
@@ -451,6 +452,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     tasks.clear();
     for (const task of taskArray) {
       const normalized = normalizeExistingTask(projectId, task);
+      clearStaleRecoveredReview(normalized);
       tasks.set(normalized.id, normalized);
     }
     rebuildAliases();
@@ -465,6 +467,18 @@ export function createTaskBoard(projectId = 'legacy-project') {
       }
       task.dependencies = deps;
       task.unresolvedDependencies = unresolved;
+    }
+  }
+
+  function clearStaleRecoveredReview(task) {
+    if (task.status !== 'submitted') return;
+    if (task.recoveryStatus !== 'recovered') return;
+    if (task.reviewResult?.passed !== false) return;
+    const recoveredAt = Number(task.recoveredAt || 0);
+    const reviewedAt = Number(task.reviewResult.reviewedAt || 0);
+    if (!recoveredAt) return;
+    if (!reviewedAt || reviewedAt < recoveredAt) {
+      task.reviewResult = null;
     }
   }
 

@@ -58,7 +58,7 @@ mkdirSync(PROJECTS_DIR, { recursive: true });
 // ─── Hub Instance ─────────────────────────────────────────────────
 let agentStore = null;
 const hub = createHub({
-  eventLogDir: null,
+  eventLogDir: join(KSWARM_HOME, 'events'),
   silent: false,
   dataDir: join(KSWARM_HOME, 'state.json'),
   getAgentProfiles: () => agentStore?.list({ includeArchived: false }) || [],
@@ -828,6 +828,45 @@ async function handleRequest(req, res) {
         if ((result.dispatched || []).length > 0) {
           await sendBrokerRequestTasks(projectId, result.dispatched || []);
         }
+      }
+      return json(res, result, result.status || (result.ok ? 200 : 400));
+    }
+
+    // ── Resolve project intervention with a repaired artifact ──
+    const resolveInterventionMatch = path.match(/^\/projects\/([^/]+)\/intervention\/resolve$/);
+    if (resolveInterventionMatch && req.method === 'POST') {
+      const projectId = resolveInterventionMatch[1];
+      const body = await parseBody(req);
+      const ws = getProjectWorkspace(projectId);
+      const project = hub.getProject(projectId);
+      const canNotifyReview = Boolean(brokerClient && brokerClient.isConnected() && project?.poAgent);
+      const result = hub.handleResolveProjectIntervention(projectId, body || {}, {
+        writeArtifact: ({ filename, content }) => {
+          const artifactPath = join(ws.artifacts, filename);
+          writeFileSync(artifactPath, content, 'utf8');
+          return { ok: true, path: artifactPath };
+        },
+        sendReviewSubmission: canNotifyReview ? ({ taskId, payload }) => {
+          brokerClient.sendTo(project.poAgent, 'review_submission', { taskId, payload }).catch(err => {
+            log('warn', `Failed to send review_submission to ${project.poAgent}`, { projectId, taskId, error: err.message });
+          });
+        } : null,
+      });
+      if (result.ok) {
+        log('info', `Project intervention resolved`, {
+          projectId,
+          taskId: result.taskId,
+          resolution: result.resolution,
+          reviewNotification: result.reviewNotification,
+        });
+        broadcast({
+          type: 'task_update',
+          projectId,
+          taskId: result.taskId,
+          status: 'submitted',
+          recovered: true,
+          reviewNotification: result.reviewNotification,
+        });
       }
       return json(res, result, result.status || (result.ok ? 200 : 400));
     }

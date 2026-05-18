@@ -6,12 +6,21 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../src/core/hub.js';
+import { restoreTaskBoard } from '../src/core/task-board.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-function setup() {
-  const hub = createHub({ silent: true });
+function createMockBridge() {
+  const sent = [];
+  return {
+    send(message) { sent.push(message); },
+    getSentOf(kind) { return sent.filter(message => message.kind === kind); },
+  };
+}
+
+function setup(options = {}) {
+  const hub = createHub({ silent: true, bridge: options.bridge });
   hub.createProject({ id: 'proj-recover', name: 'Recover', goal: 'goal', poAgent: 'po', members: ['worker'] });
   hub.handleSubmitPlan('proj-recover', {
     analysis: 'test',
@@ -91,6 +100,77 @@ test('recover records run identity and recovery reason for startup recovery', ()
   assert.equal(task.recoveredRunId, 'run-recover-1');
   assert.equal(task.recoveryStatus, 'recovered');
   assert.equal(task.recoveryReason, 'journal_artifact_written');
+});
+
+test('recover notifies PO through result submitted bridge event', () => {
+  const bridge = createMockBridge();
+  const hub = setup({ bridge });
+  const board = hub.getBoard('proj-recover');
+  board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-recover-notify' });
+  board.transition('item-1', 'cancelled');
+
+  const resultPayload = {
+    summary: 'Recovered artifact',
+    artifacts: [{ filename: 'item-1-report.md' }],
+  };
+  const result = hub.handleRecoverSubmission('proj-recover', 'item-1', resultPayload, 'worker', {
+    runId: 'run-recover-notify',
+  });
+
+  assert.equal(result.ok, true);
+  const submitted = bridge.getSentOf('result_submitted');
+  assert.equal(submitted.length, 1);
+  assert.equal(submitted[0].toParticipantId, 'po');
+  assert.equal(submitted[0].taskId, 'proj-recover__item-1');
+  assert.equal(submitted[0].payload.result, resultPayload);
+});
+
+test('recover clears current failed review result but keeps review history', () => {
+  const hub = setup();
+  const board = hub.getBoard('proj-recover');
+  board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-recover-review' });
+  board.transition('item-1', 'failed');
+  const task = board.getTask('item-1');
+  const failedReview = {
+    passed: false,
+    feedback: '补充数据来源和假设基线',
+    reviewedAt: Date.now(),
+  };
+  task.reviewResult = failedReview;
+  task.qualityReviewHistory.push(failedReview);
+
+  const result = hub.handleRecoverSubmission('proj-recover', 'item-1', {
+    summary: 'Recovered artifact',
+    artifacts: [{ filename: 'item-1-report.md' }],
+  }, 'worker', { runId: 'run-recover-review' });
+
+  assert.equal(result.ok, true);
+  assert.equal(task.status, 'submitted');
+  assert.equal(task.reviewResult, null);
+  assert.deepEqual(task.qualityReviewHistory, [failedReview]);
+});
+
+test('restore clears stale failed review that predates recovered submission', () => {
+  const failedReview = {
+    passed: false,
+    feedback: '旧失败审核',
+    reviewedAt: 1_000,
+  };
+  const board = restoreTaskBoard([{
+    id: 'proj-recover__item-1',
+    title: 'Research',
+    status: 'submitted',
+    result: { summary: 'Recovered artifact' },
+    reviewResult: failedReview,
+    qualityReviewHistory: [failedReview],
+    recoveryStatus: 'recovered',
+    recoveredAt: 2_000,
+    dependencies: [],
+  }], 'proj-recover');
+
+  const task = board.getTask('proj-recover__item-1');
+  assert.equal(task.reviewResult, null);
+  assert.deepEqual(task.qualityReviewHistory, [failedReview]);
 });
 
 test('hub can reset a stale active run to pending for redispatch', () => {

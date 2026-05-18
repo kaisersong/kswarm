@@ -50,6 +50,21 @@ test('normalizeTasksForProject globalizes local IDs', () => {
   assert.equal(result.tasks[0].legacyTaskId, 'item-1');
 });
 
+test('normalizeTasksForProject ignores metadata-only plan rows', () => {
+  const result = normalizeTasksForProject('proj-a', [
+    { id: 'item-1', title: 'Executable task', dependencies: [] },
+    { key: 'background', value: 'Only plan context, not a task' },
+    { fields: ['source', 'baseline'], assumptions: ['Use public customs data'] },
+    { description: 'Description-only executable task', assignedAgent: 'worker' },
+  ]);
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks.length, 2);
+  assert.deepEqual(result.tasks.map(task => task.title || task.description), [
+    'Executable task',
+    'Description-only executable task',
+  ]);
+});
+
 test('normalizeTasksForProject rejects duplicate normalized local IDs', () => {
   const result = normalizeTasksForProject('proj-a', [
     { id: 'item 1', title: 'Task 1', dependencies: [] },

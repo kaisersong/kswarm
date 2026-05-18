@@ -159,6 +159,75 @@ test('durable artifact recovery uses recovered submission', () => {
   assert.equal(task.result.artifactManifest[0].filename, 'report.md');
 });
 
+test('durable artifact recovery uses task result artifacts when lease manifest is empty', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const failed = failRootTask(hub, 'agent_error', 'quality review rejected but artifacts were captured');
+  failed.lastRunLease = {
+    runId: 'run-empty-manifest',
+    assignedAgent: 'cli-codex',
+    artifactManifest: [],
+  };
+  failed.result = {
+    summary: 'partial report with attached data file',
+    artifacts: [{ filename: 'data_sources_assumptions.json', path: '/tmp/data_sources_assumptions.json' }],
+  };
+
+  const intervention = hub.getProjectIntervention('proj-continue');
+  assert.equal(intervention.primaryAction.strategy, 'recover_submission');
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-result-artifacts',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'recover_submission');
+  assert.equal(result.error, undefined);
+  assert.equal(task.status, 'submitted');
+  assert.equal(task.result.artifacts[0].filename, 'data_sources_assumptions.json');
+});
+
+test('continue retries rejected recovered artifact instead of resubmitting it', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const failed = failRootTask(hub, 'quality_content_failed', '旧产物不合格');
+  const feedback = '补全主要贸易伙伴、人民币汇率、政策变动清单、热点事件列表';
+  failed.result = {
+    summary: 'Rejected recovered artifact',
+    artifacts: [{ filename: 'data_sources_assumptions.json', path: '/tmp/data_sources_assumptions.json' }],
+  };
+  failed.recoveryStatus = 'recovered';
+  failed.recoveredAt = Date.now() - 1_000;
+  failed.reviewResult = { passed: false, feedback, reviewedAt: Date.now() };
+  failed.qualityReviewHistory.push(failed.reviewResult);
+  failed.qualityFailureCount = 2;
+  const blocked = hub.getBoard('proj-continue').blockTask(failed.id, {
+    blockKind: 'executor_quality_blocked',
+    blockedReason: feedback,
+    failureClass: 'quality_content_failed',
+    qualityFailureCount: 2,
+  });
+  assert.equal(blocked.ok, true);
+  const blockedTask = getTask(hub);
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: blockedTask.id,
+    expectedTaskUpdatedAt: blockedTask.updatedAt,
+    idempotencyKey: 'continue-rejected-recovered-artifact',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'retry_with_repair_instruction');
+  assert.deepEqual(result.dispatched, [task.id]);
+  assert.equal(task.status, 'dispatched');
+  assert.notEqual(task.status, 'submitted');
+  assert.match(task.repairInstruction, /人民币汇率/);
+});
+
 test('unsafe state returns needs conversation and does not mutate', () => {
   const hub = createTestHub(offlineAgents());
   setupProject(hub);
@@ -238,6 +307,53 @@ test('recovery budget prevents repeating the same failed strategy', () => {
   assert.equal(second.error, 'recovery_budget_exceeded');
   assert.equal(second.strategy, 'needs_conversation');
   assert.equal(getTask(hub).status, 'failed');
+});
+
+test('budget exceeded returns explicit needs_user_action next action without mutating project', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const failed = failRootTask(hub, 'quality_content_failed', '质量不达标');
+  failed.qualityFailureCount = 1;
+  failed.qualityReviewHistory.push({ passed: false, feedback: '补充数据来源和关键假设', reviewedAt: Date.now() });
+  failed.continueRecoveryHistory = [
+    { strategy: 'retry_with_repair_instruction', result: 'started', at: Date.now() - 1_000 },
+  ];
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-budget-next-action',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'recovery_budget_exceeded');
+  assert.equal(result.outcome, 'needs_user_action');
+  assert.equal(result.projectChanged, false);
+  assert.equal(result.humanActionRequired, true);
+  assert.equal(result.nextActions[0].id, 'repair_and_submit');
+  assert.equal(result.nextActions[0].toolName, 'repair_project_task');
+  assert.equal(result.nextActions[0].params.projectId, 'proj-continue');
+  assert.equal(result.nextActions[0].params.expectedPrimaryTaskId, failed.id);
+  assert.equal(result.nextActions[0].params.expectedTaskUpdatedAt, failed.updatedAt);
+  assert.equal(task.status, 'failed');
+});
+
+test('successful retry outcome is advanced and projectChanged', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const failed = failRootTask(hub);
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-advanced-outcome',
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'advanced');
+  assert.equal(result.projectChanged, true);
+  assert.equal(result.humanActionRequired, false);
 });
 
 let passed = 0;

@@ -83,6 +83,8 @@ function selectPrimaryCandidate({ project, tasks, taskMap, agents, dispatchPlan,
 
   const candidates = [];
   for (const task of tasks) {
+    if (isHistoricalRetryChild(task, taskMap)) continue;
+
     if (ACTIVE_STATUSES.has(task.status)) {
       if (hasUnexpiredLease(task, now)) continue;
       if (hasExpiredLease(task, now)) {
@@ -109,13 +111,20 @@ function findCompletedRetryParentCandidate(tasks, taskMap) {
   const candidates = tasks
     .filter(task => task.parentTaskId && task.status === 'done')
     .map(task => ({ child: task, parent: taskMap.get(task.parentTaskId) }))
-    .filter(({ parent }) => parent && parent.status !== 'done' && parent.status !== 'cancelled' && !parent.isCompositeParent);
+    .filter(({ parent }) => parent && ATTENTION_STATUSES.has(parent.status) && !parent.isCompositeParent);
   if (candidates.length === 0) return null;
   candidates.sort((left, right) => latestTimestamp(right.child) - latestTimestamp(left.child));
   return candidates[0].parent;
 }
 
+function isHistoricalRetryChild(task, taskMap) {
+  if (!task?.parentTaskId) return false;
+  const parent = taskMap.get(task.parentTaskId);
+  return Boolean(parent && !ATTENTION_STATUSES.has(parent.status));
+}
+
 function chooseAttentionStrategy(task, agents) {
+  if (hasCurrentQualityRejection(task)) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
   if (hasRecoverableArtifact(task)) return 'recover_submission';
   if (hasQualityFeedback(task)) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
   return chooseRetryStrategy(task, agents, 'retry_best_agent');
@@ -157,6 +166,12 @@ function hasQualityFeedback(task = {}) {
   if (String(task.lastFailureClass || '').startsWith('quality_')) return true;
   if (task.blockKind && String(task.blockKind).includes('quality')) return true;
   return latestFailedReview(task) !== null;
+}
+
+function hasCurrentQualityRejection(task = {}) {
+  if (task.reviewResult?.passed === false) return true;
+  if (String(task.lastFailureClass || '').startsWith('quality_')) return true;
+  return Boolean(task.blockKind && String(task.blockKind).includes('quality'));
 }
 
 function latestFailedReview(task = {}) {
@@ -236,7 +251,7 @@ function buildMessage({ task, strategy, downstreamBlockedCount }) {
     ? `后续 ${downstreamBlockedCount} 个任务正在等待它。`
     : '后续任务暂未受阻。';
   if (strategy === 'needs_conversation') {
-    return `${task.title || task.id} 无法安全自动推进，需要先问小K。${suffix}`;
+    return `${task.title || task.id} 无法安全自动推进，需要让小K帮忙确认下一步。${suffix}`;
   }
   if (strategy === 'recover_submission') {
     return `${task.title || task.id} 已有可恢复产物，可以继续推进。${suffix}`;
@@ -256,7 +271,7 @@ function buildMessage({ task, strategy, downstreamBlockedCount }) {
 function makeAskXiaokAction({ project, primaryTask, downstreamBlockedCount, primaryFailure = null }) {
   return {
     id: 'ask_xiaok',
-    label: '问小K',
+    label: '让小K帮忙',
     context: {
       projectId: project?.id || null,
       projectName: project?.name || '',
