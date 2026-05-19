@@ -30,6 +30,16 @@ function setupProject(hub, id) {
   assert.equal(hub.handleApprove(id).ok, true);
 }
 
+function setupXiaokWorkerProject(hub, id) {
+  hub.createProject({ id, name: id, goal: 'goal', poAgent: 'po', members: ['xiaok-worker'] });
+  const created = hub.handleCreateTasks(id, [
+    { id: 'item-1', title: 'First', brief: 'Do first', assignedAgent: 'xiaok-worker', dependencies: [] },
+    { id: 'item-2', title: 'Second', brief: 'Do second', assignedAgent: 'xiaok-worker', dependencies: [] },
+  ], 'po');
+  assert.equal(created.ok, true);
+  assert.equal(hub.handleApprove(id).ok, true);
+}
+
 test('same local task IDs in different projects stay isolated', () => {
   const hub = createHub({ silent: true });
   setupProject(hub, 'proj-a');
@@ -62,6 +72,80 @@ test('request dispatch sends runId in bridge request_task', () => {
   assert.equal(request.projectId, 'proj-a');
   assert.equal(request.localTaskId, 'item-1');
   assert.ok(request.runId);
+});
+
+test('request dispatch reserves runtime instances while preserving logical agent identity', () => {
+  const bridge = createMockBridge();
+  let reservation = 0;
+  const runtimeInstanceAllocator = {
+    getAgentConcurrency: () => ({ 'xiaok-worker': 2 }),
+    reserveWorkerInstance: ({ task }) => {
+      reservation += 1;
+      return { ok: true, instanceId: `${task.assignedAgent}@inst-${reservation}` };
+    },
+  };
+  const hub = createHub({ bridge, silent: true, runtimeInstanceAllocator });
+  setupXiaokWorkerProject(hub, 'proj-pool');
+
+  const dispatch = hub.handleRequestDispatch('proj-pool', 'po');
+  assert.equal(dispatch.ok, true);
+  assert.deepEqual(dispatch.dispatched, ['proj-pool__item-1', 'proj-pool__item-2']);
+
+  const first = hub.getBoard('proj-pool').getTask('item-1');
+  assert.equal(first.assignedAgent, 'xiaok-worker');
+  assert.equal(first.assignedRuntimeInstance, 'xiaok-worker@inst-1');
+  assert.equal(first.runLease.assignedAgent, 'xiaok-worker');
+  assert.equal(first.runLease.assignedRuntimeInstance, 'xiaok-worker@inst-1');
+
+  const [request] = bridge.getSentOf('request_task');
+  assert.equal(request.targetParticipantId, 'xiaok-worker@inst-1');
+
+  const runId = first.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-pool', 'item-1', 'xiaok-worker@inst-1', runId).ok, true);
+  assert.equal(hub.handleProgress('proj-pool', 'item-1', 'started', 'xiaok-worker@inst-1', runId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-pool', 'item-1', { summary: 'done' }, 'xiaok-worker@inst-1', runId).ok, true);
+});
+
+test('runtime instance run validation rejects another instance for the same logical agent', () => {
+  const runtimeInstanceAllocator = {
+    getAgentConcurrency: () => ({ 'xiaok-worker': 1 }),
+    reserveWorkerInstance: ({ task }) => ({ ok: true, instanceId: `${task.assignedAgent}@inst-owner` }),
+  };
+  const hub = createHub({ silent: true, runtimeInstanceAllocator });
+  setupXiaokWorkerProject(hub, 'proj-owner');
+  hub.handleRequestDispatch('proj-owner', 'po');
+  const task = hub.getBoard('proj-owner').getTask('item-1');
+
+  const wrong = hub.handleAcceptTask('proj-owner', 'item-1', 'xiaok-worker@inst-other', task.activeRunId);
+  assert.equal(wrong.ok, false);
+  assert.equal(wrong.error, 'wrong_assigned_agent');
+  assert.equal(wrong.assignedRuntimeInstance, 'xiaok-worker@inst-owner');
+});
+
+test('runtime instance returns to idle when submitted payload fails deliverable contract', () => {
+  const idleInstances = [];
+  const runtimeInstanceAllocator = {
+    getAgentConcurrency: () => ({ 'xiaok-worker': 1 }),
+    reserveWorkerInstance: ({ task }) => ({ ok: true, instanceId: `${task.assignedAgent}@inst-contract` }),
+    markInstanceIdle: instanceId => idleInstances.push(instanceId),
+  };
+  const hub = createHub({ silent: true, runtimeInstanceAllocator });
+  hub.createProject({ id: 'proj-contract', name: 'Contract', goal: 'goal', poAgent: 'po', members: ['xiaok-worker'] });
+  assert.equal(hub.handleCreateTasks('proj-contract', [
+    { id: 'item-1', title: 'Write report', brief: 'Create a markdown file', assignedAgent: 'xiaok-worker', dependencies: [], requiredOutputs: ['markdown'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-contract').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-contract', 'po').dispatched, ['proj-contract__item-1']);
+
+  const task = hub.getBoard('proj-contract').getTask('item-1');
+  const runId = task.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-contract', 'item-1', 'xiaok-worker@inst-contract', runId).ok, true);
+  assert.equal(hub.handleProgress('proj-contract', 'item-1', 'started', 'xiaok-worker@inst-contract', runId).ok, true);
+
+  const submitted = hub.handleSubmitResult('proj-contract', 'item-1', { summary: 'no artifact' }, 'xiaok-worker@inst-contract', runId);
+  assert.equal(submitted.ok, false);
+  assert.equal(submitted.error, 'deliverable_contract_failed');
+  assert.deepEqual(idleInstances, ['xiaok-worker@inst-contract']);
 });
 
 test('worker intents without the active runId are rejected after dispatch', () => {
@@ -178,6 +262,93 @@ test('worker failure requires active runId and creates a retry run', () => {
   assert.equal(retry.status, 'dispatched');
   assert.ok(retry.activeRunId);
   assert.notEqual(retry.activeRunId, runId);
+});
+
+test('runtime instance worker failure creates retry run with a fresh runtime instance', () => {
+  let reservation = 0;
+  const runtimeInstanceAllocator = {
+    getAgentConcurrency: () => ({ 'xiaok-worker': 2 }),
+    reserveWorkerInstance: ({ task }) => {
+      reservation += 1;
+      return { ok: true, instanceId: `${task.assignedAgent}@inst-${reservation}` };
+    },
+    markInstanceFailed: () => {},
+  };
+  const hub = createHub({ silent: true, runtimeInstanceAllocator });
+  hub.createProject({ id: 'proj-runtime-retry', name: 'Runtime Retry', goal: 'goal', poAgent: 'po', members: ['xiaok-worker'] });
+  assert.equal(hub.handleCreateTasks('proj-runtime-retry', [
+    { id: 'item-1', title: 'First', brief: 'Do first', assignedAgent: 'xiaok-worker', dependencies: [] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-runtime-retry').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-runtime-retry', 'po').dispatched, ['proj-runtime-retry__item-1']);
+
+  const board = hub.getBoard('proj-runtime-retry');
+  const original = board.getTask('item-1');
+  const failed = hub.handleWorkerFailure(
+    'proj-runtime-retry',
+    'item-1',
+    'xiaok-worker@inst-1',
+    original.activeRunId,
+    'agent_error',
+    'no output',
+  );
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.retried, true);
+  const retry = board.getTask(failed.retryTaskId);
+  assert.equal(retry.status, 'dispatched');
+  assert.equal(retry.assignedAgent, 'xiaok-worker');
+  assert.equal(retry.assignedRuntimeInstance, 'xiaok-worker@inst-2');
+  assert.equal(retry.runLease.assignedRuntimeInstance, 'xiaok-worker@inst-2');
+});
+
+test('model empty output releases runtime instance for immediate retry instead of failing it', () => {
+  const idleInstances = [];
+  const failedInstances = [];
+  let originalInstanceIdle = false;
+  let originalInstanceReserved = false;
+  const runtimeInstanceAllocator = {
+    getAgentConcurrency: () => ({ 'xiaok-worker': 1 }),
+    reserveWorkerInstance: () => {
+      if (!originalInstanceReserved) {
+        originalInstanceReserved = true;
+        return { ok: true, instanceId: 'xiaok-worker@inst-1' };
+      }
+      if (originalInstanceIdle) return { ok: true, instanceId: 'xiaok-worker@inst-1' };
+      return { ok: false, error: 'capacity_full' };
+    },
+    markInstanceIdle: instanceId => {
+      originalInstanceIdle = true;
+      idleInstances.push(instanceId);
+    },
+    markInstanceFailed: instanceId => failedInstances.push(instanceId),
+  };
+  const hub = createHub({ silent: true, runtimeInstanceAllocator });
+  hub.createProject({ id: 'proj-empty-output', name: 'Empty Output', goal: 'goal', poAgent: 'po', members: ['xiaok-worker'] });
+  assert.equal(hub.handleCreateTasks('proj-empty-output', [
+    { id: 'item-1', title: 'Write report', brief: 'Do first', assignedAgent: 'xiaok-worker', dependencies: [] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-empty-output').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-empty-output', 'po').dispatched, ['proj-empty-output__item-1']);
+
+  const board = hub.getBoard('proj-empty-output');
+  const original = board.getTask('item-1');
+  const failed = hub.handleWorkerFailure(
+    'proj-empty-output',
+    'item-1',
+    'xiaok-worker@inst-1',
+    original.activeRunId,
+    'model_empty_output',
+    'content_too_short',
+  );
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.retried, true);
+  assert.deepEqual(idleInstances, ['xiaok-worker@inst-1']);
+  assert.deepEqual(failedInstances, []);
+  const retry = board.getTask(failed.retryTaskId);
+  assert.equal(retry.status, 'dispatched');
+  assert.equal(retry.assignedRuntimeInstance, 'xiaok-worker@inst-1');
 });
 
 test('retry child completion marks failed parent done and unblocks dependents', () => {

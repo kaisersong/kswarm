@@ -319,16 +319,44 @@ function retryTask({ board, task, strategy, agents, dispatchProjectTasks, interv
 function selectHealthyAgent(task, agents) {
   const list = listAgents(agents);
   const healthy = list.filter(isHealthyAgent);
-  if (healthy.length === 0) return list.length === 0 ? (task.assignedAgent || null) : null;
   const previous = task.assignedAgent;
+  if (healthy.length === 0) {
+    const previousAgent = list.find(agent => agent.id === previous);
+    if (isRecoverableContentFailureAgent(previousAgent, task)) return previousAgent.id;
+    return list.length === 0 ? (task.assignedAgent || null) : null;
+  }
   return (healthy.find(agent => agent.id !== previous) || healthy[0]).id || null;
 }
 
 function isHealthyAgent(agent = {}) {
-  if (!agent || agent.archived) return false;
-  if (['offline', 'error', 'failed', 'stopped', 'archived'].includes(String(agent.status || '').toLowerCase())) return false;
+  if (!isAvailableAgent(agent)) return false;
   const state = String(agent.runtimeHealth?.state || 'healthy').toLowerCase();
   return !['unhealthy', 'error', 'failed', 'offline', 'cooldown', 'degraded', 'stalled'].includes(state);
+}
+
+function isRecoverableContentFailureAgent(agent = {}, task = {}) {
+  if (!isAvailableAgent(agent)) return false;
+  const health = agent.runtimeHealth || {};
+  const state = String(health.state || '').toLowerCase();
+  if (state !== 'degraded') return false;
+  if (health.cooldownUntil && Number(health.cooldownUntil) > Date.now()) return false;
+  if (String(health.lastFailureClass || '') === 'runtime_stalled') return false;
+
+  const failureText = [
+    task.lastFailureClass,
+    task.failureReason,
+    task.blockedReason,
+    task.reviewResult?.feedback,
+    health.lastFailureClass,
+    health.lastError,
+  ].filter(Boolean).join('\n');
+
+  return /model_empty_output|content_too_short|empty output|both failed to generate output/i.test(failureText);
+}
+
+function isAvailableAgent(agent = {}) {
+  if (!agent || agent.archived) return false;
+  return !['offline', 'error', 'failed', 'stopped', 'archived'].includes(String(agent.status || '').toLowerCase());
 }
 
 function buildRepairInstruction(task = {}) {

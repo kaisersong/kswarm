@@ -135,6 +135,91 @@ test('route planner skips cooldown assigned agent and selects another healthy ag
   assert.equal(route.skipped[0].reason, 'runtime_cooldown');
 });
 
+test('route planner does not fallback worker work to a project-owner-only PO', () => {
+  const workerDown = {
+    id: 'xiaok-worker',
+    roles: ['worker'],
+    runtimeHealth: {
+      state: 'stalled',
+      taskCapabilities: ['analysis'],
+      outputCapabilities: ['markdown'],
+    },
+  };
+  const poOnly = {
+    id: 'xiaok-po',
+    roles: ['project_owner'],
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['analysis'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: { id: 'task', title: '分析报告', assignedAgent: 'xiaok-worker', requiredCapabilities: ['analysis'], requiredOutputs: ['markdown'] },
+    agents: [workerDown, poOnly],
+    now,
+  });
+
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedAgentId, null);
+  assert.equal(route.skipped.some(item => item.agentId === 'xiaok-po'), false);
+});
+
+test('route planner can fallback worker work to another worker agent', () => {
+  const workerDown = {
+    id: 'worker-a',
+    roles: ['worker'],
+    runtimeHealth: {
+      state: 'stalled',
+      taskCapabilities: ['analysis'],
+      outputCapabilities: ['markdown'],
+    },
+  };
+  const workerHealthy = {
+    id: 'worker-b',
+    roles: ['worker'],
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['analysis'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: { id: 'task', title: '分析报告', assignedAgent: 'worker-a', requiredCapabilities: ['analysis'], requiredOutputs: ['markdown'] },
+    agents: [workerDown, workerHealthy],
+    now,
+  });
+
+  assert.equal(route.ok, true);
+  assert.equal(route.selectedAgentId, 'worker-b');
+});
+
+test('route planner still allows a task explicitly assigned to PO', () => {
+  const poOnly = {
+    id: 'xiaok-po',
+    roles: ['project_owner'],
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['planning'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: { id: 'review', title: '综合审核报告', assignedAgent: 'xiaok-po', requiredCapabilities: ['planning'], requiredOutputs: ['markdown'] },
+    agents: [poOnly],
+    now,
+  });
+
+  assert.equal(route.ok, true);
+  assert.equal(route.selectedAgentId, 'xiaok-po');
+});
+
 test('route planner selects registered presentation executor when no agent has pptx output capability', () => {
   const markdownOnly = {
     id: 'worker-md',

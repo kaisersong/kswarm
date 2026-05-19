@@ -35,11 +35,18 @@ import {
 import { probeAgentRuntime } from '../core/runtime-probe.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
+import {
+  XIAOK_PO_AGENT_ID,
+  XIAOK_WORKER_AGENT_ID,
+  createRuntimeInstancePool,
+} from '../core/runtime-instance-pool.js';
 import { createBuiltInLocalExecutorRegistry } from '../executors/registry.js';
 import {
+  getProjectWorkspace as getProjectWorkspaceRecord,
   initProjectWorkspace as initProjectWorkspaceRecord,
   setProjectWorkspace as setProjectWorkspaceRecord,
 } from './project-workspace.js';
+import { sendTaskToBrokerParticipant } from './broker-task-delivery.js';
 import {
   createAutoWorkerSpawnConfig,
   spawnAutoWorkerProcess,
@@ -49,6 +56,7 @@ import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const localExecutorRegistry = createBuiltInLocalExecutorRegistry();
+const runtimeInstancePool = createRuntimeInstancePool();
 
 // Project workspace base — each project gets its own folder
 const KSWARM_HOME = join(homedir(), '.kswarm');
@@ -63,6 +71,13 @@ const hub = createHub({
   dataDir: join(KSWARM_HOME, 'state.json'),
   getAgentProfiles: () => agentStore?.list({ includeArchived: false }) || [],
   getExecutors: () => listLocalExecutors(),
+  runtimeInstanceAllocator: {
+    getAgentConcurrency: () => runtimeInstancePool.getAgentConcurrency(),
+    reserveWorkerInstance: reservation => reserveWorkerRuntimeInstance(reservation),
+    markInstanceWorking: (instanceId, meta) => runtimeInstancePool.markInstanceWorking(instanceId, meta),
+    markInstanceIdle: instanceId => runtimeInstancePool.markInstanceIdle(instanceId),
+    markInstanceFailed: (instanceId, reason) => runtimeInstancePool.markInstanceFailed(instanceId, reason),
+  },
 });
 
 // ─── Agent Store ──────────────────────────────────────────────────
@@ -87,14 +102,18 @@ function initProjectWorkspace(projectId, customPath) {
 }
 
 function getProjectWorkspace(projectId) {
-  if (!projectWorkspaces.has(projectId)) {
-    return initProjectWorkspace(projectId);
-  }
-  return projectWorkspaces.get(projectId);
+  const project = hub.getProject(projectId);
+  return getProjectWorkspaceRecord(projectWorkspaces, PROJECTS_DIR, projectId, project?.workFolder);
 }
 
 function setProjectWorkspace(projectId, newPath) {
-  return setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
+  const ws = setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
+  const project = hub.getProject(projectId);
+  if (project) {
+    project.workFolder = ws.path;
+    hub.persistState();
+  }
+  return ws;
 }
 
 function listProjectArtifacts(projectId) {
@@ -167,6 +186,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   const project = hub.getProject(projectId);
   const board = hub.getBoard(projectId);
   const ws = getProjectWorkspace(projectId);
+  const retryTaskIds = [];
 
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
@@ -178,27 +198,68 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
       });
       continue;
     }
+    const targetAgent = task.assignedRuntimeInstance || task.assignedAgent;
     try {
-      await brokerClient.sendTo(task.assignedAgent, 'request_task', {
-        taskId: task.id,
-        threadId: `thread-${task.id}`,
-        payload: {
-          projectId,
+      const delivery = await sendTaskToBrokerParticipant({
+        brokerClient,
+        targetId: targetAgent,
+        kind: 'request_task',
+        isOnline: isAgentOnBroker,
+        waitTimeoutMs: 8_000,
+        waitIntervalMs: 200,
+        request: {
           taskId: task.id,
-          localTaskId: task.localTaskId,
-          runId: task.activeRunId,
-          attempt: task.attempt || 1,
-          title: task.title,
-          brief: task.brief,
-          projectName: project?.name,
-          projectGoal: project?.goal || '',
-          projectRequirements: project?.requirements || '',
-          workFolder: ws.path,
+          threadId: `thread-${task.id}`,
+          payload: {
+            projectId,
+            taskId: task.id,
+            localTaskId: task.localTaskId,
+            runId: task.activeRunId,
+            attempt: task.attempt || 1,
+            title: task.title,
+            brief: task.brief,
+            projectName: project?.name,
+            projectGoal: project?.goal || '',
+            projectRequirements: project?.requirements || '',
+            workFolder: ws.path,
+          },
         },
       });
+      if (!delivery.ok) {
+        log('warn', `Failed to deliver request_task to ${targetAgent}`, {
+          projectId,
+          taskId: task.id,
+          agent: task.assignedAgent,
+          runtimeInstance: task.assignedRuntimeInstance || null,
+          error: delivery.error,
+          delivery: delivery.delivery || null,
+        });
+        const failed = hub.handleWorkerFailure(
+          projectId,
+          task.id,
+          targetAgent,
+          task.activeRunId,
+          'runtime_offline',
+          delivery.error || 'delivery_failed',
+        );
+        if (failed?.retryDispatched && failed.retryTaskId) retryTaskIds.push(failed.retryTaskId);
+      }
     } catch (err) {
-      log('warn', `Failed to send request_task to ${task.assignedAgent}`, { projectId, taskId: task.id, error: err.message });
+      log('warn', `Failed to send request_task to ${targetAgent}`, { projectId, taskId: task.id, agent: task.assignedAgent, runtimeInstance: task.assignedRuntimeInstance || null, error: err.message });
+      const failed = hub.handleWorkerFailure(
+        projectId,
+        task.id,
+        targetAgent,
+        task.activeRunId,
+        'runtime_offline',
+        err.message,
+      );
+      if (failed?.retryDispatched && failed.retryTaskId) retryTaskIds.push(failed.retryTaskId);
     }
+  }
+
+  if (retryTaskIds.length > 0) {
+    await sendBrokerRequestTasks(projectId, retryTaskIds);
   }
 }
 
@@ -240,7 +301,8 @@ async function executeLocalExecutorTask(projectId, taskId, executorId) {
   const submitted = hub.handleSubmitResult(projectId, task.id, result, executorId, runId);
   broadcast({ type: 'task_update', projectId, taskId: task.id, status: submitted.ok ? 'submitted' : 'failed', agent: executorId, result: submitted });
   if (submitted.ok && brokerClient && brokerClient.isConnected() && project.poAgent) {
-    await brokerClient.sendTo(project.poAgent, 'review_submission', {
+    const poTarget = getProjectPoTarget(project);
+    await brokerClient.sendTo(poTarget, 'review_submission', {
       taskId: task.id,
       payload: { projectId, taskId: task.id, fromWorker: executorId, result },
     });
@@ -300,7 +362,7 @@ async function getOnlineAgentIds() {
 async function sendRecoveryReviewSubmission({ projectId, taskId, fromWorker, result }) {
   const project = hub.getProject(projectId);
   if (!brokerClient || !brokerClient.isConnected() || !project?.poAgent) return;
-  await brokerClient.sendTo(project.poAgent, 'review_submission', {
+  await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
     taskId,
     payload: { projectId, taskId, fromWorker, result },
   });
@@ -431,7 +493,7 @@ function handleBrokerIntent(intent) {
       // Notify PO to review this submission
       const project = hub.getProject(resolved.projectId);
       if (brokerClient && brokerClient.isConnected() && project?.poAgent && !result.alreadySubmitted) {
-        brokerClient.sendTo(project.poAgent, 'review_submission', {
+        brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
           taskId: resolved.taskId,
           payload: { projectId: resolved.projectId, taskId: resolved.taskId, fromWorker: fromParticipantId, result: payload },
         }).catch(() => {});
@@ -503,7 +565,7 @@ async function isAgentOnBroker(agentId) {
   }
 }
 
-function buildAgentChildEnv(agent, agentId) {
+function buildAgentChildEnv(agent, agentId, runtime = {}) {
   const childEnv = { ...process.env, ...agent.customEnv };
   if (agent.provider) {
     if (agent.provider === 'openai') {
@@ -519,6 +581,8 @@ function buildAgentChildEnv(agent, agentId) {
     }
   }
   childEnv.KSWARM_AGENT_ID = agentId;
+  if (runtime.logicalAgentId) childEnv.KSWARM_LOGICAL_AGENT_ID = runtime.logicalAgentId;
+  if (runtime.projectId) childEnv.KSWARM_PROJECT_ID = runtime.projectId;
   return childEnv;
 }
 
@@ -531,6 +595,113 @@ function autoWorkerSpawnConfig(agentId, alias, customArgs = [], env = process.en
     cwd: join(import.meta.dirname, '../..'),
     env,
   });
+}
+
+function isDefaultRuntimeWorker(agentId) {
+  return agentId === XIAOK_WORKER_AGENT_ID;
+}
+
+function isDefaultRuntimePo(agentId) {
+  return agentId === XIAOK_PO_AGENT_ID;
+}
+
+function shouldUseRuntimePool(agent) {
+  return Boolean(agent && !agent.archivedAt && agent.runtimeType === 'xiaok');
+}
+
+function spawnRuntimeInstance(instance, logicalAgent) {
+  if (!instance || !logicalAgent) return { ok: false, error: 'runtime_instance_missing' };
+  if (instance.pid && instance.status !== 'failed' && instance.status !== 'offline') {
+    return { ok: true, instanceId: instance.instanceId, pid: instance.pid, alreadyRunning: true };
+  }
+
+  const childEnv = buildAgentChildEnv(logicalAgent, instance.instanceId, {
+    logicalAgentId: logicalAgent.id,
+    projectId: instance.role === 'project_owner' ? instance.projectId : undefined,
+  });
+  const spawned = spawnAutoWorkerProcess(
+    autoWorkerSpawnConfig(instance.instanceId, logicalAgent.name, logicalAgent.customArgs || [], childEnv),
+    {
+      onError: err => {
+        runtimeInstancePool.markInstanceFailed(instance.instanceId, err.message);
+        log('error', `Runtime instance process error for ${instance.instanceId}: ${err.message}`);
+      },
+    },
+  );
+  if (!spawned.ok) {
+    runtimeInstancePool.markInstanceFailed(instance.instanceId, spawned.error);
+    log('error', `Failed to spawn runtime instance ${instance.instanceId}: ${spawned.error}`);
+    return spawned;
+  }
+  if (spawned.child && typeof spawned.child.once === 'function') {
+    spawned.child.once('exit', (code, signal) => {
+      runtimeInstancePool.markInstanceOffline(instance.instanceId);
+      broadcast({ type: 'runtime_instance_stopped', instanceId: instance.instanceId, code, signal });
+      log('warn', `Runtime instance exited: ${instance.instanceId}`, { code, signal });
+    });
+  }
+
+  const runtimeId = `pid-${spawned.pid}`;
+  runtimeInstancePool.markInstanceOnline(instance.instanceId, {
+    pid: spawned.pid,
+    runtimeId,
+    status: instance.role === 'worker' ? 'idle' : 'idle',
+  });
+  log('info', `Started runtime instance: ${instance.instanceId}`, {
+    logicalAgentId: instance.logicalAgentId,
+    role: instance.role,
+    projectId: instance.projectId,
+    pid: spawned.pid,
+    runtimeId,
+  });
+  broadcast({
+    type: 'runtime_instance_started',
+    instanceId: instance.instanceId,
+    logicalAgentId: instance.logicalAgentId,
+    role: instance.role,
+    projectId: instance.projectId,
+    runtimeId,
+    pid: spawned.pid,
+  });
+  return { ok: true, instanceId: instance.instanceId, pid: spawned.pid, runtimeId };
+}
+
+function ensureProjectPoRuntime(project) {
+  if (!project?.poAgent || !isDefaultRuntimePo(project.poAgent)) {
+    return { ok: false, error: 'not_pooled_agent' };
+  }
+  const agent = agentStore?.get(project.poAgent);
+  if (!shouldUseRuntimePool(agent)) {
+    return { ok: false, error: agent ? 'not_pooled_agent' : 'agent_not_found' };
+  }
+
+  const ensured = runtimeInstancePool.ensureProjectPoInstance(project.poAgent, project.id);
+  if (!ensured.ok) return ensured;
+  const spawned = spawnRuntimeInstance(ensured.instance, agent);
+  if (!spawned.ok) return { ok: false, error: spawned.error || 'spawn_failed', instanceId: ensured.instanceId };
+  return { ok: true, instanceId: ensured.instanceId, created: ensured.created };
+}
+
+function getProjectPoTarget(project) {
+  const ensured = ensureProjectPoRuntime(project);
+  return ensured.ok ? ensured.instanceId : project?.poAgent;
+}
+
+function reserveWorkerRuntimeInstance({ task } = {}) {
+  if (!task?.assignedAgent || !isDefaultRuntimeWorker(task.assignedAgent)) {
+    return { ok: false, error: 'not_pooled_agent' };
+  }
+  const agent = agentStore?.get(task.assignedAgent);
+  if (!shouldUseRuntimePool(agent)) {
+    return { ok: false, error: agent ? 'not_pooled_agent' : 'agent_not_found' };
+  }
+
+  const ensured = runtimeInstancePool.ensureWorkerInstance(task.assignedAgent);
+  if (!ensured.ok) return ensured;
+  const spawned = spawnRuntimeInstance(ensured.instance, agent);
+  if (!spawned.ok) return { ok: false, error: spawned.error || 'spawn_failed', instanceId: ensured.instanceId };
+  runtimeInstancePool.markInstanceWorking(ensured.instanceId, { taskId: task.id });
+  return { ok: true, instanceId: ensured.instanceId, created: ensured.created };
 }
 
 async function autoStartAgent(agentId) {
@@ -736,16 +907,23 @@ async function handleRequest(req, res) {
       });
       broadcast({ type: 'project_created', project });
 
-      // Auto-start PO agent and member agents if they are in agent store and offline
-      const agentsToStart = [resolvedPoAgent, ...resolvedMembers];
-      for (const agentId of agentsToStart) {
-        await autoStartAgent(agentId);
+      // Auto-start custom agents. Default Xiaok seeds are started as runtime instances on demand.
+      let poTarget = resolvedPoAgent;
+      if (isDefaultRuntimePo(resolvedPoAgent)) {
+        const ensuredPo = ensureProjectPoRuntime(project);
+        if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
+        else log('warn', 'Failed to ensure project PO runtime on create', { projectId: id, poAgent: resolvedPoAgent, error: ensuredPo.error });
+      } else {
+        await autoStartAgent(resolvedPoAgent);
+      }
+      for (const agentId of resolvedMembers) {
+        if (!isDefaultRuntimeWorker(agentId)) await autoStartAgent(agentId);
       }
 
       // Send assign_po immediately so PO can start generating the Plan
       if (brokerClient && brokerClient.isConnected()) {
         setTimeout(() => {
-          brokerClient.sendTo(resolvedPoAgent, 'assign_po', {
+          brokerClient.sendTo(poTarget, 'assign_po', {
             taskId: id,
             threadId: `thread-${id}`,
             payload: {
@@ -755,7 +933,7 @@ async function handleRequest(req, res) {
               requirements: requirements || '',
               members: resolvedMembers,
             },
-          }).catch(err => log('warn', 'Failed to send assign_po on create', { error: err.message }));
+          }).catch(err => log('warn', 'Failed to send assign_po on create', { target: poTarget, error: err.message }));
         }, 1000);
       }
 
@@ -819,7 +997,7 @@ async function handleRequest(req, res) {
           const task = hub.getBoard(projectId)?.getTask(result.taskId);
           const fromWorker = task?.recoveredBy || task?.assignedAgent || 'continue_project';
           if (project?.poAgent && result.taskId) {
-            brokerClient.sendTo(project.poAgent, 'review_submission', {
+            brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
               taskId: result.taskId,
               payload: { projectId, taskId: result.taskId, fromWorker, result: result.result },
             }).catch(() => {});
@@ -847,8 +1025,9 @@ async function handleRequest(req, res) {
           return { ok: true, path: artifactPath };
         },
         sendReviewSubmission: canNotifyReview ? ({ taskId, payload }) => {
-          brokerClient.sendTo(project.poAgent, 'review_submission', { taskId, payload }).catch(err => {
-            log('warn', `Failed to send review_submission to ${project.poAgent}`, { projectId, taskId, error: err.message });
+          const poTarget = getProjectPoTarget(project);
+          brokerClient.sendTo(poTarget, 'review_submission', { taskId, payload }).catch(err => {
+            log('warn', `Failed to send review_submission to ${poTarget}`, { projectId, taskId, poAgent: project.poAgent, error: err.message });
           });
         } : null,
       });
@@ -884,24 +1063,31 @@ async function handleRequest(req, res) {
 
           // Ensure PO and member agents are running (no-op if already online)
           const project = hub.getProject(approveMatch[1]);
+          let poTarget = project?.poAgent;
           if (project?.poAgent) {
-            await autoStartAgent(project.poAgent);
+            if (isDefaultRuntimePo(project.poAgent)) {
+              const ensuredPo = ensureProjectPoRuntime(project);
+              if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
+              else log('warn', 'Failed to ensure project PO runtime on approval', { projectId: project.id, poAgent: project.poAgent, error: ensuredPo.error });
+            } else {
+              await autoStartAgent(project.poAgent);
+            }
             for (const memberId of (project.members || [])) {
-              await autoStartAgent(memberId);
+              if (!isDefaultRuntimeWorker(memberId)) await autoStartAgent(memberId);
             }
           }
 
           // Notify PO that plan is approved — start execution
-          if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
+          if (brokerClient && brokerClient.isConnected() && poTarget) {
             await new Promise(r => setTimeout(r, 500));
-            brokerClient.sendTo(project.poAgent, 'respond_approval', {
+            brokerClient.sendTo(poTarget, 'respond_approval', {
               taskId: approveMatch[1],
               threadId: `thread-${approveMatch[1]}`,
               payload: {
                 projectId: approveMatch[1],
                 decision: 'approved',
               },
-            }).catch(err => log('warn', 'Failed to notify PO of approval', { error: err.message }));
+            }).catch(err => log('warn', 'Failed to notify PO of approval', { target: poTarget, error: err.message }));
           }
         }
       }
@@ -927,8 +1113,15 @@ async function handleRequest(req, res) {
 
       // Auto-start PO and member agents
       let poStarted = false;
+      let poTarget = project?.poAgent;
       if (project?.poAgent) {
-        poStarted = await autoStartAgent(project.poAgent);
+        if (isDefaultRuntimePo(project.poAgent)) {
+          const ensuredPo = ensureProjectPoRuntime(project);
+          poStarted = ensuredPo.ok;
+          if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
+        } else {
+          poStarted = await autoStartAgent(project.poAgent);
+        }
         if (!poStarted) {
           const failedPoAgent = project.poAgent;
           const fallbackResolution = resolvePlanRetryPoAgent(
@@ -944,20 +1137,27 @@ async function handleRequest(req, res) {
               reason: 'current_po_start_failed',
               failedPoAgent,
             };
-            poStarted = await autoStartAgent(project.poAgent);
+            if (isDefaultRuntimePo(project.poAgent)) {
+              const ensuredPo = ensureProjectPoRuntime(project);
+              poStarted = ensuredPo.ok;
+              if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
+            } else {
+              poStarted = await autoStartAgent(project.poAgent);
+              poTarget = project.poAgent;
+            }
           }
         }
         for (const memberId of (project.members || [])) {
-          await autoStartAgent(memberId);
+          if (!isDefaultRuntimeWorker(memberId)) await autoStartAgent(memberId);
         }
       }
 
       hub.persistState();
 
       // Send assign_po intent via brokerClient
-      if (brokerClient && brokerClient.isConnected() && project.poAgent) {
-        brokerClient.sendTo(project.poAgent, 'assign_po', buildPlanRetryAssignPoIntent(project))
-          .catch(err => log('warn', 'Failed to send assign_po intent', { error: err.message }));
+      if (brokerClient && brokerClient.isConnected() && poTarget) {
+        brokerClient.sendTo(poTarget, 'assign_po', buildPlanRetryAssignPoIntent(project))
+          .catch(err => log('warn', 'Failed to send assign_po intent', { target: poTarget, error: err.message }));
       }
 
       const retryInfo = {
@@ -1060,27 +1260,7 @@ async function handleRequest(req, res) {
           if (dispatchResult.ok && dispatchResult.dispatched.length > 0) {
             log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched });
             broadcast({ type: 'tasks_dispatched', projectId, dispatched: dispatchResult.dispatched });
-            // Notify workers via broker
-            if (brokerClient && brokerClient.isConnected()) {
-              const board = hub.getBoard(projectId);
-              for (const tid of dispatchResult.dispatched) {
-                const task = board?.getTask(tid);
-                if (task?.assignedAgent) {
-                  brokerClient.sendTo(task.assignedAgent, 'request_task', {
-                    taskId: task.id, threadId: `thread-${task.id}`,
-                    payload: {
-                      projectId,
-                      taskId: task.id,
-                      localTaskId: task.localTaskId,
-                      runId: task.activeRunId,
-                      attempt: task.attempt || 1,
-                      title: task.title,
-                      brief: task.brief,
-                    },
-                  }).catch(err => log('warn', `Failed to send request_task to ${task.assignedAgent}`, { error: err.message }));
-                }
-              }
-            }
+            await sendBrokerRequestTasks(projectId, dispatchResult.dispatched);
           }
         }
 
@@ -1092,7 +1272,8 @@ async function handleRequest(req, res) {
           const board = hub.getBoard(projectId);
           const task = board?.getTask(taskId);
           if (task?.assignedAgent) {
-            brokerClient.sendTo(task.assignedAgent, 'rework', {
+            const targetAgent = task.assignedRuntimeInstance || task.assignedAgent;
+            brokerClient.sendTo(targetAgent, 'rework', {
               taskId: task.id, threadId: `thread-${projectId}`,
               payload: { reason: review.feedback, projectId },
             }).catch(() => {});
@@ -1147,7 +1328,7 @@ async function handleRequest(req, res) {
 
         const project = hub.getProject(projectId);
         if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
-          brokerClient.sendTo(project.poAgent, 'review_submission', {
+          brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
             taskId: result.taskId,
             payload: { projectId, taskId: result.taskId, fromWorker: fromAgent, result: resultPayload },
           }).catch(() => {});
@@ -1275,32 +1456,7 @@ async function handleRequest(req, res) {
         log('info', `Dispatched tasks for project ${projectId}`, { dispatched: result.dispatched });
         broadcast({ type: 'tasks_dispatched', projectId, dispatched: result.dispatched });
 
-        if (brokerClient && brokerClient.isConnected()) {
-          const project = hub.getProject(projectId);
-          const board = hub.getBoard(projectId);
-          const ws = getProjectWorkspace(projectId);
-          for (const taskId of result.dispatched) {
-            const task = board.getTask(taskId);
-            if (task && task.assignedAgent) {
-              brokerClient.sendTo(task.assignedAgent, 'request_task', {
-                taskId: task.id, threadId: `thread-${task.id}`,
-                payload: {
-                  projectId,
-                  taskId: task.id,
-                  localTaskId: task.localTaskId,
-                  runId: task.activeRunId,
-                  attempt: task.attempt || 1,
-                  title: task.title,
-                  brief: task.brief,
-                  projectName: project?.name,
-                  projectGoal: project?.goal || '',
-                  projectRequirements: project?.requirements || '',
-                  workFolder: ws.path,
-                },
-              }).catch(err => log('warn', `Failed to send request_task to ${task.assignedAgent}`, { error: err.message }));
-            }
-          }
-        }
+        await sendBrokerRequestTasks(projectId, result.dispatched || []);
       }
       return json(res, result);
     }
@@ -1611,6 +1767,14 @@ async function handleRequest(req, res) {
       return json(res, { loads });
     }
 
+    // ── Runtime instances (internal Xiaok pooled workers/POs) ──
+    if (path === '/agents/runtime-instances' && req.method === 'GET') {
+      return json(res, {
+        instances: runtimeInstancePool.listInstances(),
+        summary: runtimeInstancePool.summarizeByAgent(),
+      });
+    }
+
     // ── Agent CRUD API (aligned with multica /api/agents) ─────────────
     // ═══════════════════════════════════════════════════════════════════
 
@@ -1887,9 +2051,10 @@ function runStalledRunWatchdog() {
         continue;
       }
       if (action.type === 'mark_runtime_stalled') {
-        const agent = action.agentId ? agentStore.get(action.agentId) : null;
+        const healthAgentId = action.logicalAgentId || action.agentId;
+        const agent = healthAgentId ? agentStore.get(healthAgentId) : null;
         if (agent) {
-          agentStore.updateRuntimeHealth(action.agentId, recordRuntimeFailure(agent.runtimeHealth, {
+          agentStore.updateRuntimeHealth(healthAgentId, recordRuntimeFailure(agent.runtimeHealth, {
             failureClass: 'runtime_stalled',
             error: action.reason,
           }));
@@ -1925,15 +2090,18 @@ const AGENT_RUNTIME_FAILURE_CLASSES = new Set([
   'runtime_recovery',
   'runtime_stalled',
   'runtime_generation_unavailable',
+  'model_empty_output',
   'artifact_type_mismatch',
   'artifact_invalid',
 ]);
 
 function recordAgentRuntimeFailure(agentId, failureClass, errorMessage) {
   if (!agentId || !AGENT_RUNTIME_FAILURE_CLASSES.has(failureClass)) return;
-  const agent = agentStore.get(agentId);
+  const instance = runtimeInstancePool.getInstance(agentId);
+  const healthAgentId = instance?.logicalAgentId || agentId;
+  const agent = agentStore.get(healthAgentId);
   if (!agent) return;
-  agentStore.updateRuntimeHealth(agentId, recordRuntimeFailure(agent.runtimeHealth, {
+  agentStore.updateRuntimeHealth(healthAgentId, recordRuntimeFailure(agent.runtimeHealth, {
     failureClass,
     error: errorMessage || failureClass,
   }));

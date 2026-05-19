@@ -44,6 +44,20 @@ test('accept and progress update the run lease status and heartbeat', () => {
   task = board.getTask('item-1');
   assert.equal(task.runLease.status, 'in_progress');
   assert.equal(typeof task.runLease.lastHeartbeatAt, 'number');
+  assert.equal(typeof task.startedAt, 'number');
+});
+
+test('resetting an active run clears the visible run start time for retry', () => {
+  const board = setupBoard();
+  board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-lease-1' });
+  board.transition('item-1', 'accepted', { assignedAgent: 'worker' });
+  board.transition('item-1', 'in_progress');
+  assert.equal(typeof board.getTask('item-1').startedAt, 'number');
+
+  const reset = board.resetStaleRun('item-1', 'lease_expired');
+
+  assert.equal(reset.ok, true);
+  assert.equal(board.getTask('item-1').startedAt, null);
 });
 
 test('progress telemetry is stored on active task run', () => {

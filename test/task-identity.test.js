@@ -14,6 +14,7 @@ import {
   parseTaskId,
   resolveTaskRef,
 } from '../src/core/task-identity.js';
+import { restoreTaskBoard } from '../src/core/task-board.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -133,6 +134,28 @@ test('buildTaskAliases resolves duplicate retry title to original parent', () =>
 
   assert.equal(aliases.get('Research'), 'proj-a__item-1');
   assert.deepEqual(tasks[2].dependencies, ['proj-a__item-1']);
+});
+
+test('restoreTaskBoard skips persisted metadata-only tasks', () => {
+  const board = restoreTaskBoard([
+    { id: 'item-1', status: 'pending', assignedAgent: null, phaseId: 'phase-1', planItemId: 'item-1' },
+    { id: 'item-2', title: 'Executable task', status: 'pending', dependencies: ['item-1'] },
+  ], 'proj-a');
+
+  const tasks = board.getAllTasks();
+  assert.deepEqual(tasks.map(task => task.id), ['proj-a__item-2']);
+  assert.deepEqual(tasks[0].unresolvedDependencies, ['item-1']);
+});
+
+test('restoreTaskBoard preserves description-only persisted tasks', () => {
+  const board = restoreTaskBoard([
+    { id: 'item-1', description: 'Description-only task that can still be executed', status: 'pending' },
+  ], 'proj-a');
+
+  const tasks = board.getAllTasks();
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].id, 'proj-a__item-1');
+  assert.equal(tasks[0].description, 'Description-only task that can still be executed');
 });
 
 let passed = 0;

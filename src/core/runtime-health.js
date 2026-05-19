@@ -1,5 +1,6 @@
 const DEFAULT_COOLDOWNS = [0, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 const ROUTABLE_STATES = new Set(['healthy']);
+const TASK_LEVEL_FAILURE_CLASSES = new Set(['model_empty_output']);
 
 export function createUnknownRuntimeHealth(overrides = {}) {
   return {
@@ -62,12 +63,23 @@ export function recordProbeResult(current = {}, probe = {}, now = Date.now()) {
 
 export function recordRuntimeFailure(current = {}, failure = {}, now = Date.now(), options = {}) {
   const base = normalizeHealth(current);
+  const failureClass = failure.failureClass || 'agent_error';
+
+  if (TASK_LEVEL_FAILURE_CLASSES.has(failureClass)) {
+    return {
+      ...base,
+      checkedAt: now,
+      lastFailureAt: now,
+      lastFailureClass: failureClass,
+      lastError: failure.error || failure.errorMessage || failure.feedback || null,
+    };
+  }
+
   const count = (base.consecutiveRuntimeFailures || 0) + 1;
   const cooldownThreshold = options.cooldownThreshold ?? 2;
   const cooldownUntil = count >= cooldownThreshold
     ? now + cooldownForCount(count, options.cooldowns)
     : null;
-  const failureClass = failure.failureClass || 'agent_error';
 
   return {
     ...base,

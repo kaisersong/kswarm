@@ -2,16 +2,14 @@ import { planTaskRoute } from './capability-router.js';
 
 export const ACTIVE_TASK_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 
-export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agentProfiles = null, executors = [], now = Date.now() } = {}) {
+export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agentProfiles = null, executors = [], now = Date.now(), agentConcurrency = {} } = {}) {
   const taskMap = new Map(tasks.map(task => [task.id, task]));
   const shouldCheckCapabilities = hasAgentProfiles(agentProfiles);
-  const busyAgents = new Set(
+  const activeCounts = countActiveTasksByAgent(
     allActiveTasks
       .filter(task => ACTIVE_TASK_STATUSES.has(task.status))
       .filter(task => !isReworkReadyForDispatch(task))
-      .filter(task => !task.assignedExecutor)
-      .map(task => task.assignedAgent)
-      .filter(Boolean)
+      .filter(task => !task.assignedExecutor),
   );
 
   const dispatchedTasks = [];
@@ -34,12 +32,16 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
       skipped.push({ taskId: task.id, reason: 'unassigned_task' });
       continue;
     }
-    if (busyAgents.has(task.assignedAgent)) {
-      skipped.push({ taskId: task.id, reason: 'agent_busy', agent: task.assignedAgent });
+    if (isAgentAtCapacity(task.assignedAgent, activeCounts, agentConcurrency)) {
+      skipped.push({
+        taskId: task.id,
+        reason: getAgentLimit(task.assignedAgent, agentConcurrency) > 1 ? 'xiaok_capacity_full' : 'agent_busy',
+        agent: task.assignedAgent,
+      });
       continue;
     }
     if (shouldCheckCapabilities) {
-      const availableAgents = listAgentProfiles(agentProfiles).filter(agent => !busyAgents.has(agent.id));
+      const availableAgents = listAgentProfiles(agentProfiles).filter(agent => !isAgentAtCapacity(agent.id, activeCounts, agentConcurrency));
       const route = planTaskRoute({ task, agents: availableAgents, executors, now });
       if (!route.ok) {
         skipped.push({ taskId: task.id, reason: route.reason, agent: task.assignedAgent });
@@ -54,12 +56,12 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
         selectedRoute: route,
       };
       dispatchedTasks.push(routedTask);
-      if (selectedAgent) busyAgents.add(selectedAgent);
+      incrementActiveCount(activeCounts, selectedAgent || task.assignedAgent);
       continue;
     }
 
     dispatchedTasks.push(task);
-    busyAgents.add(task.assignedAgent);
+    incrementActiveCount(activeCounts, task.assignedAgent);
   }
 
   return {
@@ -69,6 +71,30 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
     blocked,
     projectGate: deriveProjectGate({ dispatchedTasks, skipped, blocked, tasks }),
   };
+}
+
+function countActiveTasksByAgent(activeTasks) {
+  const counts = new Map();
+  for (const task of activeTasks) {
+    if (!task.assignedAgent) continue;
+    incrementActiveCount(counts, task.assignedAgent);
+  }
+  return counts;
+}
+
+function incrementActiveCount(counts, agentId) {
+  if (!agentId) return;
+  counts.set(agentId, (counts.get(agentId) || 0) + 1);
+}
+
+function getAgentLimit(agentId, agentConcurrency = {}) {
+  const limit = Number(agentConcurrency?.[agentId] || 1);
+  return Number.isFinite(limit) && limit > 0 ? limit : 1;
+}
+
+function isAgentAtCapacity(agentId, activeCounts, agentConcurrency) {
+  if (!agentId) return false;
+  return (activeCounts.get(agentId) || 0) >= getAgentLimit(agentId, agentConcurrency);
 }
 
 export function isReworkReadyForDispatch(task = {}) {
@@ -129,6 +155,7 @@ function deriveProjectGate({ dispatchedTasks, skipped, blocked, tasks }) {
   if (dispatchedTasks.length > 0) return null;
   const pendingCount = tasks.filter(task => task.status === 'pending' && !task.isCompositeParent).length;
   if (pendingCount === 0) return null;
+  if (skipped.length > 0 && skipped.every(item => item.reason === 'xiaok_capacity_full')) return 'waiting_for_xiaok_capacity';
   if (skipped.length > 0 && skipped.every(item => item.reason === 'agent_busy')) return 'waiting_for_busy_agents';
   if (skipped.length > 0 && skipped.every(item => isCapabilitySkipReason(item.reason))) return 'waiting_for_capable_agent';
   if (blocked.length > 0 && skipped.length === 0) return 'waiting_for_dependencies';

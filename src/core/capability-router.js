@@ -11,6 +11,17 @@ export function evaluateTaskRoute(task = {}, agent = null, now = Date.now()) {
     now,
   );
 
+  if (!route.ok && route.reason === 'runtime_degraded' && isRecoverableContentFailureRetry(task, agent, now)) {
+    return {
+      ok: true,
+      reason: null,
+      agentId: agent.id || null,
+      requiredCapabilities: requirements.requiredCapabilities || [],
+      requiredOutputs: requirements.requiredOutputs || [],
+      recoveredRuntimeFailure: 'model_empty_output',
+    };
+  }
+
   return {
     ...route,
     agentId: agent.id || null,
@@ -21,7 +32,8 @@ export function evaluateTaskRoute(task = {}, agent = null, now = Date.now()) {
 
 export function planTaskRoute({ task = {}, agents = [], executors = [], now = Date.now() } = {}) {
   const requirements = inferTaskRequirements(task);
-  const orderedAgents = orderAgentsByPreference(agents, task.assignedAgent);
+  const orderedAgents = orderAgentsByPreference(agents, task.assignedAgent)
+    .filter(agent => shouldConsiderAgentForTask(agent, task));
   const skipped = [];
 
   for (const agent of orderedAgents) {
@@ -89,6 +101,14 @@ function orderAgentsByPreference(agents, assignedAgent) {
   ];
 }
 
+function shouldConsiderAgentForTask(agent, task = {}) {
+  if (!agent) return false;
+  if (agent.id === task.assignedAgent) return true;
+  const roles = normalizeList(agent.roles);
+  if (roles.length === 0) return true;
+  return roles.includes('worker') || !roles.includes('project_owner');
+}
+
 function executorRoutable(executor = {}, requirements = {}) {
   const taskCaps = new Set(normalizeList(executor.taskCapabilities));
   const outputCaps = new Set(normalizeList(executor.outputCapabilities));
@@ -126,6 +146,21 @@ function limitedAssignedRuntimeMatches({ agent, task, requirements, route }) {
   }
 
   return true;
+}
+
+function isRecoverableContentFailureRetry(task = {}, agent = {}, now = Date.now()) {
+  if (!task.assignedAgent || agent.id !== task.assignedAgent) return false;
+  const health = agent.runtimeHealth || {};
+  if (health.cooldownUntil && Number(health.cooldownUntil) > now) return false;
+  if (String(health.lastFailureClass || '') === 'runtime_stalled') return false;
+  const failureText = [
+    task.lastFailureClass,
+    task.failureReason,
+    task.blockedReason,
+    health.lastFailureClass,
+    health.lastError,
+  ].filter(Boolean).join('\n');
+  return /model_empty_output|content_too_short|empty output|both failed to generate output/i.test(failureText);
 }
 
 function normalizeList(values = []) {

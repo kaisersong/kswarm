@@ -28,7 +28,9 @@ import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
 import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getExecutors = null } = {}) {
+const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output']);
+
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getExecutors = null, runtimeInstanceAllocator = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
@@ -86,6 +88,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       allActiveTasks: getActiveTasksAcrossLiveProjects(),
       agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
       executors: typeof getExecutors === 'function' ? getExecutors() : [],
+      agentConcurrency: typeof runtimeInstanceAllocator?.getAgentConcurrency === 'function'
+        ? runtimeInstanceAllocator.getAgentConcurrency()
+        : {},
     });
   }
 
@@ -420,6 +425,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const board = boards.get(projectId);
     const dispatchPlan = buildDispatchPlan(projectId);
     const dispatched = [];
+    const skipped = [...(dispatchPlan.skipped || [])];
 
     for (const task of dispatchPlan.dispatchedTasks) {
       const currentTask = board.getTask(task.id);
@@ -431,26 +437,42 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         });
         if (!reset.ok) continue;
       }
+      let assignedRuntimeInstance = task.assignedRuntimeInstance || null;
+      if (!task.assignedExecutor && typeof runtimeInstanceAllocator?.reserveWorkerInstance === 'function') {
+        const reservation = runtimeInstanceAllocator.reserveWorkerInstance({ project, task });
+        if (reservation?.ok) {
+          assignedRuntimeInstance = reservation.instanceId || null;
+        } else if (reservation?.error && reservation.error !== 'not_pooled_agent') {
+          skipped.push({
+            taskId: task.id,
+            reason: reservation.error === 'capacity_full' ? 'xiaok_capacity_full' : reservation.error,
+            agent: task.assignedAgent,
+          });
+          continue;
+        }
+      }
       const result = board.transition(task.id, 'dispatched', {
         assignedAgent: task.assignedAgent,
         assignedExecutor: task.assignedExecutor || null,
+        assignedRuntimeInstance,
         selectedRoute: task.selectedRoute || null,
       });
       if (!result.ok) continue;
 
       if (bridge && !task.assignedExecutor) {
+        const targetParticipantId = assignedRuntimeInstance || task.assignedAgent;
         bridge.requestTask({
           taskId: task.id, title: task.title, brief: task.brief,
           projectId,
           localTaskId: task.localTaskId,
           runId: result.runId,
           attempt: task.attempt || 1,
-          projectName: project.name, targetParticipantId: task.assignedAgent,
+          projectName: project.name, targetParticipantId,
         });
       }
 
       eventLog.emit('task.dispatched', {
-        projectId, taskId: task.id, taskTitle: task.title, target: task.assignedAgent,
+        projectId, taskId: task.id, taskTitle: task.title, agent: task.assignedAgent, target: assignedRuntimeInstance || task.assignedAgent, runtimeInstance: assignedRuntimeInstance,
       });
       dispatched.push(task.id);
     }
@@ -458,7 +480,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return {
       ok: true,
       dispatched,
-      skipped: dispatchPlan.skipped,
+      skipped,
       blocked: dispatchPlan.blocked,
       projectGate: dispatchPlan.projectGate,
     };
@@ -521,7 +543,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const reason = failureReason || classifyFailure(errorMessage);
 
     // Mark current task as failed
-    const result = board.transition(task.id, 'failed', { failureReason: reason });
+    const result = board.transition(task.id, 'failed', { failureReason: reason, failureClass: reason });
     if (!result.ok) return result;
 
     eventLog.emit('task.failed', {
@@ -544,15 +566,35 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         allActiveTasks: getActiveTasksAcrossLiveProjects(),
         agentProfiles: typeof getAgentProfiles === 'function' ? getAgentProfiles() : null,
         executors: typeof getExecutors === 'function' ? getExecutors() : [],
+        agentConcurrency: typeof runtimeInstanceAllocator?.getAgentConcurrency === 'function'
+          ? runtimeInstanceAllocator.getAgentConcurrency()
+          : {},
       }) : { dispatchedTasks: [], skipped: [] };
 
       let retryDispatched = false;
       let retryDispatchError = null;
       const routedRetry = retryDispatchPlan.dispatchedTasks[0];
+      let assignedRuntimeInstance = routedRetry?.assignedRuntimeInstance || null;
       if (routedRetry) {
+        if (!routedRetry.assignedExecutor && typeof runtimeInstanceAllocator?.reserveWorkerInstance === 'function') {
+          const reservation = runtimeInstanceAllocator.reserveWorkerInstance({ project, task: routedRetry });
+          if (reservation?.ok) {
+            assignedRuntimeInstance = reservation.instanceId || null;
+          } else if (reservation?.error && reservation.error !== 'not_pooled_agent') {
+            retryDispatchPlan.skipped.push({
+              taskId: routedRetry.id,
+              reason: reservation.error === 'capacity_full' ? 'xiaok_capacity_full' : reservation.error,
+              agent: routedRetry.assignedAgent,
+            });
+            retryDispatchError = reservation.error;
+          }
+        }
+      }
+      if (routedRetry && !retryDispatchError) {
         const dispatchedRetry = board.transition(routedRetry.id, 'dispatched', {
           assignedAgent: routedRetry.assignedAgent,
           assignedExecutor: routedRetry.assignedExecutor || null,
+          assignedRuntimeInstance,
           preferredAssignedAgent: routedRetry.preferredAssignedAgent || null,
           selectedRoute: routedRetry.selectedRoute || null,
         });
@@ -665,18 +707,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (!task) return { ok: false, error: 'task_not_found' };
     const runCheck = board.validateRun(task.id, runId, workerAgent);
     if (!runCheck.ok) return runCheck;
-    if (task.status === 'accepted' && task.assignedAgent === workerAgent) {
+    if (task.status === 'accepted') {
       return { ok: true, alreadyAccepted: true, taskId: task.id };
     }
-    const result = board.transition(task.id, 'accepted', { assignedAgent: workerAgent });
+    const result = board.transition(task.id, 'accepted', { assignedRuntimeInstance: task.assignedRuntimeInstance || null });
     if (result.ok) {
-      eventLog.emit('task.accepted', { projectId, taskId: task.id, taskTitle: task?.title, agent: workerAgent });
+      if (task.assignedRuntimeInstance && typeof runtimeInstanceAllocator?.markInstanceWorking === 'function') {
+        runtimeInstanceAllocator.markInstanceWorking(task.assignedRuntimeInstance, { taskId: task.id });
+      }
+      eventLog.emit('task.accepted', { projectId, taskId: task.id, taskTitle: task?.title, agent: task.assignedAgent, runtimeInstance: task.assignedRuntimeInstance || null });
       const project = projects.get(projectId);
       if (bridge && project) {
         bridge.send({
           type: 'intent', kind: 'task_accepted',
           taskId: task.id, toParticipantId: project.poAgent,
-          payload: { agent: workerAgent, projectId, runId },
+          payload: { agent: task.assignedAgent, runtimeInstance: task.assignedRuntimeInstance || null, projectId, runId },
         });
       }
     }
@@ -703,14 +748,17 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       result = board.updateRunTelemetry(task.id, telemetry);
     }
     if (!result.ok) return result;
-    eventLog.emit('task.progress', { projectId, taskId: task.id, taskTitle: task?.title, stage, agent: workerAgent });
+    if (task.assignedRuntimeInstance && typeof runtimeInstanceAllocator?.markInstanceWorking === 'function') {
+      runtimeInstanceAllocator.markInstanceWorking(task.assignedRuntimeInstance, { taskId: task.id });
+    }
+    eventLog.emit('task.progress', { projectId, taskId: task.id, taskTitle: task?.title, stage, agent: task.assignedAgent, runtimeInstance: task.assignedRuntimeInstance || null });
 
     const project = projects.get(projectId);
     if (bridge && project) {
       bridge.send({
         type: 'intent', kind: 'progress_update',
         taskId: task.id, toParticipantId: project.poAgent,
-        payload: { stage, agent: workerAgent, projectId, runId },
+        payload: { stage, agent: task.assignedAgent, runtimeInstance: task.assignedRuntimeInstance || null, projectId, runId },
       });
     }
     return result;
@@ -725,7 +773,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const runCheck = board.validateRun(task.id, runId, workerAgent);
     if (!runCheck.ok) return runCheck;
 
-    return handleTaskFail(projectId, task.id, failureReason, errorMessage);
+    if (
+      TASK_LEVEL_WORKER_FAILURE_CLASSES.has(failureReason) &&
+      task.assignedRuntimeInstance &&
+      typeof runtimeInstanceAllocator?.markInstanceIdle === 'function'
+    ) {
+      runtimeInstanceAllocator.markInstanceIdle(task.assignedRuntimeInstance);
+    }
+
+    const failed = handleTaskFail(projectId, task.id, failureReason, errorMessage);
+    if (task.assignedRuntimeInstance && typeof runtimeInstanceAllocator?.markInstanceFailed === 'function') {
+      if (!TASK_LEVEL_WORKER_FAILURE_CLASSES.has(failureReason)) {
+        runtimeInstanceAllocator.markInstanceFailed(task.assignedRuntimeInstance, failureReason || errorMessage || 'task_failed');
+      }
+    }
+    return failed;
   }
 
   function handleSubmitResult(projectId, taskId, result, workerAgent, runId) {
@@ -748,7 +810,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       task.rejectedSubmissions = Array.isArray(task.rejectedSubmissions) ? task.rejectedSubmissions : [];
       task.rejectedSubmissions.push({
         at: Date.now(),
-        fromAgent: workerAgent,
+        fromAgent: task.assignedAgent || workerAgent,
+        runtimeInstance: task.assignedRuntimeInstance || null,
         runId,
         failureClass: deliverableValidation.failureClass,
         errors: deliverableValidation.errors,
@@ -759,11 +822,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         failureReason: deliverableValidation.failureClass,
         failureClass: deliverableValidation.failureClass,
       });
+      if (task.assignedRuntimeInstance && typeof runtimeInstanceAllocator?.markInstanceIdle === 'function') {
+        runtimeInstanceAllocator.markInstanceIdle(task.assignedRuntimeInstance);
+      }
       eventLog.emit('task.submission_rejected', {
         projectId,
         taskId: task.id,
         taskTitle: task.title,
-        agent: workerAgent,
+        agent: task.assignedAgent || workerAgent,
+        runtimeInstance: task.assignedRuntimeInstance || null,
         failureClass: deliverableValidation.failureClass,
         errors: deliverableValidation.errors,
         missing: deliverableValidation.missing,
@@ -780,9 +847,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
     const transResult = board.transition(task.id, 'submitted', { result, runId });
     if (!transResult.ok) return transResult;
+    if (task.assignedRuntimeInstance && typeof runtimeInstanceAllocator?.markInstanceIdle === 'function') {
+      runtimeInstanceAllocator.markInstanceIdle(task.assignedRuntimeInstance);
+    }
 
     eventLog.emit('task.submitted', {
-      projectId, taskId: task.id, taskTitle: task?.title, agent: workerAgent,
+      projectId, taskId: task.id, taskTitle: task?.title, agent: task.assignedAgent || workerAgent, runtimeInstance: task.assignedRuntimeInstance || null,
       output: result,  // includes artifacts list
     });
 
@@ -791,7 +861,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       bridge.send({
         type: 'intent', kind: 'result_submitted',
         taskId: task.id, toParticipantId: project.poAgent,
-        payload: { result, agent: workerAgent, projectId, runId },
+        payload: { result, agent: task.assignedAgent || workerAgent, runtimeInstance: task.assignedRuntimeInstance || null, projectId, runId },
       });
     }
     return { ok: true };

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { initProjectWorkspace, resolveWorkspacePath } from '../src/server/project-workspace.js';
+import { getProjectWorkspace, initProjectWorkspace, resolveWorkspacePath, setProjectWorkspace } from '../src/server/project-workspace.js';
 
 const root = join(tmpdir(), `kswarm-workspace-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 const projectsDir = join(root, 'projects');
@@ -34,7 +34,19 @@ try {
   assert.equal(defaultWs.custom, false);
   assert.equal(existsSync(join(projectsDir, 'proj-default', 'artifacts')), true);
 
-  console.log('3/3 project workspace tests passed');
+  const persistedPath = join(root, 'persisted-workspace');
+  const restored = getProjectWorkspace(workspaces, projectsDir, 'proj-restored', persistedPath);
+  assert.equal(restored.path, persistedPath);
+  assert.equal(restored.custom, true);
+  assert.equal(existsSync(join(persistedPath, 'artifacts')), true);
+
+  const replacementPath = join(root, 'replacement-workspace');
+  const replaced = setProjectWorkspace(workspaces, 'proj-restored', replacementPath);
+  assert.equal(replaced.path, replacementPath);
+  assert.equal(replaced.custom, true);
+  assert.deepEqual(workspaces.get('proj-restored'), replaced);
+
+  console.log('5/5 project workspace tests passed');
 } finally {
   rmSync(root, { recursive: true, force: true });
 }

@@ -23,6 +23,7 @@ import {
   validateTaskResultAgainstContract,
 } from '../src/core/execution-contract.js';
 import { extractDeclaredArtifacts } from '../src/core/artifact-extractor.js';
+import { buildArtifactRepairPrompt, classifyGeneratedArtifact } from '../src/core/artifact-quality.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -31,6 +32,8 @@ import { tmpdir } from 'node:os';
 const BROKER = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const KSWARM_API = process.env.KSWARM_API || 'http://127.0.0.1:4400';
 const AGENT_ID = process.env.KSWARM_AGENT_ID || process.argv[2] || `auto-worker-${Date.now()}`;
+const LOGICAL_AGENT_ID = process.env.KSWARM_LOGICAL_AGENT_ID || AGENT_ID;
+const PROJECT_INSTANCE_ID = process.env.KSWARM_PROJECT_ID || '';
 const ALIAS = process.argv[3] || 'AutoWorker';
 const DELAY = Number(process.env.WORK_DELAY || 2000);
 
@@ -144,7 +147,7 @@ async function cancelActiveRun(payload = {}) {
 async function loadAgentConfig() {
   // Try to fetch from server
   try {
-    const res = await fetch(`${KSWARM_API}/agents/${AGENT_ID}`);
+    const res = await fetch(`${KSWARM_API}/agents/${LOGICAL_AGENT_ID}`);
     if (res.ok) {
       const data = await res.json();
       agentConfig = data.agent;
@@ -220,6 +223,21 @@ function buildEnvConfig() {
     };
   }
   return null;
+}
+
+function isProjectPo(proj) {
+  return Boolean(
+    proj?.poAgent === LOGICAL_AGENT_ID &&
+    (!PROJECT_INSTANCE_ID || proj.id === PROJECT_INSTANCE_ID)
+  );
+}
+
+function isTaskAssignedToRuntime(task) {
+  return Boolean(
+    task &&
+    (task.assignedRuntimeInstance === AGENT_ID ||
+      (!task.assignedRuntimeInstance && task.assignedAgent === LOGICAL_AGENT_ID))
+  );
 }
 
 // ─── CLI Harness: spawn real CLI binaries (multica-aligned) ───────────────────
@@ -712,6 +730,9 @@ function runXiaok(binPath, prompt, model, workFolder) {
 }
 
 console.log(`[${ALIAS}] Starting agent: ${AGENT_ID}`);
+if (LOGICAL_AGENT_ID !== AGENT_ID) {
+  console.log(`[${ALIAS}] Logical agent: ${LOGICAL_AGENT_ID}${PROJECT_INSTANCE_ID ? ` (project ${PROJECT_INSTANCE_ID})` : ''}`);
+}
 console.log(`[${ALIAS}] Broker: ${BROKER}`);
 console.log(`[${ALIAS}] Work delay: ${DELAY}ms\n`);
 
@@ -800,7 +821,7 @@ async function handlePOAssignment(payload) {
     // Fallback to legacy decompose
     try {
       const rawTasks = await decomposeGoal(projectId, projectName, goal, requirements || '', members || []);
-      const workers = [AGENT_ID, ...(members || [])].filter(Boolean);
+      const workers = [LOGICAL_AGENT_ID, ...(members || [])].filter(Boolean);
       tasks = await smartAssignTasks(rawTasks, workers);
       console.log(`[${ALIAS}]   → Decomposed into ${tasks.length} tasks (legacy mode):`);
     } catch (err2) {
@@ -812,7 +833,7 @@ async function handlePOAssignment(payload) {
   }
 
   // Smart-assign any unassigned tasks
-  const workers = [AGENT_ID, ...(members || [])].filter(Boolean);
+  const workers = [LOGICAL_AGENT_ID, ...(members || [])].filter(Boolean);
   tasks = await smartAssignTasks(tasks, workers);
   tasks.forEach(t => console.log(`[${ALIAS}]     - ${t.title} → @${t.assignedAgent}${t.phaseId ? ` [${t.phaseId}]` : ''}`));
 
@@ -821,7 +842,7 @@ async function handlePOAssignment(payload) {
     const res = await fetch(`${KSWARM_API}/projects/${projectId}/tasks`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ tasks, fromAgent: AGENT_ID }),
+      body: JSON.stringify({ tasks, fromAgent: LOGICAL_AGENT_ID }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -847,7 +868,7 @@ async function handlePOAssignment(payload) {
 }
 
 async function decomposeGoal(projectId, projectName, goal, requirements, members) {
-  const workers = [AGENT_ID, ...members].filter(Boolean);
+  const workers = [LOGICAL_AGENT_ID, ...members].filter(Boolean);
   const goalText = goal || projectName || 'project';
 
   let taskTemplates = null;
@@ -898,7 +919,7 @@ async function decomposeGoal(projectId, projectName, goal, requirements, members
  * PO analyzes the goal deeply and produces phases with acceptance criteria.
  */
 async function generatePlan(projectId, projectName, goal, requirements, members) {
-  const workers = [AGENT_ID, ...members].filter(Boolean);
+  const workers = [LOGICAL_AGENT_ID, ...members].filter(Boolean);
   const goalText = goal || projectName || 'project';
   const lang = detectLanguage(goalText);
   const workerList = workers.map((w, i) => `- ${w}${i === 0 ? ' (你自己，PO)' : ''}`).join('\n');
@@ -1047,7 +1068,7 @@ Strict JSON object (no markdown fences, no commentary):
   const submitRes = await fetch(`${KSWARM_API}/projects/${projectId}/plan`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ plan: planObj, fromAgent: AGENT_ID }),
+    body: JSON.stringify({ plan: planObj, fromAgent: LOGICAL_AGENT_ID }),
   });
   const submitData = await submitRes.json();
   if (!submitData.ok) throw new Error(`Plan submit failed: ${submitData.error}`);
@@ -1240,7 +1261,7 @@ Strict JSON (no markdown fences):
     const res = await fetch(`${KSWARM_API}/projects/${projectId}/tasks/${taskId}/review`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ review: reviewResult, fromAgent: AGENT_ID }),
+      body: JSON.stringify({ review: reviewResult, fromAgent: LOGICAL_AGENT_ID }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -1330,7 +1351,7 @@ If not: {"needed": false}`;
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         revision: { reason: revisionData.reason, changes: revisionData.changes || [] },
-        fromAgent: AGENT_ID,
+        fromAgent: LOGICAL_AGENT_ID,
       }),
     });
     console.log(`[${ALIAS}]   → Plan revised: ${revisionData.reason}`);
@@ -1502,7 +1523,7 @@ Based on this project experience, suggest principle improvements:
     const res = await fetch(`${KSWARM_API}/projects/${projectId}/synthesize`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ synthesis, fromAgent: AGENT_ID }),
+      body: JSON.stringify({ synthesis, fromAgent: LOGICAL_AGENT_ID }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -1798,7 +1819,7 @@ async function handleApprovalReceived(projectId) {
     const res = await fetch(`${KSWARM_API}/projects/${projectId}/dispatch`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ fromAgent: AGENT_ID }),
+      body: JSON.stringify({ fromAgent: LOGICAL_AGENT_ID }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -1844,12 +1865,14 @@ async function checkSelfAssignedTasks(projectId) {
     for (const task of tasks) {
       if (task.status !== 'dispatched') continue;
 
-      const isSelf = task.assignedAgent === AGENT_ID;
-      const workerOnline = onlineAgents.has(task.assignedAgent);
+      const targetAgent = task.assignedRuntimeInstance || task.assignedAgent;
+      const isSelf = isTaskAssignedToRuntime(task);
+      const workerOnline = targetAgent ? onlineAgents.has(targetAgent) : false;
 
-      if (isSelf || !workerOnline) {
+      const shouldTakeOverOffline = !workerOnline && !task.assignedRuntimeInstance;
+      if (isSelf || shouldTakeOverOffline) {
         if (!isSelf) {
-          console.log(`[${ALIAS}]   → Worker "${task.assignedAgent}" offline, PO taking over: ${task.title}`);
+          console.log(`[${ALIAS}]   → Worker "${targetAgent || task.assignedAgent}" offline, PO taking over: ${task.title}`);
         } else {
           console.log(`[${ALIAS}]   → Self-assigned task found: ${task.title}`);
         }
@@ -1860,6 +1883,8 @@ async function checkSelfAssignedTasks(projectId) {
           projectGoal: data.project?.goal || poInfo?.goal || '',
           projectRequirements: data.project?.requirements || poInfo?.requirements || '',
           projectId,
+          localTaskId: task.localTaskId,
+          runId: task.activeRunId,
           workFolder: data.workspace?.path || data.project?.workFolder || '',
         });
       }
@@ -2026,9 +2051,45 @@ async function doTask(taskId, payload) {
     }
   }
 
-  // Priority 3: If both CLI and LLM failed, report failure instead of fake template
-  if (!artifactContent) {
-    console.log(`[${ALIAS}]   ✗ Both CLI and LLM failed for: ${title} — reporting task failure`);
+  let artifactQuality = classifyGeneratedArtifact({ title, brief, content: artifactContent || '' });
+  if (!artifactContent || !artifactQuality.ok) {
+    console.log(`[${ALIAS}]   ⚠ Artifact quality gate failed (${artifactQuality.reason}); trying one local repair`);
+    const repairPrompt = buildArtifactRepairPrompt({
+      originalPrompt: taskPrompt,
+      artifactContent: artifactContent || '',
+      validation: artifactQuality,
+    });
+    let repairedContent = null;
+
+    if (agentConfig?.runtimeType && agentConfig?.runtimePath && agentConfig.runtimeType !== 'builtin') {
+      try {
+        repairedContent = await runCLIHarness(repairPrompt, workFolder);
+        if (repairedContent) {
+          console.log(`[${ALIAS}]   → Artifact repaired via CLI (${agentConfig.runtimeType})`);
+        }
+      } catch (err) {
+        console.log(`[${ALIAS}]   ⚠ CLI artifact repair failed: ${err.message}`);
+      }
+    }
+
+    if (!repairedContent && llm) {
+      try {
+        repairedContent = await llmGenerateFromPrompt(repairPrompt);
+        if (repairedContent) console.log(`[${ALIAS}]   → Artifact repaired via LLM API`);
+      } catch (err) {
+        console.log(`[${ALIAS}]   ⚠ LLM artifact repair failed: ${err.message}`);
+      }
+    }
+
+    if (repairedContent) {
+      artifactContent = repairedContent;
+      artifactQuality = classifyGeneratedArtifact({ title, brief, content: artifactContent });
+    }
+  }
+
+  if (!artifactContent || !artifactQuality.ok) {
+    const errorMessage = `Generated artifact failed local quality gate for "${title}": ${artifactQuality.reason || 'empty_output'}`;
+    console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
     reportStatus('idle');
     writeTaskJournal(workFolder, {
       projectId,
@@ -2036,10 +2097,8 @@ async function doTask(taskId, payload) {
       localTaskId,
       runId,
       status: 'failed',
-      errorMessage: `CLI and LLM both failed to generate output for "${title}"`,
+      errorMessage,
     });
-    // Report failure via explicit task_failed intent. A progress update alone
-    // would leave the task stuck in in_progress.
     await client.sendIntent({
       kind: 'task_failed',
       taskId,
@@ -2049,8 +2108,9 @@ async function doTask(taskId, payload) {
         taskId,
         localTaskId,
         runId,
-        failureReason: 'agent_error',
-        errorMessage: `CLI and LLM both failed to generate output for "${title}"`,
+        failureReason: 'model_empty_output',
+        errorMessage,
+        artifactQuality,
       },
     });
     stopRunTelemetry();
@@ -2363,8 +2423,20 @@ ${brief ? `任务描述：${brief}` : ''}${workFolderContext || ''}`
     }
   ];
 
-  const result = await llm.chat(messages, { temperature: 0.6, maxTokens: 1200 });
-  return result.content.trim();
+  const result = await llm.chat(messages, { temperature: 0.6, maxTokens: 3000 });
+  return String(result.content || '').trim();
+}
+
+async function llmGenerateFromPrompt(prompt) {
+  const systemPrompt = agentInstructions
+    ? `${agentInstructions}\n\n你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。`
+    : '你是一个专业的 worker agent。你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。';
+
+  const result = await llm.chat([
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: prompt },
+  ], { temperature: 0.4, maxTokens: 3000 });
+  return String(result.content || '').trim();
 }
 
 // ─── Template-based fallback report ──────────────────────────────────────────
@@ -2474,7 +2546,7 @@ async function requestRework(projectId, taskId, reason) {
     await fetch(`${KSWARM_API}/projects/${projectId}/tasks/${taskId}/rework`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ fromAgent: AGENT_ID, reason }),
+      body: JSON.stringify({ fromAgent: LOGICAL_AGENT_ID, reason }),
     });
   } catch (err) {
     console.log(`[${ALIAS}]   ⚠ Rework request failed: ${err.message}`);
@@ -2495,7 +2567,7 @@ async function autoConfirmTask(projectId, taskId) {
     const res = await fetch(`${KSWARM_API}/projects/${projectId}/tasks/${taskId}/done`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ fromAgent: AGENT_ID }),
+      body: JSON.stringify({ fromAgent: LOGICAL_AGENT_ID }),
     });
     const data = await res.json();
     if (data.ok) {
@@ -2535,7 +2607,7 @@ async function pollMissedPOAssignments() {
 
     for (const proj of (data.projects || [])) {
       // If we are PO for a project that's in 'created' state, trigger PO assignment
-      if (proj.poAgent === AGENT_ID && proj.status === 'created') {
+      if (isProjectPo(proj) && proj.status === 'created') {
         console.log(`[${ALIAS}] Found missed PO assignment: ${proj.name} (${proj.id})`);
         const detailRes = await fetch(`${KSWARM_API}/projects/${proj.id}`);
         if (!detailRes.ok) continue;
@@ -2551,7 +2623,7 @@ async function pollMissedPOAssignments() {
         });
       }
       // If we are PO for a project that's 'active' but needs work, trigger appropriate action
-      else if (proj.poAgent === AGENT_ID && proj.status === 'active') {
+      else if (isProjectPo(proj) && proj.status === 'active') {
         const detailRes = await fetch(`${KSWARM_API}/projects/${proj.id}`);
         if (!detailRes.ok) continue;
         const detail = await detailRes.json();
@@ -2595,7 +2667,7 @@ async function pollDispatchedTasks() {
       const detail = await detailRes.json();
 
       for (const task of (detail.tasks || [])) {
-        if (task.assignedAgent === AGENT_ID && task.status === 'dispatched') {
+        if (isTaskAssignedToRuntime(task) && task.status === 'dispatched') {
           console.log(`[${ALIAS}] Found pending dispatched task: ${task.title}`);
           await doTask(task.id, {
             title: task.title,
@@ -2604,6 +2676,8 @@ async function pollDispatchedTasks() {
             projectGoal: detail.project?.goal || '',
             projectRequirements: detail.project?.requirements || '',
             projectId: proj.id,
+            localTaskId: task.localTaskId,
+            runId: task.activeRunId,
             workFolder: detail.workspace?.path || detail.project?.workFolder || '',
           });
         }
@@ -2633,7 +2707,7 @@ async function poHealthCheck() {
     const data = await res.json();
 
     for (const proj of (data.projects || [])) {
-      if (proj.poAgent !== AGENT_ID || proj.status !== 'active') continue;
+      if (!isProjectPo(proj) || proj.status !== 'active') continue;
 
       const detailRes = await fetch(`${KSWARM_API}/projects/${proj.id}`);
       if (!detailRes.ok) continue;
@@ -2652,10 +2726,11 @@ async function poHealthCheck() {
         if (elapsed < STUCK_THRESHOLD) continue;
 
         const onlineAgents = await getOnlineAgents();
-        const workerOnline = onlineAgents.has(task.assignedAgent);
+        const targetAgent = task.assignedRuntimeInstance || task.assignedAgent;
+        const workerOnline = targetAgent ? onlineAgents.has(targetAgent) : false;
         console.log(`[${ALIAS}] ⚠ Stuck task detected: "${task.title}" (${task.status}, ${Math.round(elapsed / 60000)}min, worker ${workerOnline ? 'online' : 'OFFLINE'})`);
 
-        if (!workerOnline) {
+        if (!workerOnline && !task.assignedRuntimeInstance) {
           // Worker offline — PO takes over directly
           console.log(`[${ALIAS}]   → Worker offline, PO executing directly`);
           await doTask(task.id, {
@@ -2665,6 +2740,8 @@ async function poHealthCheck() {
             projectGoal: detail.project?.goal || '',
             projectRequirements: detail.project?.requirements || '',
             projectId: proj.id,
+            localTaskId: task.localTaskId,
+            runId: task.activeRunId,
             workFolder: detail.workspace?.path || detail.project?.workFolder || '',
           });
         } else {

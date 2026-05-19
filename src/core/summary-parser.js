@@ -10,10 +10,13 @@
  */
 export function extractSummarySection(synthesis) {
   if (!synthesis) return null;
-  // Match "## 项目小结" or "## Project Summary" heading and everything after it
-  const match = synthesis.match(/^##\s*(?:项目小结|Project Summary)[^\n]*\n([\s\S]*?)(?=\n##\s[^#]|$)/mi);
+  // Match "## 项目小结" or "## Project Summary" heading and capture everything after it.
+  // Use greedy match to string end, then strip any trailing same-level heading if present.
+  const match = synthesis.match(/^##\s*(?:项目小结|Project Summary)[^\n]*\n([\s\S]+)/mi);
   if (!match) return null;
-  const content = match[1].trim();
+  // If another ## heading follows, truncate there
+  let content = match[1].replace(/\n##\s[^#][\s\S]*$/, '');
+  content = content.trim();
   return content || null;
 }
 

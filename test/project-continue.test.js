@@ -27,6 +27,36 @@ function offlineAgents() {
   ];
 }
 
+function modelEmptyOutputDegradedAgents() {
+  return [
+    {
+      id: 'cli-codex',
+      status: 'idle',
+      runtimeHealth: {
+        state: 'degraded',
+        lastFailureClass: 'model_empty_output',
+        lastError: 'content_too_short',
+        cooldownUntil: null,
+      },
+    },
+  ];
+}
+
+function runtimeStalledAgents() {
+  return [
+    {
+      id: 'cli-codex',
+      status: 'idle',
+      runtimeHealth: {
+        state: 'stalled',
+        lastFailureClass: 'runtime_stalled',
+        lastError: 'heartbeat_timeout',
+        cooldownUntil: null,
+      },
+    },
+  ];
+}
+
 function setupProject(hub, taskOverrides = {}) {
   const project = hub.createProject({
     id: 'proj-continue',
@@ -247,6 +277,42 @@ test('unsafe state returns needs conversation and does not mutate', () => {
   assert.match(result.xiaokContext.lastFailure, /失败|CLI failed|agent_error/);
   assert.equal(task.status, 'failed');
   assert.equal(task.assignedAgent, 'cli-codex');
+});
+
+test('continue can retry original agent after model_empty_output degraded state', () => {
+  const hub = createTestHub(modelEmptyOutputDegradedAgents());
+  setupProject(hub);
+  const failed = failRootTask(hub, 'model_empty_output', 'content_too_short');
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-empty-output',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'retry_best_agent');
+  assert.deepEqual(result.dispatched, [failed.id]);
+  assert.equal(task.status, 'dispatched');
+  assert.equal(task.assignedAgent, 'cli-codex');
+});
+
+test('continue does not treat runtime stalled degraded agent as healthy', () => {
+  const hub = createTestHub(runtimeStalledAgents());
+  setupProject(hub);
+  const failed = failRootTask(hub, 'runtime_stalled', 'heartbeat_timeout');
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-stalled-agent',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, false);
+  assert.equal(result.strategy, 'needs_conversation');
+  assert.equal(task.status, 'failed');
 });
 
 test('automatic continue never marks failed task done without a result', () => {

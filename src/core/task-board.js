@@ -18,6 +18,7 @@
 
 import {
   buildTaskAliases,
+  isExecutableTaskInput,
   makeRunId,
   normalizeExistingTask,
   normalizeTasksForProject,
@@ -93,6 +94,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
         lastRunLease: task.lastRunLease || null,
         recoveryStatus: task.recoveryStatus || null,
         recoveryReason: task.recoveryReason || null,
+        startedAt: task.startedAt || null,
+        completedAt: task.completedAt || null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
@@ -121,6 +124,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
 
     if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
     if (Object.prototype.hasOwnProperty.call(meta, 'assignedExecutor')) task.assignedExecutor = meta.assignedExecutor || null;
+    if (Object.prototype.hasOwnProperty.call(meta, 'assignedRuntimeInstance')) task.assignedRuntimeInstance = meta.assignedRuntimeInstance || null;
     if (Object.prototype.hasOwnProperty.call(meta, 'result')) task.result = meta.result;
     if (meta.failureReason) task.failureReason = meta.failureReason;
     if (meta.failureClass) task.lastFailureClass = meta.failureClass;
@@ -136,6 +140,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     if (Object.prototype.hasOwnProperty.call(meta, 'qualityFailureCount')) task.qualityFailureCount = meta.qualityFailureCount;
     if (Object.prototype.hasOwnProperty.call(meta, 'runtimeFailureCount')) task.runtimeFailureCount = meta.runtimeFailureCount;
     if (newStatus === 'dispatched') {
+      task.startedAt = null;
       task.activeRunId = meta.runId || makeRunId(task.id, task.attempt || 1);
       if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
       task.runLease = {
@@ -143,6 +148,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         projectId,
         taskId: task.id,
         assignedAgent: task.assignedAgent || null,
+        assignedRuntimeInstance: task.assignedRuntimeInstance || null,
         assignedExecutor: task.assignedExecutor || null,
         attempt: task.attempt || 1,
         status: 'dispatched',
@@ -159,14 +165,19 @@ export function createTaskBoard(projectId = 'legacy-project') {
     if (newStatus === 'accepted' && task.runLease) {
       task.runLease.status = 'accepted';
       task.runLease.assignedAgent = task.assignedAgent || meta.assignedAgent || task.runLease.assignedAgent || null;
+      task.runLease.assignedRuntimeInstance = task.assignedRuntimeInstance || meta.assignedRuntimeInstance || task.runLease.assignedRuntimeInstance || null;
       task.runLease.assignedExecutor = task.assignedExecutor || meta.assignedExecutor || task.runLease.assignedExecutor || null;
       task.runLease.lastHeartbeatAt = now;
       task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
     }
-    if (newStatus === 'in_progress' && task.runLease) {
-      task.runLease.status = 'in_progress';
-      task.runLease.lastHeartbeatAt = now;
-      task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+    if (newStatus === 'in_progress') {
+      task.startedAt = now;
+      if (task.runLease) {
+        task.runLease.status = 'in_progress';
+        task.runLease.startedAt = now;
+        task.runLease.lastHeartbeatAt = now;
+        task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+      }
     }
     if (newStatus === 'pending') {
       if (task.runLease) {
@@ -176,7 +187,9 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.runTelemetry = null;
       task.selectedRoute = null;
       task.assignedExecutor = null;
+      task.assignedRuntimeInstance = null;
       task.activeRunId = null;
+      task.startedAt = null;
       task.blockedAt = null;
       task.blockedReason = null;
       task.blockKind = null;
@@ -277,12 +290,13 @@ export function createTaskBoard(projectId = 'legacy-project') {
   function validateRun(taskId, runId, workerAgent) {
     const task = getTask(taskId);
     if (!task) return { ok: false, error: 'task_not_found' };
-    const assignedActor = task.assignedExecutor || task.assignedAgent;
+    const assignedActor = task.assignedExecutor || task.assignedRuntimeInstance || task.assignedAgent;
     if (workerAgent && assignedActor && assignedActor !== workerAgent) {
       return {
         ok: false,
         error: 'wrong_assigned_agent',
         assignedAgent: task.assignedAgent,
+        assignedRuntimeInstance: task.assignedRuntimeInstance || null,
         assignedExecutor: task.assignedExecutor || null,
       };
     }
@@ -337,6 +351,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     task.status = 'pending';
     task.activeRunId = null;
     task.runLease = null;
+    task.startedAt = null;
     task.updatedAt = now;
     task.recoveryStatus = 'redispatch_ready';
     task.recoveryReason = reason;
@@ -452,6 +467,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     tasks.clear();
     for (const task of taskArray) {
       const normalized = normalizeExistingTask(projectId, task);
+      if (!isExecutableTaskInput(normalized)) continue;
       clearStaleRecoveredReview(normalized);
       tasks.set(normalized.id, normalized);
     }

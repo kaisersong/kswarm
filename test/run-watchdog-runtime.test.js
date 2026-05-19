@@ -35,6 +35,33 @@ test('missing heartbeat past threshold marks runtime stalled and requests cancel
   assert.equal(actions[1].agentId, 'agent-a');
 });
 
+test('stalled runtime instance targets concrete runtime participant', () => {
+  const actions = planStalledRunActions({
+    projectId: 'proj',
+    tasks: [{
+      id: 'item-1',
+      status: 'in_progress',
+      assignedAgent: 'xiaok-worker',
+      assignedRuntimeInstance: 'xiaok-worker@inst-1',
+      activeRunId: 'run-1',
+      runLease: {
+        runId: 'run-1',
+        assignedAgent: 'xiaok-worker',
+        assignedRuntimeInstance: 'xiaok-worker@inst-1',
+        lastHeartbeatAt: now - 120_000,
+        createdAt: now - 180_000,
+      },
+    }],
+    now,
+    heartbeatTimeoutMs: 60_000,
+  });
+
+  assert.equal(actions[0].agentId, 'xiaok-worker@inst-1');
+  assert.equal(actions[0].logicalAgentId, 'xiaok-worker');
+  assert.equal(actions[1].agentId, 'xiaok-worker@inst-1');
+  assert.equal(actions[1].logicalAgentId, 'xiaok-worker');
+});
+
 test('recent heartbeat but no stdout emits stalled warning first', () => {
   const actions = planStalledRunActions({
     projectId: 'proj',

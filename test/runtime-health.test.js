@@ -73,6 +73,23 @@ test('generation probe failure degrades runtime and repeated failures enter cool
   assert.equal(isRoutable({ runtimeHealth: health }, ['analysis'], [{ type: 'markdown' }], now + 3000).reason, 'runtime_cooldown');
 });
 
+test('model empty output is task-level and does not degrade runtime routing', () => {
+  const healthy = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
+    outputCapabilities: ['markdown'],
+    taskCapabilities: ['analysis'],
+  }, now);
+
+  const afterEmpty = recordRuntimeFailure(healthy, {
+    failureClass: 'model_empty_output',
+    error: 'content_too_short',
+  }, now + 1000);
+
+  assert.equal(afterEmpty.state, 'healthy');
+  assert.equal(afterEmpty.consecutiveRuntimeFailures, 0);
+  assert.equal(afterEmpty.lastFailureClass, 'model_empty_output');
+  assert.equal(isRoutable({ runtimeHealth: afterEmpty }, ['analysis'], [{ type: 'markdown' }], now + 2000).ok, true);
+});
+
 test('successful task records capabilities and routability checks task and output capabilities', () => {
   const health = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
     taskId: 'proj__item-1',

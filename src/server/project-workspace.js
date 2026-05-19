@@ -21,6 +21,11 @@ export function initProjectWorkspace(workspaces, projectsDir, projectId, customP
   return ws;
 }
 
+export function getProjectWorkspace(workspaces, projectsDir, projectId, persistedPath) {
+  if (workspaces.has(projectId)) return workspaces.get(projectId);
+  return initProjectWorkspace(workspaces, projectsDir, projectId, persistedPath);
+}
+
 export function setProjectWorkspace(workspaces, projectId, newPath) {
   const wsPath = resolveWorkspacePath(newPath);
   if (!wsPath) throw new Error('workspace path required');

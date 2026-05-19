@@ -30,6 +30,43 @@ test('dispatch planning treats busy agents as global across projects', () => {
   assert.equal(plan.projectGate, 'waiting_for_busy_agents');
 });
 
+test('dispatch planning uses pooled Xiaok worker capacity before waiting', () => {
+  const plan = planDispatch({
+    projectId: 'proj-b',
+    tasks: [
+      { id: 'proj-b__task-1', title: 'B task', status: 'pending', assignedAgent: 'xiaok-worker', dependencies: [] },
+    ],
+    allActiveTasks: [
+      { id: 'proj-a__task-1', projectId: 'proj-a', status: 'in_progress', assignedAgent: 'xiaok-worker' },
+    ],
+    agentConcurrency: { 'xiaok-worker': 2 },
+  });
+
+  assert.deepEqual(plan.dispatchedTasks.map(task => task.id), ['proj-b__task-1']);
+  assert.deepEqual(plan.skipped, []);
+  assert.equal(plan.projectGate, null);
+});
+
+test('dispatch planning reports Xiaok capacity wait after pooled capacity is full', () => {
+  const plan = planDispatch({
+    projectId: 'proj-c',
+    tasks: [
+      { id: 'proj-c__task-1', title: 'C task', status: 'pending', assignedAgent: 'xiaok-worker', dependencies: [] },
+    ],
+    allActiveTasks: [
+      { id: 'proj-a__task-1', projectId: 'proj-a', status: 'in_progress', assignedAgent: 'xiaok-worker' },
+      { id: 'proj-b__task-1', projectId: 'proj-b', status: 'accepted', assignedAgent: 'xiaok-worker' },
+    ],
+    agentConcurrency: { 'xiaok-worker': 2 },
+  });
+
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.deepEqual(plan.skipped, [
+    { taskId: 'proj-c__task-1', reason: 'xiaok_capacity_full', agent: 'xiaok-worker' },
+  ]);
+  assert.equal(plan.projectGate, 'waiting_for_xiaok_capacity');
+});
+
 test('dispatch planning does not mark preferred agent busy for active local executor runs', () => {
   const plan = planDispatch({
     projectId: 'proj-b',
@@ -160,6 +197,33 @@ test('dispatch planning reroutes to a capable healthy agent when assigned agent 
   assert.deepEqual(plan.dispatchedTasks.map(t => t.assignedAgent), ['worker-b']);
   assert.equal(plan.dispatchedTasks[0].preferredAssignedAgent, 'worker-a');
   assert.equal(plan.dispatchedTasks[0].selectedRoute.selectedAgentId, 'worker-b');
+});
+
+test('dispatch planning does not reroute worker tasks to project-owner-only PO', () => {
+  const now = 1779050000000;
+  const healthy = recordProbeResult(createUnknownRuntimeHealth(), {
+    commandOk: true,
+    generationOk: true,
+    taskCapabilities: ['analysis'],
+    outputCapabilities: ['markdown'],
+  }, now);
+  const plan = planDispatch({
+    projectId: 'proj-a',
+    tasks: [
+      { id: 'analysis', title: '分析报告', status: 'pending', assignedAgent: 'xiaok-worker', requiredCapabilities: ['analysis'], requiredOutputs: ['markdown'], dependencies: [] },
+    ],
+    allActiveTasks: [],
+    agentProfiles: [
+      { id: 'xiaok-worker', roles: ['worker'], runtimeHealth: { state: 'stalled', taskCapabilities: ['analysis'], outputCapabilities: ['markdown'] } },
+      { id: 'xiaok-po', roles: ['project_owner'], runtimeHealth: healthy },
+    ],
+    now,
+  });
+
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.equal(plan.skipped[0].taskId, 'analysis');
+  assert.notEqual(plan.skipped[0].agent, 'xiaok-po');
+  assert.equal(plan.projectGate, 'waiting_for_capable_agent');
 });
 
 let passed = 0;

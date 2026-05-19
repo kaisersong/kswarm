@@ -7,7 +7,7 @@
  * - The failure history pattern
  */
 
-const RETRYABLE_FAILURES = new Set(['agent_error', 'timeout', 'runtime_offline', 'runtime_recovery', 'runtime_stalled', 'runtime_generation_unavailable']);
+const RETRYABLE_FAILURES = new Set(['agent_error', 'timeout', 'runtime_offline', 'runtime_recovery', 'runtime_stalled', 'runtime_generation_unavailable', 'model_empty_output']);
 
 /**
  * @param {{ attempt: number, maxAttempts?: number, failureReason?: string }} task

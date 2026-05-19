@@ -26,11 +26,14 @@ export function planStalledRunActions({
       lease.artifactManifest?.length > 0 ? lease.lastHeartbeatAt : null,
     );
 
+    const logicalAgentId = task.assignedAgent || lease.assignedAgent || null;
+    const runtimeAgentId = task.assignedRuntimeInstance || lease.assignedRuntimeInstance || logicalAgentId;
     const base = {
       projectId,
       taskId: task.id,
       runId,
-      agentId: task.assignedAgent || lease.assignedAgent || null,
+      agentId: runtimeAgentId,
+      logicalAgentId,
     };
 
     const missingHeartbeat = now - lastHeartbeatAt >= heartbeatTimeoutMs;
