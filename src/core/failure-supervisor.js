@@ -9,7 +9,7 @@ export function superviseTaskFailure(task = {}, failure = {}, options = {}) {
 }
 
 function superviseQualityFailure(task, failure, options) {
-  const maxReworks = options.maxQualityReworks ?? task.maxQualityReworks ?? 1;
+  const maxReworks = options.maxQualityReworks ?? task.maxQualityReworks ?? 2;
   const qualityFailureCount = (task.qualityFailureCount || 0) + 1;
   const feedback = failure.feedback || failure.errorMessage || '质量验收未通过';
 

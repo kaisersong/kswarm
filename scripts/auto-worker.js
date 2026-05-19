@@ -917,7 +917,11 @@ ${workerList}
 1. **深度分析**：先分析项目目标和要求，理解核心挑战和关键风险
 2. **成功标准**：明确定义项目交付的成功标准（3-5条）
 3. **分阶段组织**：将工作分为 2-4 个阶段（Phase），每个阶段有明确的里程碑
-4. **验收标准**：每个任务项必须有具体的验收标准（acceptanceCriteria）
+4. **验收标准**：每个任务项必须有具体的验收标准（acceptanceCriteria）。验收标准必须合理可达：
+   - 信息收集类：要求完整性、准确性、有来源标注，禁止设"至少N个"等武断数量下限
+   - 内容创作类：要求结构完整、语言流畅、逻辑清晰，不设字数下限
+   - 分析对比类：要求分析有逻辑、结论有依据，不设洞察数量下限
+   - 只有项目要求中明确指定的量化指标才可写入验收标准
 5. **严格遵守项目要求中的流程**：如果要求"讨论N轮"、"对抗性评审"、"迭代修订"等，必须按轮次/阶段组织
 6. **依赖关系**：用 dependencies 体现任务间的先后顺序
 7. **合理分工**：根据任务性质分配给合适的 worker
@@ -958,7 +962,11 @@ ${workerList}
 1. **Deep analysis**: Analyze goal/requirements, identify core challenges and risks
 2. **Success criteria**: Define 3-5 measurable success criteria
 3. **Phased organization**: Organize into 2-4 phases with clear milestones
-4. **Acceptance criteria**: Each item must have specific acceptance criteria
+4. **Acceptance criteria**: Each item must have specific acceptance criteria. Criteria must be reasonable and achievable:
+   - Info collection: require completeness, accuracy, source attribution — no arbitrary "at least N" thresholds
+   - Content creation: require structural integrity, clarity, logical flow — no word count minimums
+   - Analysis/comparison: require logical reasoning, evidence-based conclusions — no insight count minimums
+   - Only include quantitative thresholds if explicitly specified in project requirements
 5. **Follow process requirements**: Honor any specified rounds/reviews/iterations
 6. **Dependencies**: Use dependencies to enforce ordering
 7. **Smart assignment**: Match tasks to appropriate workers
