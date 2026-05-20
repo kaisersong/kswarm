@@ -8,26 +8,10 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, extname, join } from 'node:path';
-
-const MIME_TYPES = {
-  '.html': 'text/html',
-  '.md': 'text/markdown',
-  '.json': 'application/json',
-  '.txt': 'text/plain',
-  '.pdf': 'application/pdf',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.doc': 'application/msword',
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xls': 'application/vnd.ms-excel',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-};
+import { basename, join } from 'node:path';
+export { buildArtifactManifest } from './artifact-manifest.js';
 
 function assertSafeSegment(value, label) {
   if (!value || value !== basename(value) || value.includes('..') || value.includes('/')) {
@@ -76,21 +60,5 @@ export function readRunJournals(projectWorkspace) {
     }
   }
   return journals;
-}
-
-export function buildArtifactManifest(projectWorkspace, filenames = []) {
-  const artifactsDir = join(projectWorkspace, 'artifacts');
-  return filenames.map(filename => {
-    assertSafeSegment(filename, 'artifact_filename');
-    const artifactPath = join(artifactsDir, filename);
-    const stat = statSync(artifactPath);
-    const ext = extname(filename);
-    return {
-      filename,
-      path: `artifacts/${filename}`,
-      mimeType: MIME_TYPES[ext] || 'application/octet-stream',
-      size: stat.size,
-    };
-  });
 }
 

@@ -61,17 +61,19 @@ test('buildArtifactManifest returns relative artifact paths with file sizes', ()
   writeFileSync(join(ws, 'artifacts', 'result.md'), 'hello recovery', 'utf-8');
 
   const manifest = buildArtifactManifest(ws, ['result.md']);
-  assert.deepEqual(manifest, [{
-    filename: 'result.md',
-    path: 'artifacts/result.md',
-    mimeType: 'text/markdown',
-    size: 14,
-  }]);
+  assert.equal(manifest.length, 1);
+  assert.equal(manifest[0].filename, 'result.md');
+  assert.equal(manifest[0].path, 'artifacts/result.md');
+  assert.equal(manifest[0].relativePath, 'artifacts/result.md');
+  assert.equal(manifest[0].mimeType, 'text/markdown');
+  assert.equal(manifest[0].size, 14);
+  assert.equal(typeof manifest[0].sha256, 'string');
+  assert.equal(typeof manifest[0].generatedAt, 'number');
 });
 
 test('buildArtifactManifest rejects unsafe artifact filenames', () => {
   const ws = makeWorkspace();
-  assert.throws(() => buildArtifactManifest(ws, ['../secret.md']), /invalid_artifact_filename/);
+  assert.throws(() => buildArtifactManifest(ws, ['../secret.md']), /artifact_path_escape/);
 });
 
 let passed = 0;

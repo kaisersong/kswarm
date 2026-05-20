@@ -25,7 +25,7 @@ import { aggregateDelivery } from '../core/delivery.js';
 import { createWatchdog } from '../core/watchdog.js';
 import { parseTaskId } from '../core/task-identity.js';
 import { planProjectRecovery } from '../core/recovery-planner.js';
-import { readRunJournals } from '../core/recovery-store.js';
+import { buildArtifactManifest, readRunJournals } from '../core/recovery-store.js';
 import { executeRecoveryAction } from '../core/recovery-executor.js';
 import {
   buildPlanRetryAssignPoIntent,
@@ -870,12 +870,12 @@ async function handleRequest(req, res) {
         const board = hub.getBoard(p.id);
         const tasks = board ? board.getAllTasks() : [];
         const done = tasks.filter(t => t.status === 'done').length;
-        const cancelled = tasks.filter(t => t.status === 'cancelled').length;
+        const stopped = tasks.filter(t => ['failed', 'blocked', 'cancelled'].includes(t.status)).length;
         return {
           ...p,
           taskCount: tasks.length,
           doneCount: done,
-          cancelledCount: cancelled,
+          stoppedCount: stopped,
           updatedAt: p.updatedAt || p.createdAt || 0,
           projectIntervention: hub.getProjectIntervention(p.id),
         };
@@ -992,15 +992,29 @@ async function handleRequest(req, res) {
           dispatched: result.dispatched || [],
         });
         broadcast({ type: 'project_continue', projectId, result });
-        if (result.recovered && brokerClient && brokerClient.isConnected()) {
+        if ((result.recovered || result.reviewNotificationNeeded) && result.taskId) {
           const project = hub.getProject(projectId);
           const task = hub.getBoard(projectId)?.getTask(result.taskId);
-          const fromWorker = task?.recoveredBy || task?.assignedAgent || 'continue_project';
-          if (project?.poAgent && result.taskId) {
-            brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
-              taskId: result.taskId,
-              payload: { projectId, taskId: result.taskId, fromWorker, result: result.result },
-            }).catch(() => {});
+          const fromWorker = result.fromWorker || task?.recoveredBy || task?.assignedAgent || 'continue_project';
+          if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
+            try {
+              await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
+                taskId: result.taskId,
+                payload: { projectId, taskId: result.taskId, fromWorker, result: result.result },
+              });
+              result.reviewNotification = 'sent';
+            } catch (err) {
+              result.reviewNotification = 'failed';
+              result.reviewNotificationError = String(err?.message || err);
+              log('warn', `Failed to send review_submission on project continue`, {
+                projectId,
+                taskId: result.taskId,
+                poAgent: project?.poAgent,
+                error: result.reviewNotificationError,
+              });
+            }
+          } else {
+            result.reviewNotification = 'not_available';
           }
         }
         if ((result.dispatched || []).length > 0) {
@@ -1019,10 +1033,17 @@ async function handleRequest(req, res) {
       const project = hub.getProject(projectId);
       const canNotifyReview = Boolean(brokerClient && brokerClient.isConnected() && project?.poAgent);
       const result = hub.handleResolveProjectIntervention(projectId, body || {}, {
-        writeArtifact: ({ filename, content }) => {
-          const artifactPath = join(ws.artifacts, filename);
-          writeFileSync(artifactPath, content, 'utf8');
-          return { ok: true, path: artifactPath };
+        writeArtifact: artifact => {
+          if (artifact?.path || artifact?.relativePath || artifact?.artifactPath) {
+            const [manifest] = buildArtifactManifest(ws.path, [artifact.path || artifact.relativePath || artifact.artifactPath], {
+              projectId,
+              taskId: body?.expectedPrimaryTaskId,
+              role: artifact.role || 'primary',
+              producedBy: { agentId: body?.fromAgent || 'human', source: 'xiaok_intervention' },
+            });
+            return { ok: true, ...manifest };
+          }
+          return { ok: false, error: 'inline_content_forbidden', status: 400 };
         },
         sendReviewSubmission: canNotifyReview ? ({ taskId, payload }) => {
           const poTarget = getProjectPoTarget(project);
@@ -1359,9 +1380,10 @@ async function handleRequest(req, res) {
         const project = hub.getProject(projectId);
         if (project && project.enableSummary !== false) {
           try {
-            const { extractSummarySection, extractSummaryScore } = await import('../core/summary-parser.js');
+            const { extractSummarySection, extractSummaryScore, extractTaskScores } = await import('../core/summary-parser.js');
             project.summary = extractSummarySection(synthesis);
             project.summaryScore = extractSummaryScore(synthesis);
+            project.taskScores = extractTaskScores(synthesis);
             hub.persistState();
           } catch (e) {
             log('warn', 'Failed to parse project summary', { projectId, error: String(e) });
@@ -1376,11 +1398,43 @@ async function handleRequest(req, res) {
           deliveredAt: Date.now(),
         });
         if (delivery) {
+          // Update project.deliverable with actual file list for frontend display
+          if (project) {
+            project.deliverable = {
+              synthesis: true,
+              files: delivery.manifest.artifacts.map(a => ({
+                name: a.filename,
+                type: a.type,
+                size: a.size,
+                taskId: a.taskId,
+              })),
+            };
+            hub.persistState();
+          }
           result.delivery = {
             manifestUrl: `/projects/${projectId}/delivery/delivery-manifest.json`,
             reportUrl: delivery.reportPath ? `/projects/${projectId}/delivery/delivery-report.md` : null,
             artifactCount: delivery.manifest.artifacts.length,
           };
+        } else if (project) {
+          // Fallback: collect artifact info from task results for display
+          const board = hub.getBoard(projectId);
+          const tasks = board ? board.getAllTasks() : [];
+          const files = [];
+          for (const task of tasks) {
+            const arts = task.result?.artifacts || [];
+            for (const a of arts) {
+              files.push({
+                name: a.filename || a.path || a.title || 'unknown',
+                type: a.mimeType || a.type || undefined,
+                taskId: task.id,
+              });
+            }
+          }
+          if (files.length > 0) {
+            project.deliverable = { synthesis: true, files };
+            hub.persistState();
+          }
         }
       }
       return json(res, result);

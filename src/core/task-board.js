@@ -403,7 +403,15 @@ export function createTaskBoard(projectId = 'legacy-project') {
    */
   function isAllDone() {
     if (tasks.size === 0) return false;
-    return [...tasks.values()].every(t => t.status === 'done' || t.status === 'cancelled');
+    return [...tasks.values()].every(t => isTaskDoneForProjectCompletion(t));
+  }
+
+  function isTaskDoneForProjectCompletion(task) {
+    if (task.status === 'done' || task.status === 'cancelled') return true;
+    if (!task.parentTaskId) return false;
+    const parentId = resolveTaskId(task.parentTaskId) || task.parentTaskId;
+    const parent = tasks.get(parentId);
+    return Boolean(parent && (parent.status === 'done' || parent.status === 'cancelled'));
   }
 
   function getTask(id) {

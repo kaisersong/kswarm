@@ -381,6 +381,26 @@ test('retry child completion marks failed parent done and unblocks dependents', 
   assert.deepEqual(dispatch.dispatched, ['proj-a__item-2']);
 });
 
+test('historical failed retry child does not block project delivery after parent is done', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-deliver-history', name: 'Deliver', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-deliver-history', [
+    { id: 'item-1', title: 'Final report', assignedAgent: 'worker' },
+    { id: 'item-1-retry-1', title: 'Final report retry', assignedAgent: 'worker', parentTaskId: 'item-1' },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-deliver-history').ok, true);
+
+  const board = hub.getBoard('proj-deliver-history');
+  board.getTask('item-1').status = 'done';
+  board.getTask('item-1-retry-1').status = 'failed';
+  board.getTask('item-1-retry-1').failureReason = 'model_empty_output';
+
+  assert.equal(board.isAllDone(), true);
+  const delivered = hub.handleDeliver('proj-deliver-history', { synthesis: true }, 'po');
+  assert.equal(delivered.ok, true);
+  assert.equal(hub.getProject('proj-deliver-history').status, 'delivered');
+});
+
 test('retry child with duplicate title does not break title dependency after reload', () => {
   const hub = createHub({ silent: true });
   setupProject(hub, 'proj-a');

@@ -82,11 +82,19 @@ test('worker emits runtime telemetry and supports owner-checked cancel_run', () 
   assert.match(source, /activeChild\.kill\(['"]SIGTERM['"]\)/);
 });
 
-test('worker prompt and submission path support declared artifact files', () => {
+test('worker prompt requires file-first artifact handoff instead of inline artifact blocks', () => {
+  assert.match(source, /写入 artifacts/);
+  assert.match(source, /不要在回复、stdout、tool 参数或聊天消息中粘贴完整交付物/);
+  assert.doesNotMatch(source, /必须使用独立产物块输出核心文件/);
+  assert.doesNotMatch(source, /artifact path=filename\.ext/);
+});
+
+test('worker submission includes artifact manifests and avoids project artifact content upload when workFolder exists', () => {
   assert.match(source, /extractDeclaredArtifacts/);
-  assert.match(source, /artifact path=/);
-  assert.match(source, /declaredArtifacts\.artifacts/);
-  assert.match(source, /declaredArtifacts\.artifacts\.map/);
+  assert.match(source, /inline_artifact_forbidden/);
+  assert.match(source, /artifactManifest/);
+  assert.match(source, /submittedArtifacts\s*=\s*artifactManifest/);
+  assert.match(source, /if\s*\(!workFolder\)/);
 });
 
 test('worker supports separate logical agent and runtime instance identity', () => {
@@ -100,6 +108,35 @@ test('project PO polling is scoped to a single project instance when provided', 
   assert.match(source, /PROJECT_INSTANCE_ID/);
   assert.match(source, /function isProjectPo/);
   assert.match(source, /proj\.id === PROJECT_INSTANCE_ID/);
+});
+
+test('PO synthesis all-done check ignores historical retry children', () => {
+  assert.match(source, /function isProjectAllDoneForDelivery/);
+  assert.match(source, /parentTaskId/);
+  assert.match(source, /isHistoricalRetryChildResolved/);
+  assert.doesNotMatch(source, /tasks\.every\(t => t\.status === 'done' \|\| t\.status === 'cancelled'\)/);
+});
+
+test('PO health polling synthesizes active all-done idle projects', () => {
+  const healthBlock = source.slice(
+    source.indexOf('async function poHealthCheck'),
+    source.indexOf('// Start health monitor after initial startup')
+  );
+
+  assert.match(healthBlock, /const allDone = isProjectAllDoneForDelivery\(tasks\)/);
+  assert.match(healthBlock, /if\s*\(allDone\)\s*\{/);
+  assert.match(healthBlock, /await synthesizeProject\(proj\.id\)/);
+  assert.match(healthBlock, /else if\s*\(hasPending\)/);
+});
+
+test('PO health polling runs once shortly after startup before interval polling', () => {
+  const startupBlock = source.slice(source.indexOf('// Start health monitor after initial startup'));
+  const immediateHealthMatch = startupBlock.match(/(?:void\s+)?poHealthCheck\(\);/);
+  const intervalIndex = startupBlock.indexOf('setInterval(poHealthCheck');
+
+  assert.ok(immediateHealthMatch, 'expected startup block to call poHealthCheck once immediately');
+  assert.ok(intervalIndex > 0, 'expected startup block to register interval polling');
+  assert.ok(immediateHealthMatch.index < intervalIndex, 'expected immediate health check before interval registration');
 });
 
 test('worker polling accepts assigned runtime instances', () => {

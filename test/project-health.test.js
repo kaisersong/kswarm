@@ -37,6 +37,26 @@ test('submitted tasks are surfaced as needs_review before idle', () => {
   assert.equal(health.state, 'needs_review');
 });
 
+test('historical failed retry child does not prevent complete health when parent is done', () => {
+  const health = deriveProjectHealth({
+    project: { id: 'proj-history', status: 'active' },
+    tasks: [
+      { id: 'item-1', title: '撰写报告草稿', status: 'done' },
+      {
+        id: 'item-1-retry-1',
+        title: '撰写报告草稿',
+        status: 'failed',
+        parentTaskId: 'item-1',
+        failureReason: 'model_empty_output',
+      },
+      { id: 'item-2', title: '修订并定稿', status: 'done' },
+    ],
+  });
+
+  assert.equal(health.state, 'complete');
+  assert.equal(health.gate, null);
+});
+
 test('dispatch plan gates explain idle projects with only busy agents', () => {
   const health = deriveProjectHealth({
     project: { id: 'proj-a', status: 'active' },

@@ -67,7 +67,7 @@ export function handleContinueProjectCore({
     });
   }
 
-  if (isRecoveryBudgetExceeded(task, strategy)) {
+  if (strategy !== 'notify_po_review' && isRecoveryBudgetExceeded(task, strategy)) {
     return remember(project, idempotencyKey, {
       ok: false,
       action: 'continue_project',
@@ -89,6 +89,8 @@ export function handleContinueProjectCore({
   let result;
   if (strategy === 'recover_submission') {
     result = recoverTaskSubmission({ project, task, intervention, recoverSubmission });
+  } else if (strategy === 'notify_po_review') {
+    result = notifyPoReview({ project, task, intervention });
   } else if (strategy === 'complete_retry_parent') {
     result = completeRetryParent({ board, task });
   } else if (MUTATING_RETRY_STRATEGIES.has(strategy)) {
@@ -105,7 +107,7 @@ export function handleContinueProjectCore({
   }
 
   if (result.ok) {
-    recordRecoveryAttempt(task, strategy, now);
+    if (strategy !== 'notify_po_review') recordRecoveryAttempt(task, strategy, now);
     emitEvent?.('project.continue', {
       projectId: project.id,
       taskId: task.id,
@@ -120,9 +122,9 @@ export function handleContinueProjectCore({
     intervention,
     ...result,
     ...outcomeFields(result.ok
-      ? (result.recovered ? 'submitted_for_review' : 'advanced')
+      ? (result.recovered || result.reviewNotificationNeeded ? 'submitted_for_review' : 'advanced')
       : (result.strategy === 'needs_conversation' ? 'needs_user_action' : 'not_advanced'), {
-        projectChanged: Boolean(result.ok),
+        projectChanged: Boolean(result.ok && !result.reviewNotificationNeeded),
         humanActionRequired: !result.ok && result.strategy === 'needs_conversation',
       }),
     ...(!result.ok && result.strategy === 'needs_conversation'
@@ -152,7 +154,7 @@ function buildNextActions({ project = {}, task = null } = {}) {
     id: 'repair_and_submit',
     label: '修复并提交',
     description: '补充或修正任务产物后，直接提交给项目审核流程。',
-    toolName: 'repair_project_task',
+    toolName: 'repair_project_task_from_file',
     params: {
       projectId: project.id,
       expectedPrimaryTaskId: task.id,
@@ -212,6 +214,26 @@ function recoverTaskSubmission({ project, task, intervention, recoverSubmission 
     : { ok: false, error: 'recover_submission_unavailable' };
   if (!recovered.ok) return recovered;
   return { ok: true, recovered: true, dispatched: [], taskId: task.id, result: payload };
+}
+
+function notifyPoReview({ project, task, intervention }) {
+  if (task.status !== 'submitted' || !task.result || task.reviewResult) {
+    return {
+      ok: false,
+      error: 'review_notification_not_applicable',
+      strategy: 'needs_conversation',
+      xiaokContext: buildXiaokContext({ project, intervention, task }),
+    };
+  }
+
+  return {
+    ok: true,
+    reviewNotificationNeeded: true,
+    dispatched: [],
+    taskId: task.id,
+    result: task.result,
+    fromWorker: task.result?.participantId || task.result?.agent || task.assignedAgent || 'continue_project',
+  };
 }
 
 function collectRecoverableArtifacts(task = {}, lease = {}) {
@@ -402,7 +424,7 @@ export function buildXiaokContext({ project = {}, intervention = {}, task = null
       ? `${taskTitle || '当前任务'} 卡住，后续 ${downstreamBlockedCount} 个任务正在等待。`
       : `${taskTitle || '当前任务'} 需要确认下一步。`,
     lastFailure,
-    suggestedInstruction: '请诊断失败原因；如需要提交修复产物，请调用 repair_project_task 将产物提交回项目审核。',
+    suggestedInstruction: '请诊断失败原因；如需要提交修复产物，请先把完整产物写入 artifacts 文件，再调用 repair_project_task_from_file 将文件路径提交回项目审核。',
   };
 }
 

@@ -1,8 +1,7 @@
 import { createHash } from 'node:crypto';
-import { basename, extname } from 'node:path';
+import { basename, extname, isAbsolute } from 'node:path';
 import { deriveProjectIntervention } from './project-intervention.js';
 
-const MIN_ARTIFACT_CHARS = 100;
 const PREVIEWABLE_EXTENSIONS = new Set(['.md', '.txt', '.html', '.htm', '.json', '.csv']);
 const MIME_TYPES = {
   '.md': 'text/markdown',
@@ -148,14 +147,7 @@ export function resolveProjectIntervention({
         intervention,
       }));
     }
-    const ext = extname(artifact.filename).toLowerCase();
-    submittedArtifacts.push({
-      filename: artifact.filename,
-      url: `/projects/${project.id}/artifacts/${artifact.filename}`,
-      previewable: PREVIEWABLE_EXTENSIONS.has(ext),
-      mimeType: artifact.mimeType || MIME_TYPES[ext] || 'application/octet-stream',
-      path: written?.path || null,
-    });
+    submittedArtifacts.push(buildSubmittedArtifact(project.id, artifact, written));
   }
 
   const fromAgent = String(request.fromAgent || 'human').trim() || 'human';
@@ -223,32 +215,67 @@ export function resolveProjectIntervention({
 }
 
 export function validateRepairArtifact(input = {}) {
-  const filename = String(input.filename || '').trim();
-  if (
-    !filename ||
-    filename !== basename(filename) ||
-    filename.includes('..') ||
-    filename.includes('/') ||
-    filename.includes('\\') ||
-    filename.startsWith('.') ||
-    /[\u0000-\u001f]/.test(filename)
-  ) {
-    return { ok: false, error: 'invalid_artifact_filename', status: 400, filename };
-  }
-
   const content = typeof input.content === 'string' ? input.content : '';
-  if (content.trim().length < MIN_ARTIFACT_CHARS) {
-    return { ok: false, error: 'artifact_too_small', status: 400, filename };
+  if (content.trim()) {
+    return {
+      ok: false,
+      error: 'inline_content_forbidden',
+      status: 400,
+      message: 'deliverable content must be written to an artifacts file and submitted by path',
+    };
   }
 
+  const artifactPath = String(input.artifactPath || input.relativePath || input.path || '').trim();
+  if (!artifactPath) {
+    return { ok: false, error: 'artifact_path_required', status: 400 };
+  }
+  const normalizedPath = artifactPath.replace(/\\/g, '/');
+  const segments = normalizedPath.split('/').filter(Boolean);
+  if (
+    !normalizedPath ||
+    isAbsolute(normalizedPath) ||
+    normalizedPath.includes('\0') ||
+    segments.includes('..') ||
+    segments.length === 0 ||
+    basename(normalizedPath).startsWith('.')
+  ) {
+    return { ok: false, error: 'artifact_path_escape', status: 400, path: artifactPath };
+  }
+
+  const filename = basename(normalizedPath);
   const ext = extname(filename).toLowerCase();
   return {
     ok: true,
     artifact: {
       filename,
-      content,
+      path: normalizedPath,
+      relativePath: normalizedPath.startsWith('artifacts/') ? normalizedPath : `artifacts/${normalizedPath}`,
       mimeType: input.mimeType || MIME_TYPES[ext] || 'application/octet-stream',
+      role: input.role || 'primary',
     },
+  };
+}
+
+function buildSubmittedArtifact(projectId, artifact, written = {}) {
+  const filename = written.filename || artifact.filename;
+  const relativePath = written.relativePath || artifact.relativePath || artifact.path;
+  const ext = extname(filename).toLowerCase();
+  const encodedPath = String(relativePath || `artifacts/${filename}`)
+    .replace(/^artifacts\//, '')
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+  return {
+    filename,
+    url: `/projects/${projectId}/artifacts/${encodedPath}`,
+    previewable: PREVIEWABLE_EXTENSIONS.has(ext),
+    mimeType: written.mimeType || artifact.mimeType || MIME_TYPES[ext] || 'application/octet-stream',
+    path: written.path || null,
+    relativePath,
+    size: typeof written.size === 'number' ? written.size : undefined,
+    sha256: written.sha256 || undefined,
+    generatedAt: written.generatedAt || undefined,
+    role: artifact.role || written.role || 'primary',
   };
 }
 
@@ -307,8 +334,8 @@ function fingerprintRequest(request = {}) {
   const artifacts = Array.isArray(request.artifacts)
     ? request.artifacts.map(artifact => ({
         filename: String(artifact?.filename || ''),
+        path: String(artifact?.artifactPath || artifact?.relativePath || artifact?.path || ''),
         mimeType: String(artifact?.mimeType || ''),
-        contentHash: hash(String(artifact?.content || '')),
       }))
     : [];
   return hash(JSON.stringify({

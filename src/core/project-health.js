@@ -2,6 +2,7 @@ const ACTIVE_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 
 export function deriveProjectHealth({ project = {}, tasks = [], dispatchPlan = null } = {}) {
   const counts = countStatuses(tasks);
+  const taskMap = new Map(tasks.map(task => [task.id, task]));
   const blockedTasks = tasks.filter(task => task.status === 'blocked');
 
   if (blockedTasks.length > 0) {
@@ -37,10 +38,17 @@ export function deriveProjectHealth({ project = {}, tasks = [], dispatchPlan = n
   if (dispatchPlan?.dispatchedTasks?.length > 0) {
     return { state: 'dispatchable', gate: null, counts, reasons: [] };
   }
-  if (tasks.length > 0 && tasks.every(task => ['done', 'cancelled'].includes(task.status))) {
+  if (tasks.length > 0 && tasks.every(task => isDoneForProjectCompletion(task, taskMap))) {
     return { state: project.status === 'closed' ? 'closed' : 'complete', gate: null, counts, reasons: [] };
   }
   return { state: 'idle', gate: null, counts, reasons: [] };
+}
+
+function isDoneForProjectCompletion(task = {}, taskMap) {
+  if (['done', 'cancelled'].includes(task.status)) return true;
+  if (!task.parentTaskId) return false;
+  const parent = taskMap.get(task.parentTaskId);
+  return Boolean(parent && ['done', 'cancelled'].includes(parent.status));
 }
 
 function countStatuses(tasks) {

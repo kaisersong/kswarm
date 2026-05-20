@@ -1,6 +1,7 @@
 const ACTIVE_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 const ATTENTION_STATUSES = new Set(['failed', 'blocked']);
 const DONE_STATUSES = new Set(['done', 'cancelled']);
+const MAX_AUTO_QUALITY_RETRIES = 2;
 
 export function deriveProjectIntervention({
   project = {},
@@ -84,12 +85,18 @@ function selectPrimaryCandidate({ project, tasks, taskMap, agents, dispatchPlan,
   const candidates = [];
   for (const task of tasks) {
     if (isHistoricalRetryChild(task, taskMap)) continue;
+    if (isRetryChildMaskingQualityDeadloop(task, taskMap)) continue;
 
     if (ACTIVE_STATUSES.has(task.status)) {
       if (hasUnexpiredLease(task, now)) continue;
       if (hasExpiredLease(task, now)) {
         candidates.push({ task, strategy: chooseRetryStrategy(task, agents, 'restart_then_retry'), rank: 20 });
       }
+      continue;
+    }
+
+    if (isSubmittedAwaitingReview(task)) {
+      candidates.push({ task, strategy: 'notify_po_review', rank: rankTask(task, 'notify_po_review') });
       continue;
     }
 
@@ -123,10 +130,21 @@ function isHistoricalRetryChild(task, taskMap) {
   return Boolean(parent && !ATTENTION_STATUSES.has(parent.status));
 }
 
+function isRetryChildMaskingQualityDeadloop(task, taskMap) {
+  if (!task?.parentTaskId) return false;
+  const parent = taskMap.get(task.parentTaskId);
+  if (!parent || !ATTENTION_STATUSES.has(parent.status)) return false;
+  const parentHasQualityFeedback = hasCurrentQualityRejection(parent) || hasQualityFeedback(parent);
+  return parentHasQualityFeedback && shouldEscalateQualityRepair(parent);
+}
+
 function chooseAttentionStrategy(task, agents) {
-  if (hasCurrentQualityRejection(task)) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
+  const hasCurrentQuality = hasCurrentQualityRejection(task);
+  const hasAnyQualityFeedback = hasCurrentQuality || hasQualityFeedback(task);
+  if (hasAnyQualityFeedback && shouldEscalateQualityRepair(task)) return 'needs_conversation';
+  if (hasCurrentQuality) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
   if (hasRecoverableArtifact(task)) return 'recover_submission';
-  if (hasQualityFeedback(task)) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
+  if (hasAnyQualityFeedback) return chooseRetryStrategy(task, agents, 'retry_with_repair_instruction');
   return chooseRetryStrategy(task, agents, 'retry_best_agent');
 }
 
@@ -137,11 +155,17 @@ function chooseRetryStrategy(task, agents, preferredStrategy) {
 
 function rankTask(task, strategy) {
   if (strategy === 'recover_submission') return 10;
+  if (strategy === 'notify_po_review') return 12;
+  if (strategy === 'needs_conversation' && hasQualityFeedback(task) && shouldEscalateQualityRepair(task)) return 15;
   if (strategy === 'retry_with_repair_instruction') return 20;
   if (strategy === 'restart_then_retry') return 30;
   if (strategy === 'retry_best_agent') return 40;
   if (strategy === 'needs_conversation') return 90;
   return 100;
+}
+
+function isSubmittedAwaitingReview(task = {}) {
+  return task.status === 'submitted' && Boolean(task.result) && !task.reviewResult;
 }
 
 function hasRecoverableArtifact(task) {
@@ -172,6 +196,16 @@ function hasCurrentQualityRejection(task = {}) {
   if (task.reviewResult?.passed === false) return true;
   if (String(task.lastFailureClass || '').startsWith('quality_')) return true;
   return Boolean(task.blockKind && String(task.blockKind).includes('quality'));
+}
+
+function shouldEscalateQualityRepair(task = {}) {
+  if (Number(task.qualityFailureCount || 0) > MAX_AUTO_QUALITY_RETRIES) return true;
+  return hasStartedRecovery(task, 'retry_with_repair_instruction');
+}
+
+function hasStartedRecovery(task = {}, strategy) {
+  const history = Array.isArray(task.continueRecoveryHistory) ? task.continueRecoveryHistory : [];
+  return history.some(entry => entry?.strategy === strategy && entry?.result === 'started');
 }
 
 function latestFailedReview(task = {}) {
@@ -255,6 +289,9 @@ function buildMessage({ task, strategy, downstreamBlockedCount }) {
   }
   if (strategy === 'recover_submission') {
     return `${task.title || task.id} 已有可恢复产物，可以继续推进。${suffix}`;
+  }
+  if (strategy === 'notify_po_review') {
+    return `${task.title || task.id} 已提交，等待 PO 复审；可以重新通知 PO。${suffix}`;
   }
   if (strategy === 'complete_retry_parent') {
     return `${task.title || task.id} 的重试结果已完成，可以补齐父任务状态。${suffix}`;

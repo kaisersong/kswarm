@@ -45,3 +45,36 @@ export function extractSummaryScore(synthesis) {
   }
   return null;
 }
+
+/**
+ * Extract per-task scores from synthesis text.
+ * Expected format: `- 任务标题 @执行者: X/10 — 一句话评价`
+ * @param {string} synthesis
+ * @returns {Array<{ title: string; agent: string; score: number; comment: string }> | null}
+ */
+export function extractTaskScores(synthesis) {
+  if (!synthesis) return null;
+  // Locate the "### 任务评分" or "### Task Scores" section
+  const sectionMatch = synthesis.match(/^###\s*(?:任务评分|Task Scores)[^\n]*\n([\s\S]+)/mi);
+  if (!sectionMatch) return null;
+  // Truncate at next heading of same or higher level
+  let section = sectionMatch[1].replace(/\n#{1,3}\s[^#][\s\S]*$/, '').trim();
+  if (!section) return null;
+
+  const results = [];
+  // Strip markdown bold/code formatting
+  const cleaned = section.replace(/\*\*/g, '').replace(/\*/g, '').replace(/`/g, '');
+  // Match each line: - title @agent: score/10 — comment
+  const linePattern = /^-\s+(.+?)\s+@([^:：]+)[:：]\s*(\d+)\s*\/\s*10\s*[—\-–]\s*(.+)$/gm;
+  let m;
+  while ((m = linePattern.exec(cleaned)) !== null) {
+    const score = parseInt(m[3], 10);
+    results.push({
+      title: m[1].trim(),
+      agent: m[2].trim(),
+      score: Math.min(10, Math.max(1, score)),
+      comment: m[4].trim(),
+    });
+  }
+  return results.length > 0 ? results : null;
+}

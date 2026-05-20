@@ -5,8 +5,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import test from 'node:test';
 import { createHub } from '../src/core/hub.js';
@@ -55,12 +55,17 @@ function setupFailedProject({ bridge = null } = {}) {
 
 function tempArtifactWriter() {
   const dir = mkdtempSync(join(tmpdir(), 'kswarm-resolve-'));
+  const artifactsDir = join(dir, 'artifacts');
+  mkdirSync(artifactsDir, { recursive: true });
   return {
     dir,
-    writeArtifact: ({ filename, content }) => {
-      const path = join(dir, filename);
-      writeFileSync(path, content, 'utf8');
-      return { ok: true, path };
+    artifactsDir,
+    writeArtifact: ({ path, relativePath, artifactPath }) => {
+      const requested = String(path || relativePath || artifactPath || '');
+      const filename = basename(requested);
+      const fullPath = join(artifactsDir, filename);
+      if (!existsSync(fullPath)) return { ok: false, error: 'artifact_missing', status: 404 };
+      return { ok: true, filename, path: fullPath, relativePath: `artifacts/${filename}`, size: readFileSync(fullPath).length };
     },
   };
 }
@@ -70,6 +75,7 @@ test('repair_and_submit writes artifact, recovers failed task, and notifies revi
   const bridge = { send: message => sent.push(message) };
   const { hub, project, task } = setupFailedProject({ bridge });
   const writer = tempArtifactWriter();
+  writeFileSync(join(writer.artifactsDir, 'foreign_trade_trend.md'), STORY, 'utf8');
 
   const result = hub.handleResolveProjectIntervention(project.id, {
     idempotencyKey: 'repair-submit-1',
@@ -79,7 +85,7 @@ test('repair_and_submit writes artifact, recovers failed task, and notifies revi
     expectedTaskUpdatedAt: task.updatedAt,
     summary: '已补齐外贸趋势分析初稿',
     artifacts: [
-      { filename: 'foreign_trade_trend.md', mimeType: 'text/markdown', content: STORY },
+      { path: 'artifacts/foreign_trade_trend.md', mimeType: 'text/markdown' },
     ],
   }, writer);
 
@@ -91,8 +97,9 @@ test('repair_and_submit writes artifact, recovers failed task, and notifies revi
   assert.equal(updated.status, 'submitted');
   assert.equal(updated.recoveryReason, 'intervention_repair_and_submit');
   assert.equal(updated.result.artifacts[0].filename, 'foreign_trade_trend.md');
-  assert.equal(existsSync(join(writer.dir, 'foreign_trade_trend.md')), true);
-  assert.match(readFileSync(join(writer.dir, 'foreign_trade_trend.md'), 'utf8'), /人工干预补全/);
+  assert.equal(updated.result.artifacts[0].relativePath, 'artifacts/foreign_trade_trend.md');
+  assert.equal(existsSync(join(writer.artifactsDir, 'foreign_trade_trend.md')), true);
+  assert.match(readFileSync(join(writer.artifactsDir, 'foreign_trade_trend.md'), 'utf8'), /人工干预补全/);
   const reviewMessages = sent.filter(message => message.kind === 'review_submission');
   assert.equal(reviewMessages.length, 1);
   assert.equal(reviewMessages[0].toParticipantId, 'po');
@@ -109,7 +116,7 @@ test('repair_and_submit rejects stale task state without writing artifacts', () 
     expectedPrimaryTaskId: task.id,
     expectedTaskUpdatedAt: task.updatedAt - 1,
     artifacts: [
-      { filename: 'foreign_trade_trend.md', content: STORY },
+      { path: 'artifacts/foreign_trade_trend.md' },
     ],
   }, writer);
 
@@ -117,18 +124,17 @@ test('repair_and_submit rejects stale task state without writing artifacts', () 
   assert.equal(result.error, 'task_state_changed');
   assert.equal(result.status, 409);
   assert.equal(result.projectChanged, false);
-  assert.equal(existsSync(join(writer.dir, 'foreign_trade_trend.md')), false);
   assert.equal(hub.getBoard(project.id).getTask(task.id).status, 'failed');
 });
 
-test('repair_and_submit rejects unsafe or empty artifact filenames', () => {
+test('repair_and_submit rejects unsafe, missing, and inline artifacts', () => {
   const { hub, project, task } = setupFailedProject();
   const writer = tempArtifactWriter();
 
   const cases = [
-    { filename: '../escape.md', content: STORY, error: 'invalid_artifact_filename' },
-    { filename: '.hidden.md', content: STORY, error: 'invalid_artifact_filename' },
-    { filename: 'tiny.md', content: 'too short', error: 'artifact_too_small' },
+    { path: '../escape.md', error: 'artifact_path_escape' },
+    { path: 'artifacts/missing.md', error: 'artifact_missing' },
+    { filename: 'inline.md', content: STORY, error: 'inline_content_forbidden' },
   ];
 
   for (const [index, artifact] of cases.entries()) {
@@ -151,6 +157,8 @@ test('repair_and_submit rejects unsafe or empty artifact filenames', () => {
 test('repair_and_submit is idempotent for same request and rejects same key with different payload', () => {
   const { hub, project, task } = setupFailedProject();
   const writer = tempArtifactWriter();
+  writeFileSync(join(writer.artifactsDir, 'foreign_trade_trend.md'), STORY, 'utf8');
+  writeFileSync(join(writer.artifactsDir, 'foreign_trade_trend_v2.md'), `${STORY}\n\n新内容`, 'utf8');
   const request = {
     idempotencyKey: 'repair-idempotent',
     resolution: 'repair_and_submit',
@@ -158,7 +166,7 @@ test('repair_and_submit is idempotent for same request and rejects same key with
     expectedPrimaryTaskId: task.id,
     expectedTaskUpdatedAt: task.updatedAt,
     artifacts: [
-      { filename: 'foreign_trade_trend.md', content: STORY },
+      { path: 'artifacts/foreign_trade_trend.md' },
     ],
   };
 
@@ -167,7 +175,7 @@ test('repair_and_submit is idempotent for same request and rejects same key with
   const conflict = hub.handleResolveProjectIntervention(project.id, {
     ...request,
     artifacts: [
-      { filename: 'foreign_trade_trend.md', content: `${STORY}\n\n新内容` },
+      { path: 'artifacts/foreign_trade_trend_v2.md' },
     ],
   }, writer);
 
@@ -187,6 +195,7 @@ test('repair_and_submit succeeds when review notification fails but reports the 
   };
   const { hub, project, task } = setupFailedProject({ bridge });
   const writer = tempArtifactWriter();
+  writeFileSync(join(writer.artifactsDir, 'foreign_trade_trend.md'), STORY, 'utf8');
 
   const result = hub.handleResolveProjectIntervention(project.id, {
     idempotencyKey: 'repair-notify-failed',
@@ -195,7 +204,7 @@ test('repair_and_submit succeeds when review notification fails but reports the 
     expectedPrimaryTaskId: task.id,
     expectedTaskUpdatedAt: task.updatedAt,
     artifacts: [
-      { filename: 'foreign_trade_trend.md', content: STORY },
+      { path: 'artifacts/foreign_trade_trend.md' },
     ],
   }, writer);
 

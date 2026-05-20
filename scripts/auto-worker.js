@@ -23,6 +23,7 @@ import {
   validateTaskResultAgainstContract,
 } from '../src/core/execution-contract.js';
 import { extractDeclaredArtifacts } from '../src/core/artifact-extractor.js';
+import { selectReviewArtifacts } from '../src/core/artifact-manifest.js';
 import { buildArtifactRepairPrompt, classifyGeneratedArtifact } from '../src/core/artifact-quality.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
@@ -238,6 +239,21 @@ function isTaskAssignedToRuntime(task) {
     (task.assignedRuntimeInstance === AGENT_ID ||
       (!task.assignedRuntimeInstance && task.assignedAgent === LOGICAL_AGENT_ID))
   );
+}
+
+function isProjectAllDoneForDelivery(tasks = []) {
+  if (!Array.isArray(tasks) || tasks.length === 0) return false;
+  const taskById = new Map(tasks.map(task => [task.id, task]));
+  return tasks.every(task => {
+    if (task.status === 'done' || task.status === 'cancelled') return true;
+    return isHistoricalRetryChildResolved(task, taskById);
+  });
+}
+
+function isHistoricalRetryChildResolved(task, taskById) {
+  if (!task?.parentTaskId) return false;
+  const parent = taskById.get(task.parentTaskId);
+  return Boolean(parent && (parent.status === 'done' || parent.status === 'cancelled'));
 }
 
 // ─── CLI Harness: spawn real CLI binaries (multica-aligned) ───────────────────
@@ -1128,26 +1144,31 @@ async function qualityReviewTask(projectId, taskId, result) {
     }
   } catch (_) {}
 
-  // Read actual artifact content
+  // Read artifact evidence. Snippets are only evidence previews; manifests decide identity.
   let artifactContent = '';
   try {
     const artRes = await fetch(`${KSWARM_API}/projects/${projectId}/artifacts`);
     if (artRes.ok) {
       const artData = await artRes.json();
-      const resultArtifactNames = new Set((result?.artifacts || []).map(a => a.filename || a).filter(Boolean));
-      const artifacts = (artData.artifacts || []).filter(a =>
-        resultArtifactNames.has(a.filename) ||
-        a.filename.includes(taskId) ||
-        (taskLocalId && a.filename.includes(taskLocalId)) ||
-        a.filename.includes(taskTitle.replace(/\s+/g, '-'))
-      );
+      const submittedArtifacts = [
+        ...(Array.isArray(result?.artifacts) ? result.artifacts : []),
+        ...(Array.isArray(result?.artifactManifest) ? result.artifactManifest : []),
+      ];
+      const artifacts = selectReviewArtifacts({
+        submittedArtifacts,
+        availableArtifacts: artData.artifacts || [],
+        taskId,
+        taskLocalId,
+        taskTitle,
+      });
 
       for (const art of artifacts.slice(0, 3)) {
         try {
           const contentRes = await fetch(`${KSWARM_API}${art.url}`);
           if (contentRes.ok) {
             const text = await contentRes.text();
-            artifactContent += `\n--- ${art.filename} ---\n${text.slice(0, 4000)}\n`;
+            const snippet = text.slice(0, 4000);
+            artifactContent += `\n--- ${art.filename} (snippet only, truncated=${text.length > snippet.length}, selection=${art.selectionReason || 'submitted_manifest'}) ---\n${snippet}\n`;
           }
         } catch (_) {}
       }
@@ -1156,7 +1177,10 @@ async function qualityReviewTask(projectId, taskId, result) {
 
   // Also check the result payload for content
   const resultSummary = result?.summary || result?.output || '';
-  const resultArtifacts = result?.artifacts?.map(a => a.filename || a).join(', ') || 'none';
+  const resultArtifacts = [
+    ...(Array.isArray(result?.artifacts) ? result.artifacts : []),
+    ...(Array.isArray(result?.artifactManifest) ? result.artifactManifest : []),
+  ].map(a => a.filename || a.relativePath || a.path || a).join(', ') || 'none';
 
   const lang = detectLanguage(goal);
   const langInstr = getLanguageInstruction(lang);
@@ -1177,13 +1201,14 @@ ${requirements ? `- 项目要求：${requirements.slice(0, 500)}` : ''}
 ## 提交结果
 - 摘要：${resultSummary.slice(0, 500)}
 - 产出物文件：${resultArtifacts}
-${artifactContent ? `\n## 产出物实际内容\n${artifactContent.slice(0, 6000)}` : ''}
+${artifactContent ? `\n## 产出物证据片段（不是完整正文）\n${artifactContent.slice(0, 6000)}` : ''}
 
 ## 验收评估要求
-1. 仔细阅读产出物内容（不只是看文件名）
-2. 对照验收标准逐项检查
-3. 判断内容是否有实质性、专业性
-4. 给出具体的反馈意见
+1. 片段只用于定位，不能因为片段结束就判断原文件截断
+2. 优先基于提交的 manifest 文件身份进行审核，不要混入旧文件
+3. 对照验收标准逐项检查
+4. 判断内容是否有实质性、专业性
+5. 给出具体的反馈意见
 
 ## 输出格式
 输出严格 JSON（无 markdown 代码块）：
@@ -1202,13 +1227,14 @@ ${requirements ? `- Requirements: ${requirements.slice(0, 500)}` : ''}
 ## Submission
 - Summary: ${resultSummary.slice(0, 500)}
 - Artifacts: ${resultArtifacts}
-${artifactContent ? `\n## Artifact Content\n${artifactContent.slice(0, 6000)}` : ''}
+${artifactContent ? `\n## Artifact Evidence Snippets (not full content)\n${artifactContent.slice(0, 6000)}` : ''}
 
 ## Review Requirements
-1. Read actual content (not just filenames)
-2. Check against acceptance criteria
-3. Evaluate substance and quality
-4. Give specific feedback
+1. Snippets are only evidence previews; do not infer truncation from snippet boundaries
+2. Review only the submitted manifest files, not stale fuzzy matches
+3. Check against acceptance criteria
+4. Evaluate substance and quality
+5. Give specific feedback
 
 ## Output Format
 Strict JSON (no markdown fences):
@@ -1375,6 +1401,7 @@ async function synthesizeProject(projectId) {
   // Read plan and all artifacts
   let planText = '';
   let allArtifactContent = '';
+  let taskListText = '';
   let enableSummary = true; // default true for backwards compatibility
   try {
     const projRes = await fetch(`${KSWARM_API}/projects/${projectId}`);
@@ -1389,6 +1416,15 @@ async function synthesizeProject(projectId) {
       // Plan info
       if (projData.plan) {
         planText = `成功标准：${(projData.plan.successCriteria || []).join('、')}`;
+      }
+
+      // Task list for per-task scoring
+      const tasks = projData.tasks || [];
+      if (tasks.length > 0) {
+        taskListText = tasks
+          .filter(t => t.title && t.status === 'done')
+          .map(t => `- ${t.title} @${t.assignedAgent || 'unknown'}`)
+          .join('\n');
       }
 
       // Read all artifacts
@@ -1414,6 +1450,7 @@ ${langInstr}
 ${goal}
 ${requirements ? `\n## 项目要求\n${requirements}` : ''}
 ${planText ? `\n## 计划\n${planText}` : ''}
+${taskListText ? `\n## 已完成任务\n${taskListText}` : ''}
 
 ## 所有产出物
 ${allArtifactContent.slice(0, 12000) || '无可读取的产出物'}
@@ -1431,6 +1468,7 @@ ${langInstr}
 ${goal}
 ${requirements ? `\n## Requirements\n${requirements}` : ''}
 ${planText ? `\n## Plan\n${planText}` : ''}
+${taskListText ? `\n## Completed Tasks\n${taskListText}` : ''}
 
 ## All Artifacts
 ${allArtifactContent.slice(0, 12000) || 'No readable artifacts'}
@@ -1454,6 +1492,12 @@ ${allArtifactContent.slice(0, 12000) || 'No readable artifacts'}
 ### 评分
 给出项目整体评分（1-10），并简述理由。评分格式必须严格为"评分: X/10"，不要加任何修饰符号。
 
+### 任务评分
+对每个已完成任务逐一评分（1-10），格式必须严格为：
+- 任务标题 @执行者: X/10 — 一句话评价
+
+评分依据：产出质量、完整性、是否满足任务目标。
+
 ### 遵循的原则
 列出本项目实际遵循了哪些原则（从项目要求中提取），并评价每条原则的实际效果：
 - 原则内容 → 效果评价（有效/部分有效/未体现）
@@ -1472,6 +1516,12 @@ At the end of the synthesis document, output a structured summary under the head
 
 ### Score
 Rate the project overall (1-10) with a brief rationale. Score format must be exactly "Score: X/10" with no additional formatting.
+
+### Task Scores
+Rate each completed task individually (1-10), format must be exactly:
+- Task title @agent: X/10 — one-line assessment
+
+Score based on: output quality, completeness, whether task objectives were met.
 
 ### Principles Followed
 List which principles from the requirements were actually followed, and evaluate each:
@@ -1837,7 +1887,7 @@ async function handleApprovalReceived(projectId) {
         if (projRes.ok) {
           const projData = await projRes.json();
           const tasks = projData.tasks || [];
-          const allDone = tasks.length > 0 && tasks.every(t => t.status === 'done' || t.status === 'cancelled');
+          const allDone = isProjectAllDoneForDelivery(tasks);
           if (allDone && projData.project?.status === 'active') {
             console.log(`[${ALIAS}]   → All tasks done — starting synthesis`);
             await synthesizeProject(projectId);
@@ -2119,7 +2169,32 @@ async function doTask(taskId, payload) {
 
   const declaredArtifacts = extractDeclaredArtifacts(artifactContent, { taskId });
   if (declaredArtifacts.artifacts.length > 0) {
-    artifactContent = declaredArtifacts.cleanedContent || artifactContent;
+    const errorMessage = `Inline artifact content is forbidden for "${title}"; write deliverables to artifacts/ files and submit only paths/manifests.`;
+    console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
+    reportStatus('idle');
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'failed',
+      errorMessage,
+    });
+    await client.sendIntent({
+      kind: 'task_failed',
+      taskId,
+      threadId: `thread-${taskId}`,
+      payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        failureReason: 'inline_artifact_forbidden',
+        errorMessage,
+      },
+    });
+    stopRunTelemetry();
+    return;
   }
 
   const artifactFiles = [
@@ -2138,6 +2213,8 @@ async function doTask(taskId, payload) {
   }
 
   const artifactFilenames = artifactFiles.map(file => file.filename);
+  let artifactManifest = [];
+  let submittedArtifacts = [];
 
   // Write artifacts to project workFolder directly (if available)
   if (workFolder) {
@@ -2147,39 +2224,58 @@ async function doTask(taskId, payload) {
       writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
     }
     noteArtifact();
+    artifactManifest = buildArtifactManifest(workFolder, artifactFilenames, {
+      projectId,
+      taskId,
+      role: 'primary',
+      producedBy: { agentId: AGENT_ID, source: 'worker' },
+    });
     writeTaskJournal(workFolder, {
       projectId,
       taskId,
       localTaskId,
       runId,
       status: 'artifact_written',
-      artifactManifest: buildArtifactManifest(workFolder, artifactFilenames),
+      artifactManifest,
     });
+    submittedArtifacts = artifactManifest.map(artifact => ({
+      filename: artifact.filename,
+      url: artifact.url || `/projects/${projectId}/artifacts/${encodeURIComponent(artifact.filename)}`,
+      previewable: filePreviewable(artifact.filename),
+      mimeType: artifact.mimeType,
+      path: artifact.path,
+      relativePath: artifact.relativePath,
+      size: artifact.size,
+      sha256: artifact.sha256,
+      generatedAt: artifact.generatedAt,
+      role: artifact.role,
+    }));
     console.log(`[${ALIAS}]   → Written to workFolder: ${artifactFilenames.map(name => `${artifactsDir}/${name}`).join(', ')}`);
   }
 
-  // Upload artifacts to server
-  const submittedArtifacts = [];
-  for (const file of artifactFiles) {
-    let artifactUrl = `/artifacts/${file.filename}`;
-    try {
-      const uploadRes = await fetch(`${KSWARM_API}/artifacts`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ filename: file.filename, content: file.content, projectId }),
+  // Legacy fallback only when no project workFolder was provided.
+  if (!workFolder) {
+    for (const file of artifactFiles) {
+      let artifactUrl = `/artifacts/${file.filename}`;
+      try {
+        const uploadRes = await fetch(`${KSWARM_API}/artifacts`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ filename: file.filename, content: file.content, projectId }),
+        });
+        const uploadData = await uploadRes.json();
+        if (uploadData.artifact?.url) artifactUrl = uploadData.artifact.url;
+        console.log(`[${ALIAS}]   → Artifact saved: ${uploadData.artifact?.filename} (${uploadData.artifact?.path || 'unknown'})`);
+      } catch (err) {
+        console.log(`[${ALIAS}]   ⚠ Failed to upload artifact: ${err.message}`);
+      }
+      submittedArtifacts.push({
+        filename: file.filename,
+        url: artifactUrl,
+        previewable: file.previewable,
+        mimeType: file.mimeType,
       });
-      const uploadData = await uploadRes.json();
-      if (uploadData.artifact?.url) artifactUrl = uploadData.artifact.url;
-      console.log(`[${ALIAS}]   → Artifact saved: ${uploadData.artifact?.filename} (${uploadData.artifact?.path || 'unknown'})`);
-    } catch (err) {
-      console.log(`[${ALIAS}]   ⚠ Failed to upload artifact: ${err.message}`);
     }
-    submittedArtifacts.push({
-      filename: file.filename,
-      url: artifactUrl,
-      previewable: file.previewable,
-      mimeType: file.mimeType,
-    });
   }
 
   const summarySource = [
@@ -2195,6 +2291,7 @@ async function doTask(taskId, payload) {
     summary: buildResultSummary(title, summarySource),
     participantId: AGENT_ID,
     artifacts: submittedArtifacts,
+    artifactManifest,
     delivery: { semantic: 'document', source: ALIAS },
     ...(reviewEvidence ? { reviewEvidence } : {}),
   };
@@ -2210,7 +2307,7 @@ async function doTask(taskId, payload) {
       localTaskId,
       runId,
       status: 'failed',
-      artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+      artifactManifest,
       errorMessage,
     });
     await client.sendIntent({
@@ -2238,7 +2335,7 @@ async function doTask(taskId, payload) {
     localTaskId,
     runId,
     status: 'submitting',
-    artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+    artifactManifest,
     submission: { attemptedAt: Date.now(), ackedAt: null, lastError: null },
   });
   await client.sendIntent({
@@ -2255,7 +2352,7 @@ async function doTask(taskId, payload) {
     localTaskId,
     runId,
     status: 'submitted',
-    artifactManifest: workFolder ? buildArtifactManifest(workFolder, artifactFilenames) : undefined,
+    artifactManifest,
     submission: { attemptedAt: Date.now(), ackedAt: Date.now(), lastError: null },
   });
   reportStatus('idle');
@@ -2264,8 +2361,12 @@ async function doTask(taskId, payload) {
   // If we are PO for this project, quality review (not just auto-confirm)
   if (projectId && poProjects.has(projectId)) {
     await sleep(500);
-    await qualityReviewTask(projectId, taskId, { summary: `Self-completed task: ${title}` });
+    await qualityReviewTask(projectId, taskId, resultPayload);
   }
+}
+
+function filePreviewable(filename) {
+  return /\.(md|markdown|txt|html|htm|json|csv|svg)$/i.test(filename || '');
 }
 
 function buildExecutionContractPrompt(task) {
@@ -2344,11 +2445,7 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`4. 如果是对抗性评审：必须提出至少 5 个具体质疑点，每个要说明为什么是问题、建议如何改进`);
     parts.push(`5. 如果是修订：必须逐条回应评审意见，说明采纳/不采纳的理由和对应修改`);
     parts.push(`6. 禁止输出"已完成"、"模拟"、"假设完成"等敷衍内容`);
-    parts.push(`7. 如果任务要求交付具体文件（例如 JSON、CSV、HTML、故事正文、修订稿、变更日志），必须使用独立产物块输出核心文件，格式如下：
-~~~artifact path=filename.ext
-文件完整内容
-~~~
-只写交付报告不算完成；核心产物必须放进 artifact path= 产物块中。`);
+    parts.push(`7. 文件优先交付：如果任务要求交付具体文件（例如 JSON、CSV、HTML、故事正文、修订稿、变更日志），必须把完整交付物写入 artifacts/ 目录中的实际文件。不要在回复、stdout、tool 参数或聊天消息中粘贴完整交付物；只返回文件名、路径、大小、hash 或简短摘要。`);
   } else {
     parts.push(`You are a professional technical agent executing a task. You must produce substantive, in-depth deliverables.`);
     parts.push(`\n## Task`);
@@ -2370,11 +2467,7 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`4. For adversarial reviews: at least 5 specific critique points with rationale and suggestions`);
     parts.push(`5. For revisions: address each review point explicitly with accept/reject reasoning`);
     parts.push(`6. Never output placeholder text like "completed" or "simulated"`);
-    parts.push(`7. If the task requires concrete files such as JSON, CSV, HTML, a story draft, a revised draft, or a change log, output the core files as separate artifact blocks:
-~~~artifact path=filename.ext
-full file content
-~~~
-A delivery report alone is not enough; the core deliverables must be inside artifact path= blocks.`);
+    parts.push(`7. File-first delivery: if the task requires concrete files such as JSON, CSV, HTML, a story draft, a revised draft, or a change log, write the complete deliverables to real files under artifacts/. Do not paste full deliverables into replies, stdout, tool arguments, or chat messages; return only filenames, paths, sizes, hashes, or a short summary.`);
   }
 
   if (workFolderContext) {
@@ -2402,11 +2495,8 @@ ${langInstr}
 交付要求：
 1. 使用 Markdown 格式
 2. 内容要具体、专业，像真正完成了这项工作一样
-3. 如果任务要求具体文件，必须使用如下产物块输出文件：
-~~~artifact path=filename.ext
-文件完整内容
-~~~
-4. 只写交付报告不算完成；核心产物必须放进 artifact path= 产物块中
+3. 文件优先交付：如果任务要求具体文件，必须把完整交付物写入 artifacts/ 目录中的实际文件
+4. 不要在回复、stdout、tool 参数或聊天消息中粘贴完整交付物；只返回文件名、路径、大小、hash 或简短摘要
 5. 可以附简短摘要，但不能用摘要替代核心文件
 6. 不要写"模拟"或"假设"之类的词，就像真正完成了工作一样
 7. 严格遵循项目目标和要求中的原则与约束${workFolderContext ? '\n8. 基于项目目录中的参考文件内容进行工作' : ''}`
@@ -2751,11 +2841,14 @@ async function poHealthCheck() {
         }
       }
 
-      // If no tasks are actively running but there are pending tasks, trigger dispatch
+      // If no tasks are actively running, recover missed dispatch/synthesis triggers.
       if (!hasStuckOrActive) {
         const hasPending = tasks.some(t => t.status === 'pending');
-        const allDone = tasks.length > 0 && tasks.every(t => t.status === 'done' || t.status === 'cancelled');
-        if (hasPending && !allDone) {
+        const allDone = isProjectAllDoneForDelivery(tasks);
+        if (allDone) {
+          console.log(`[${ALIAS}] Project "${proj.name}" is all done but not delivered — triggering synthesis`);
+          await synthesizeProject(proj.id);
+        } else if (hasPending) {
           console.log(`[${ALIAS}] Project "${proj.name}" has pending tasks but nothing running — triggering dispatch`);
           await handleApprovalReceived(proj.id);
         }
@@ -2768,6 +2861,7 @@ async function poHealthCheck() {
 
 // Start health monitor after initial startup
 setTimeout(() => {
+  void poHealthCheck();
   setInterval(poHealthCheck, PO_HEALTH_INTERVAL);
   console.log(`[${ALIAS}] PO health monitor started (interval: ${PO_HEALTH_INTERVAL / 1000}s, threshold: ${STUCK_THRESHOLD / 1000}s)`);
 }, 5000);

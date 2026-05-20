@@ -220,6 +220,69 @@ test('durable artifact recovery uses task result artifacts when lease manifest i
   assert.equal(task.result.artifacts[0].filename, 'data_sources_assumptions.json');
 });
 
+test('continue resends PO review notification for submitted task without mutating result', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const task = getTask(hub);
+  const submittedResult = {
+    summary: 'OpenAI 本月分析报告',
+    artifactManifest: [{ filename: 'openai_monthly_report_v38.md', path: 'artifacts/openai_monthly_report_v38.md' }],
+  };
+  task.status = 'submitted';
+  task.result = submittedResult;
+  task.reviewResult = null;
+  task.updatedAt = Date.now();
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: task.id,
+    expectedTaskUpdatedAt: task.updatedAt,
+    idempotencyKey: 'continue-notify-review',
+  });
+
+  const after = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'notify_po_review');
+  assert.equal(result.outcome, 'submitted_for_review');
+  assert.equal(result.reviewNotificationNeeded, true);
+  assert.equal(result.taskId, task.id);
+  assert.deepEqual(result.result, submittedResult);
+  assert.equal(after.status, 'submitted');
+  assert.strictEqual(after.result, submittedResult);
+  assert.equal(after.reviewResult, null);
+  assert.deepEqual(result.dispatched, []);
+});
+
+test('continue review notification is idempotent and does not consume retry budget', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const task = getTask(hub);
+  task.status = 'submitted';
+  task.result = {
+    summary: 'Submitted report',
+    artifacts: [{ filename: 'report.md', path: 'artifacts/report.md' }],
+  };
+  task.reviewResult = null;
+  task.updatedAt = Date.now();
+
+  const first = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: task.id,
+    expectedTaskUpdatedAt: task.updatedAt,
+    idempotencyKey: 'continue-notify-review-repeat',
+  });
+  const second = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: task.id,
+    expectedTaskUpdatedAt: task.updatedAt,
+    idempotencyKey: 'continue-notify-review-repeat',
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(second.idempotent, true);
+  assert.equal(second.strategy, 'notify_po_review');
+  assert.equal(getTask(hub).status, 'submitted');
+  assert.deepEqual(getTask(hub).continueRecoveryHistory || [], []);
+});
+
 test('continue retries rejected recovered artifact instead of resubmitting it', () => {
   const hub = createTestHub();
   setupProject(hub);
@@ -375,7 +438,7 @@ test('recovery budget prevents repeating the same failed strategy', () => {
   assert.equal(getTask(hub).status, 'failed');
 });
 
-test('budget exceeded returns explicit needs_user_action next action without mutating project', () => {
+test('escalated quality recovery returns explicit needs_user_action next action without mutating project', () => {
   const hub = createTestHub();
   setupProject(hub);
   const failed = failRootTask(hub, 'quality_content_failed', '质量不达标');
@@ -393,12 +456,12 @@ test('budget exceeded returns explicit needs_user_action next action without mut
 
   const task = getTask(hub);
   assert.equal(result.ok, false);
-  assert.equal(result.error, 'recovery_budget_exceeded');
+  assert.equal(result.error, 'needs_conversation');
   assert.equal(result.outcome, 'needs_user_action');
   assert.equal(result.projectChanged, false);
   assert.equal(result.humanActionRequired, true);
   assert.equal(result.nextActions[0].id, 'repair_and_submit');
-  assert.equal(result.nextActions[0].toolName, 'repair_project_task');
+  assert.equal(result.nextActions[0].toolName, 'repair_project_task_from_file');
   assert.equal(result.nextActions[0].params.projectId, 'proj-continue');
   assert.equal(result.nextActions[0].params.expectedPrimaryTaskId, failed.id);
   assert.equal(result.nextActions[0].params.expectedTaskUpdatedAt, failed.updatedAt);
