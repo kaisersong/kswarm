@@ -47,6 +47,38 @@ test('dispatch planning uses pooled Xiaok worker capacity before waiting', () =>
   assert.equal(plan.projectGate, null);
 });
 
+test('dispatch planning treats unprobed xiaok runtime workers as spawnable when capabilities match', () => {
+  const plan = planDispatch({
+    projectId: 'proj-xiaok',
+    tasks: [
+      {
+        id: 'proj-xiaok__report',
+        title: '撰写报告',
+        status: 'pending',
+        assignedAgent: 'xiaok-worker',
+        dependencies: [],
+        requiredOutputs: [{ type: 'markdown', enforcement: 'hard' }],
+      },
+    ],
+    agentProfiles: [
+      {
+        id: 'xiaok-worker',
+        runtimeType: 'xiaok',
+        roles: ['worker'],
+        runtimeHealth: createUnknownRuntimeHealth({
+          outputCapabilities: ['markdown', 'html'],
+          taskCapabilities: ['coding', 'testing', 'design', 'planning'],
+        }),
+      },
+    ],
+    agentConcurrency: { 'xiaok-worker': 3 },
+  });
+
+  assert.deepEqual(plan.dispatchedTasks.map(task => task.id), ['proj-xiaok__report']);
+  assert.deepEqual(plan.skipped, []);
+  assert.equal(plan.projectGate, null);
+});
+
 test('dispatch planning reports Xiaok capacity wait after pooled capacity is full', () => {
   const plan = planDispatch({
     projectId: 'proj-c',

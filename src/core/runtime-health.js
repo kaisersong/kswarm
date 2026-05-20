@@ -119,7 +119,8 @@ export function isRoutable(agent = {}, requiredCapabilities = [], requiredOutput
   if (state === 'cooldown' && (!health.cooldownUntil || now < health.cooldownUntil)) {
     return { ok: false, reason: 'runtime_cooldown' };
   }
-  if (!ROUTABLE_STATES.has(state)) {
+  const spawnableLocalRuntime = agent.runtimeType === 'xiaok' || agent.runtimeType === 'builtin';
+  if (!ROUTABLE_STATES.has(state) && !(spawnableLocalRuntime && state === 'unknown')) {
     return { ok: false, reason: `runtime_${state}` };
   }
 
