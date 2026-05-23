@@ -37,6 +37,11 @@ function setup(options = {}) {
   return hub;
 }
 
+const RECOVERED_RESEARCH_SUMMARY = [
+  'Recovered artifact includes the completed research findings, evidence notes, assumptions,',
+  'and the concrete synthesis inputs required for the dependent task to continue after PO review.',
+].join(' ');
+
 test('cancelled task can recover to submitted with result and audit fields', () => {
   const hub = setup();
   const board = hub.getBoard('proj-recover');
@@ -51,7 +56,8 @@ test('cancelled task can recover to submitted with result and audit fields', () 
   assert.equal(result.ok, true);
   const task = board.getTask('item-1');
   assert.equal(task.status, 'submitted');
-  assert.equal(task.result.summary, 'Recovered artifact');
+  assert.match(task.result.summary, /item-1-report\.md/);
+  assert.ok(task.result.summary.length >= 50);
   assert.equal(task.recoveredFromStatus, 'cancelled');
   assert.equal(task.recoveredBy, 'worker');
   assert.equal(task.activeRunId, null);
@@ -69,7 +75,7 @@ test('recovered submission must pass review before dependency dispatches', () =>
   const board = hub.getBoard('proj-recover');
   board.transition('item-1', 'dispatched');
   board.transition('item-1', 'cancelled');
-  hub.handleRecoverSubmission('proj-recover', 'item-1', { summary: 'Recovered artifact' }, 'worker');
+  hub.handleRecoverSubmission('proj-recover', 'item-1', { summary: RECOVERED_RESEARCH_SUMMARY }, 'worker');
 
   let dispatch = hub.handleRequestDispatch('proj-recover', 'po');
   assert.deepEqual(dispatch.dispatched, []);
@@ -122,7 +128,8 @@ test('recover notifies PO through result submitted bridge event', () => {
   assert.equal(submitted.length, 1);
   assert.equal(submitted[0].toParticipantId, 'po');
   assert.equal(submitted[0].taskId, 'proj-recover__item-1');
-  assert.equal(submitted[0].payload.result, resultPayload);
+  assert.match(submitted[0].payload.result.summary, /item-1-report\.md/);
+  assert.deepEqual(submitted[0].payload.result.artifacts, resultPayload.artifacts);
 });
 
 test('recover clears current failed review result but keeps review history', () => {

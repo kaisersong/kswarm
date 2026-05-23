@@ -9,7 +9,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
@@ -17,6 +17,36 @@ import { createUnknownRuntimeHealth, recordRuntimeSuccess } from './runtime-heal
 
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const AGENTS_FILE = join(KSWARM_HOME, 'agents.json');
+const XIAOK_PO_SEED_ID = 'xiaok-po';
+const XIAOK_WORKER_SEED_ID = 'xiaok-worker';
+const DESKTOP_AGENT_RUNTIME_SOURCE = 'desktop-agent-runtime';
+const XIAOK_FULL_TASK_CAPABILITIES = [
+  'coding',
+  'testing',
+  'qa',
+  'design',
+  'planning',
+  'research',
+  'analysis',
+  'source_research',
+  'web_research',
+  'writing',
+  'documentation',
+  'review',
+  'product',
+  'requirements',
+  'architecture',
+  'system-design',
+  'engineering',
+  'devops',
+  'deployment',
+  'data_analysis',
+  'report_generation',
+  'presentation_generation',
+  'presentation_content',
+  'slide_generation',
+];
+const XIAOK_DIRECT_OUTPUT_CAPABILITIES = ['markdown', 'html', 'report_html', 'text', 'json', 'csv'];
 
 // ─── Agent Schema ─────────────────────────────────────────────────────────────
 // Aligned with multica's Agent model
@@ -173,65 +203,97 @@ function _detectEnvLLM() {
 
 // ─── Store Implementation ─────────────────────────────────────────────────────
 
-export function createAgentStore() {
+export function createAgentStore(options = {}) {
   let agents = new Map(); // id → Agent
+  let needsSaveAfterLoad = false;
+  const storeFile = options.filePath || AGENTS_FILE;
 
   // Load from disk
   _load();
 
   // Seed defaults on cold start (empty store)
   _seedIfEmpty();
+  if (needsSaveAfterLoad) _save();
 
   function _load() {
-    mkdirSync(KSWARM_HOME, { recursive: true });
-    if (existsSync(AGENTS_FILE)) {
+    mkdirSync(dirname(storeFile), { recursive: true });
+    if (existsSync(storeFile)) {
       try {
-        const data = JSON.parse(readFileSync(AGENTS_FILE, 'utf-8'));
+        const data = JSON.parse(readFileSync(storeFile, 'utf-8'));
         if (Array.isArray(data)) {
-          for (const a of data) agents.set(a.id, normalizeAgent(a));
+          for (const a of data) {
+            const normalized = normalizeAgent(a);
+            agents.set(a.id, normalized);
+            if (JSON.stringify(normalized) !== JSON.stringify(a)) needsSaveAfterLoad = true;
+          }
         }
       } catch { /* ignore corrupt file */ }
     }
   }
 
   function _seedIfEmpty() {
-    // Ensure xiaok desktop seed agent exists (single agent with PO + Worker roles)
-    const hasXiaok = agents.has('xiaok');
-    if (hasXiaok) return;
+    // Ensure dedicated desktop-managed Xiaok seed agents exist. They do not
+    // depend on a separately installed xiaok/xiaok-cli binary.
+    const missingPo = !agents.has(XIAOK_PO_SEED_ID);
+    const missingWorker = !agents.has(XIAOK_WORKER_SEED_ID);
+    if (!missingPo && !missingWorker) return;
 
-    const llmConfig = _detectEnvLLM();
-    const desc = llmConfig.provider
-      ? `xiaok 智能体 (${llmConfig.provider}/${llmConfig.model})`
-      : 'xiaok 智能体（请在 xiaok 设置中配置模型 provider）';
+    const createdAt = Date.now();
+    const configSuffix = 'xiaok desktop agent runtime';
     const defaults = {
       ...AGENT_DEFAULTS,
       runtimeType: 'xiaok',
-      capabilities: ['coding', 'testing', 'design', 'planning'],
-      ...llmConfig,
+      runtimeSource: DESKTOP_AGENT_RUNTIME_SOURCE,
+      runtimePath: null,
+      provider: null,
+      model: null,
+      baseUrl: null,
+      apiKey: null,
+      customEnv: {},
+      capabilities: XIAOK_FULL_TASK_CAPABILITIES,
+      taskCapabilities: XIAOK_FULL_TASK_CAPABILITIES,
+      outputCapabilities: XIAOK_DIRECT_OUTPUT_CAPABILITIES,
     };
 
-    const xiaok = {
-      ...defaults,
-      id: 'xiaok',
-      name: 'xiaok',
-      description: desc,
-      instructions: '你是 xiaok 内置智能体，既能担任项目负责人（PO）进行任务规划、派发和审核，也能作为执行者完成具体任务。',
-      roles: ['project_owner', 'worker'],
-      status: 'idle',
-      createdAt: Date.now(),
-    };
-    agents.set(xiaok.id, normalizeAgent(xiaok));
+    if (missingPo) {
+      const po = {
+        ...defaults,
+        id: XIAOK_PO_SEED_ID,
+        name: 'PO-Agent',
+        description: `xiaok 项目负责人种子智能体。${configSuffix}`,
+        instructions: '你是 xiaok 项目负责人（PO）种子智能体，负责规划、拆解、派发、审核和交付把关。',
+        roles: ['project_owner'],
+        maxConcurrentTasks: 1,
+        status: 'offline',
+        createdAt,
+      };
+      agents.set(po.id, normalizeAgent(po));
+    }
+
+    if (missingWorker) {
+      const worker = {
+        ...defaults,
+        id: XIAOK_WORKER_SEED_ID,
+        name: 'Worker-Agent',
+        description: `xiaok 执行者种子智能体。${configSuffix}`,
+        instructions: '你是 xiaok 执行者种子智能体，负责执行已分配任务并提交结果。',
+        roles: ['worker'],
+        status: 'offline',
+        createdAt,
+      };
+      agents.set(worker.id, normalizeAgent(worker));
+    }
 
     _save();
-    console.log(`[AgentStore] Seed: ensured xiaok PO+Worker agents`);
+    console.log(`[AgentStore] Seed: ensured desktop xiaok PO+Worker agents`);
   }
 
   function _save() {
-    mkdirSync(KSWARM_HOME, { recursive: true });
+    mkdirSync(dirname(storeFile), { recursive: true });
     const arr = Array.from(agents.values()).filter(a => !a.archivedAt);
     // Also save archived in a separate section for recovery
     const archived = Array.from(agents.values()).filter(a => a.archivedAt);
-    writeFileSync(AGENTS_FILE, JSON.stringify([...arr, ...archived], null, 2), 'utf-8');
+    writeFileSync(storeFile, JSON.stringify([...arr, ...archived], null, 2), 'utf-8');
   }
 
   // ─── CRUD ─────────────────────────────────────────────────────────
@@ -478,7 +540,7 @@ export function createAgentStore() {
     getLLMConfig,
     resolveLLMConfig,
     redact,
-    getStorePath: () => AGENTS_FILE,
+    getStorePath: () => storeFile,
     getKnownCLIs: () => KNOWN_AGENT_CLIS.map(c => ({ type: c.type, bin: c.bin, displayName: c.displayName, description: c.description })),
     detectCLIs: () => _detectAgentCLIs(),
   };
@@ -486,12 +548,63 @@ export function createAgentStore() {
 
 function normalizeAgent(agent) {
   if (!agent) return agent;
-  const normalized = {
+  let normalized = {
     ...AGENT_DEFAULTS,
     ...agent,
   };
+  if (isDesktopXiaokSeed(normalized)) {
+    normalized = scrubDesktopXiaokSeedExecutionFields(normalized);
+  }
+  if (isXiaokRuntime(normalized)) {
+    normalized = normalizeXiaokRuntime(normalized);
+  }
   normalized.runtimeHealth = normalizeRuntimeHealth(normalized, normalized.runtimeHealth);
   return normalized;
+}
+
+function isXiaokRuntime(agent = {}) {
+  return agent.runtimeType === 'xiaok';
+}
+
+function isDesktopXiaokSeed(agent = {}) {
+  return (
+    agent.runtimeType === 'xiaok' &&
+    (agent.id === XIAOK_PO_SEED_ID || agent.id === XIAOK_WORKER_SEED_ID)
+  );
+}
+
+function normalizeXiaokRuntime(agent) {
+  return {
+    ...agent,
+    runtimePath: isDesktopXiaokSeed(agent) ? null : agent.runtimePath,
+    capabilities: mergeCapabilityLists(agent.capabilities, XIAOK_FULL_TASK_CAPABILITIES),
+    taskCapabilities: mergeCapabilityLists(agent.taskCapabilities, XIAOK_FULL_TASK_CAPABILITIES),
+    outputCapabilities: normalizeXiaokDirectOutputCapabilities(agent.outputCapabilities),
+    runtimeHealth: normalizeXiaokSeedRuntimeHealth(agent.runtimeHealth),
+  };
+}
+
+function scrubDesktopXiaokSeedExecutionFields(agent = {}) {
+  if (!isDesktopXiaokSeed(agent)) return agent;
+  return {
+    ...agent,
+    runtimeSource: DESKTOP_AGENT_RUNTIME_SOURCE,
+    runtimePath: null,
+    provider: null,
+    model: null,
+    baseUrl: null,
+    apiKey: null,
+    customEnv: {},
+  };
+}
+
+function normalizeXiaokSeedRuntimeHealth(runtimeHealth) {
+  if (!runtimeHealth || typeof runtimeHealth !== 'object') return runtimeHealth;
+  return {
+    ...runtimeHealth,
+    taskCapabilities: mergeCapabilityLists(runtimeHealth.taskCapabilities, XIAOK_FULL_TASK_CAPABILITIES),
+    outputCapabilities: normalizeXiaokDirectOutputCapabilities(runtimeHealth.outputCapabilities),
+  };
 }
 
 function normalizeRuntimeHealth(agent, runtimeHealth = null) {
@@ -516,6 +629,20 @@ function defaultOutputCapabilities(agent = {}) {
   if (Array.isArray(agent.outputCapabilities) && agent.outputCapabilities.length > 0) return agent.outputCapabilities;
   if (agent.runtimeType === 'builtin' || agent.runtimeType === 'xiaok') return ['markdown', 'html'];
   return ['markdown'];
+}
+
+function normalizeXiaokDirectOutputCapabilities(values = []) {
+  const allowed = new Set(XIAOK_DIRECT_OUTPUT_CAPABILITIES);
+  const merged = mergeCapabilityLists(values, XIAOK_DIRECT_OUTPUT_CAPABILITIES);
+  return merged.filter(value => allowed.has(value));
+}
+
+function mergeCapabilityLists(...lists) {
+  return [...new Set(
+    lists.flatMap(list => Array.isArray(list) ? list : [])
+      .map(value => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+  )];
 }
 
 function normalizeCapabilityList(values = []) {

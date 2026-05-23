@@ -5,6 +5,9 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHub } from '../src/core/hub.js';
 import { createTaskBoard } from '../src/core/task-board.js';
 
@@ -40,6 +43,29 @@ function setupXiaokWorkerProject(hub, id) {
   assert.equal(hub.handleApprove(id).ok, true);
 }
 
+test('createProject preserves user fields and sends planningGuidance only as plan context', () => {
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+  const project = hub.createProject({
+    id: 'proj-guidance',
+    name: 'Guidance',
+    goal: '输出OpenAI本月分析报告，最终用 Markdown 交付',
+    requirements: '不要改写我的目标和要求。',
+    planningGuidance: '计划中细化：最终任务交付 Markdown 报告。',
+    poAgent: 'po',
+    members: ['worker'],
+  });
+
+  assert.equal(project.goal, '输出OpenAI本月分析报告，最终用 Markdown 交付');
+  assert.equal(project.requirements, '不要改写我的目标和要求。');
+  assert.equal(project.planningGuidance, '计划中细化：最终任务交付 Markdown 报告。');
+
+  const [assignPo] = bridge.getSentOf('assign_po');
+  assert.equal(assignPo.payload.goal, '输出OpenAI本月分析报告，最终用 Markdown 交付');
+  assert.equal(assignPo.payload.requirements, '不要改写我的目标和要求。');
+  assert.equal(assignPo.payload.planningGuidance, '计划中细化：最终任务交付 Markdown 报告。');
+});
+
 test('same local task IDs in different projects stay isolated', () => {
   const hub = createHub({ silent: true });
   setupProject(hub, 'proj-a');
@@ -72,6 +98,12 @@ test('request dispatch sends runId in bridge request_task', () => {
   assert.equal(request.projectId, 'proj-a');
   assert.equal(request.localTaskId, 'item-1');
   assert.ok(request.runId);
+  assert.match(request.handoffPath, /handoffs\/.+\/request\.json$/);
+  const handoff = JSON.parse(readFileSync(request.handoffPath, 'utf-8'));
+  assert.equal(handoff.kind, 'kswarm_task_handoff_v1');
+  assert.equal(handoff.runId, request.runId);
+  assert.equal(handoff.contextPolicy.largeContent, 'file_reference_only');
+  assert.equal(JSON.stringify(handoff).includes('apiKey'), false);
 });
 
 test('request dispatch reserves runtime instances while preserving logical agent identity', () => {
@@ -351,6 +383,42 @@ test('model empty output releases runtime instance for immediate retry instead o
   assert.equal(retry.assignedRuntimeInstance, 'xiaok-worker@inst-1');
 });
 
+test('retry child preserves parent dependencies for final render tasks', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-render-retry', name: 'Render Retry', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-render-retry', [
+    { id: 'draft', title: '第二轮分析修订与定稿', brief: 'draft', assignedAgent: 'worker', dependencies: [] },
+    {
+      id: 'final',
+      title: '使用report renderer生成HTML报告',
+      brief: '将第二轮分析定稿的Markdown内容转换为HTML',
+      assignedAgent: 'worker',
+      dependencies: ['draft'],
+      requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-render-retry').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-render-retry', 'po').dispatched, ['proj-render-retry__draft']);
+
+  const board = hub.getBoard('proj-render-retry');
+  const draft = board.getTask('draft');
+  assert.equal(hub.handleAcceptTask('proj-render-retry', draft.id, 'worker', draft.activeRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-render-retry', draft.id, 'started', 'worker', draft.activeRunId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-render-retry', draft.id, { summary: 'draft completed with enough useful detail for downstream rendering.' }, 'worker', draft.activeRunId).ok, true);
+  assert.equal(hub.handleQualityReview('proj-render-retry', draft.id, { passed: true, feedback: 'OK' }, 'po').ok, true);
+
+  const dispatch = hub.handleRequestDispatch('proj-render-retry', 'po');
+  assert.deepEqual(dispatch.dispatched, ['proj-render-retry__final']);
+  const finalTask = board.getTask('final');
+  const failed = hub.handleWorkerFailure('proj-render-retry', finalTask.id, 'worker', finalTask.activeRunId, 'model_empty_output', 'placeholder');
+  assert.equal(failed.ok, true);
+
+  const retry = board.getTask(failed.retryTaskId);
+  assert.deepEqual(retry.dependencies, finalTask.dependencies);
+  assert.deepEqual(retry.dependencyRefs, finalTask.dependencyRefs);
+  assert.equal(retry.requiredOutputs[0].type, 'report_html');
+});
+
 test('retry child completion marks failed parent done and unblocks dependents', () => {
   const hub = createHub({ silent: true });
   setupProject(hub, 'proj-a');
@@ -399,6 +467,27 @@ test('historical failed retry child does not block project delivery after parent
   const delivered = hub.handleDeliver('proj-deliver-history', { synthesis: true }, 'po');
   assert.equal(delivered.ok, true);
   assert.equal(hub.getProject('proj-deliver-history').status, 'delivered');
+});
+
+test('failed root final task blocks project delivery', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-deliver-failed-root', name: 'Deliver', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-deliver-failed-root', [
+    { id: 'item-1', title: 'Research', assignedAgent: 'worker' },
+    { id: 'item-2', title: '使用 report renderer 生成HTML报告', assignedAgent: 'worker', dependencies: ['item-1'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-deliver-failed-root').ok, true);
+
+  const board = hub.getBoard('proj-deliver-failed-root');
+  board.getTask('item-1').status = 'done';
+  board.getTask('item-2').status = 'failed';
+  board.getTask('item-2').failureReason = 'artifact_type_mismatch';
+
+  assert.equal(board.isAllDone(), false);
+  const delivered = hub.handleDeliver('proj-deliver-failed-root', { synthesis: true }, 'po');
+  assert.equal(delivered.ok, false);
+  assert.equal(delivered.error, 'tasks_not_all_done');
+  assert.equal(hub.getProject('proj-deliver-failed-root').status, 'active');
 });
 
 test('retry child with duplicate title does not break title dependency after reload', () => {
@@ -500,6 +589,110 @@ test('quality review rework redispatches with a fresh run id', () => {
   const requests = bridge.getSentOf('request_task');
   assert.equal(requests.length, 2);
   assert.equal(requests[1].runId, task.activeRunId);
+
+  const secondRunId = task.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-quality', 'item-1', 'worker', secondRunId).ok, true);
+  assert.equal(hub.handleProgress('proj-quality', 'item-1', 'started', 'worker', secondRunId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-quality', 'item-1', {
+    summary: 'concrete draft',
+    artifactManifest: [{ filename: 'draft.md', path: 'artifacts/draft.md' }],
+  }, 'worker', secondRunId).ok, true);
+
+  assert.equal(task.status, 'submitted');
+  assert.equal(task.reviewResult, null);
+  assert.equal(hub.getProjectIntervention('proj-quality').primaryAction.strategy, 'notify_po_review');
+});
+
+test('quality review reports effective failure when evidence contract rejects a raw PO pass', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-quality-gate', name: 'Quality Gate', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  assert.equal(hub.handleCreateTasks('proj-quality-gate', [
+    {
+      id: 'item-1',
+      title: '验证信息准确性与完整性',
+      assignedAgent: 'worker',
+      dependencies: [],
+      evidenceContract: {
+        kind: 'review_iteration_v1',
+        requiredArtifacts: ['review-evidence.json'],
+        requiredFields: ['verdict', 'findings'],
+      },
+    },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-quality-gate').ok, true);
+  const board = hub.getBoard('proj-quality-gate');
+  const task = board.getTask('item-1');
+  task.status = 'submitted';
+  task.result = {
+    summary: '完成信息准确性与完整性验证，核对了关键产品动态、发布日期、来源链接、竞品对照和后续报告可引用边界。',
+    artifacts: [{ filename: 'review-evidence.json', relativePath: 'artifacts/review-evidence.json' }],
+  };
+
+  const review = hub.handleQualityReview('proj-quality-gate', 'item-1', {
+    passed: true,
+    feedback: 'Accepted by PO.',
+  }, 'po');
+
+  assert.equal(review.ok, true);
+  assert.equal(review.effectivePassed, false);
+  assert.equal(review.rework, true);
+  assert.equal(task.status, 'dispatched');
+  assert.match(task.failureReason, /missing required review evidence field: verdict/);
+});
+
+test('quality review accepts valid artifact-backed result even when runtime summary is low signal', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kswarm-short-summary-'));
+  try {
+    mkdirSync(join(dir, 'artifacts'), { recursive: true });
+    writeFileSync(
+      join(dir, 'artifacts', 'kingdee-report.html'),
+      `<!doctype html><html><body><main data-template="kai-report-creator"><h1>金蝶本月产品分析报告</h1><p>${'报告正文内容 '.repeat(80)}</p></main></body></html>`,
+      'utf8',
+    );
+
+    const hub = createHub({ silent: true });
+    hub.createProject({ id: 'proj-short-summary', name: 'Quality Gate', goal: 'goal', poAgent: 'po', members: ['worker'] });
+    assert.equal(hub.handleCreateTasks('proj-short-summary', [
+      {
+        id: 'item-1',
+        title: '使用report renderer生成HTML报告',
+        assignedAgent: 'worker',
+        dependencies: [],
+        evidenceContract: { kind: 'external_source_v1', required: true },
+      },
+    ], 'po').ok, true);
+    assert.equal(hub.handleApprove('proj-short-summary').ok, true);
+    assert.deepEqual(hub.handleRequestDispatch('proj-short-summary', 'po').dispatched, ['proj-short-summary__item-1']);
+
+    const board = hub.getBoard('proj-short-summary');
+    const runId = board.getTask('item-1').activeRunId;
+    assert.equal(hub.handleAcceptTask('proj-short-summary', 'item-1', 'worker', runId).ok, true);
+    assert.equal(hub.handleProgress('proj-short-summary', 'item-1', 'started', 'worker', runId).ok, true);
+    assert.equal(hub.handleSubmitResult('proj-short-summary', 'item-1', {
+      summary: '模型没有返回内容。',
+      workFolder: dir,
+      workspacePath: dir,
+      artifacts: [{
+        filename: 'kingdee-report.html',
+        relativePath: 'artifacts/kingdee-report.html',
+        mimeType: 'text/html',
+      }],
+    }, 'worker', runId).ok, true);
+
+    const review = hub.handleQualityReview('proj-short-summary', 'item-1', {
+      passed: true,
+      feedback: 'HTML 报告内容完整，验收通过。',
+    }, 'po');
+
+    const task = board.getTask('item-1');
+    assert.equal(review.ok, true);
+    assert.equal(review.effectivePassed, true);
+    assert.equal(task.status, 'done');
+    assert.match(task.result.summary, /kingdee-report\.html/);
+    assert.ok(task.result.summary.length >= 50);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('manual dispatch recovers rework-ready in-progress task without active run', () => {

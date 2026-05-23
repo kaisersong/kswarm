@@ -107,7 +107,8 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
     const normalizedDeps = [];
     const unresolved = [];
     for (const ref of task.dependencyRefs) {
-      const resolved = resolveTaskRefFromAliases(projectId, ref, aliases);
+      const resolved = resolveTaskRefFromAliases(projectId, ref, aliases)
+        || resolveNearTitleRef(projectId, ref, allByGlobal.values());
       if (resolved?.taskId) normalizedDeps.push(resolved.taskId);
       else unresolved.push(ref);
     }
@@ -161,7 +162,8 @@ export function buildTaskAliases(projectId, tasks) {
 
 export function resolveTaskRef(projectId, taskRef, tasks) {
   const aliases = buildTaskAliases(projectId, tasks);
-  return resolveTaskRefFromAliases(projectId, taskRef, aliases);
+  return resolveTaskRefFromAliases(projectId, taskRef, aliases)
+    || resolveNearTitleRef(projectId, taskRef, tasks);
 }
 
 function resolveTaskRefFromAliases(projectId, taskRef, aliases) {
@@ -178,7 +180,39 @@ function resolveTaskRefFromAliases(projectId, taskRef, aliases) {
   return null;
 }
 
+function resolveNearTitleRef(projectId, taskRef, tasks) {
+  const ref = normalizeComparableTitle(taskRef);
+  if (ref.length < 8) return null;
+
+  const candidates = buildResolvableTitleCandidates(projectId, tasks)
+    .map(candidate => {
+      const title = normalizeComparableTitle(candidate.title);
+      const longestCommon = longestCommonSubstringLength(ref, title);
+      const score = title.length === 0 ? 0 : longestCommon / Math.max(ref.length, title.length);
+      return { ...candidate, longestCommon, score };
+    })
+    .filter(candidate => candidate.longestCommon >= 6 && candidate.score >= 0.72)
+    .sort((left, right) => right.score - left.score || right.longestCommon - left.longestCommon);
+
+  if (candidates.length === 0) return null;
+  const [best, second] = candidates;
+  if (second && best.score - second.score < 0.12) return null;
+
+  return {
+    taskId: best.target.id,
+    via: 'near_title',
+    matchedTitle: best.title,
+    score: best.score,
+  };
+}
+
 function addResolvableTitleAliases(projectId, aliases, tasks) {
+  for (const { title, target } of buildResolvableTitleCandidates(projectId, tasks)) {
+    addAlias(aliases, title, target.id);
+  }
+}
+
+function buildResolvableTitleCandidates(projectId, tasks) {
   const groups = new Map();
   for (const task of tasks) {
     if (!task.title) continue;
@@ -187,10 +221,12 @@ function addResolvableTitleAliases(projectId, aliases, tasks) {
     groups.set(task.title, group);
   }
 
+  const candidates = [];
   for (const [title, group] of groups.entries()) {
     const target = resolveTitleAliasTarget(projectId, group);
-    if (target) addAlias(aliases, title, target.id);
+    if (target) candidates.push({ title, target });
   }
+  return candidates;
 }
 
 function resolveTitleAliasTarget(projectId, group) {
@@ -227,6 +263,31 @@ function isRetryLikeTask(task) {
     String(task.id || '').includes('-retry-') ||
     Number(task.attempt || 1) > 1,
   );
+}
+
+function normalizeComparableTitle(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s,，.。:：;；/\\|()[\]{}'"`~!@#$%^&*+=<>?？、_-]+/g, '');
+}
+
+function longestCommonSubstringLength(left, right) {
+  if (!left || !right) return 0;
+  let previous = new Array(right.length + 1).fill(0);
+  let best = 0;
+
+  for (let i = 1; i <= left.length; i++) {
+    const current = new Array(right.length + 1).fill(0);
+    for (let j = 1; j <= right.length; j++) {
+      if (left[i - 1] !== right[j - 1]) continue;
+      current[j] = previous[j - 1] + 1;
+      if (current[j] > best) best = current[j];
+    }
+    previous = current;
+  }
+
+  return best;
 }
 
 function addAlias(aliases, key, taskId) {

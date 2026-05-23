@@ -73,6 +73,19 @@ function setupProject(hub, taskOverrides = {}) {
   return project;
 }
 
+function setupProjectWithMembers(hub, members, tasks) {
+  const project = hub.createProject({
+    id: 'proj-continue',
+    name: 'P',
+    goal: 'goal',
+    poAgent: 'po',
+    members,
+  });
+  hub.handleCreateTasks(project.id, tasks, 'po');
+  hub.handleApprove(project.id);
+  return project;
+}
+
 function getTask(hub, localId = 'item-1') {
   return hub.getBoard('proj-continue').getTask(localId);
 }
@@ -101,6 +114,106 @@ test('continue retries failed task with best healthy agent', () => {
   assert.deepEqual(result.dispatched, [failed.id]);
   assert.equal(task.status, 'dispatched');
   assert.equal(task.assignedAgent, 'cli-xiaok');
+});
+
+test('continue skips stale healthy agent when broker presence says offline', () => {
+  const hub = createTestHub([
+    { id: 'cli-codex', status: 'idle', brokerOnline: false, runtimeHealth: { state: 'healthy' } },
+    { id: 'cli-xiaok', status: 'idle', brokerOnline: true, runtimeHealth: { state: 'healthy' } },
+  ]);
+  setupProject(hub, { assignedAgent: 'cli-xiaok' });
+  const failed = failRootTask(hub);
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-broker-presence',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(task.status, 'dispatched');
+  assert.equal(task.assignedAgent, 'cli-xiaok');
+});
+
+test('runtime offline retry budget allows recovery when an online replacement exists', () => {
+  const hub = createTestHub([
+    { id: 'cli-codex', status: 'idle', brokerOnline: false, runtimeHealth: { state: 'healthy' } },
+    { id: 'cli-xiaok', status: 'idle', brokerOnline: true, runtimeHealth: { state: 'healthy' } },
+  ]);
+  setupProject(hub);
+  const failed = failRootTask(hub, 'runtime_offline', 'delivery failed');
+  failed.continueRecoveryHistory = [{ strategy: 'retry_best_agent', result: 'started', at: Date.now() - 1000 }];
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-runtime-offline-replacement',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'retry_best_agent');
+  assert.equal(task.status, 'dispatched');
+  assert.equal(task.assignedAgent, 'cli-xiaok');
+});
+
+test('continue dispatches existing pending retry child instead of double-dispatching parent', () => {
+  const hub = createTestHub();
+  setupProject(hub);
+  const failed = failRootTask(hub, 'source_provider_unavailable', 'duckduckgo timeout');
+  const board = hub.getBoard('proj-continue');
+  const added = board.addTasksChecked([{
+    id: 'item-1-retry-1',
+    title: failed.title,
+    assignedAgent: 'cli-xiaok',
+    parentTaskId: failed.id,
+    attempt: 2,
+    maxAttempts: 2,
+  }]);
+  assert.equal(added.ok, true);
+  const retryId = added.taskIds[0];
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-existing-retry-child',
+  });
+
+  const parent = getTask(hub);
+  const retry = board.getTask(retryId);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'retry_best_agent');
+  assert.deepEqual(result.dispatched, [retryId]);
+  assert.equal(parent.status, 'failed');
+  assert.equal(retry.status, 'dispatched');
+  assert.equal(retry.assignedAgent, 'cli-xiaok');
+});
+
+test('continue retry stays inside project members instead of selecting a healthy non-member', () => {
+  const hub = createTestHub([
+    { id: 'cli-xiaok', status: 'idle', runtimeHealth: { state: 'healthy' } },
+    { id: 'xiaok-worker', status: 'idle', roles: ['worker'], runtimeHealth: { state: 'healthy' } },
+    { id: 'cli-codex', status: 'idle', roles: ['worker'], runtimeHealth: { state: 'cooldown', cooldownUntil: Date.now() + 60_000 } },
+  ]);
+  setupProjectWithMembers(hub, ['cli-codex', 'xiaok-worker'], [
+    { id: 'item-1', title: 'T', assignedAgent: 'xiaok-worker', maxAttempts: 1 },
+    { id: 'item-2', title: 'Next', assignedAgent: 'xiaok-worker', dependencies: ['item-1'] },
+  ]);
+  const failed = failRootTask(hub);
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-project-scoped',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, true);
+  assert.equal(result.strategy, 'retry_best_agent');
+  assert.equal(task.status, 'dispatched');
+  assert.equal(task.assignedAgent, 'xiaok-worker');
+  assert.notEqual(task.assignedAgent, 'cli-xiaok');
 });
 
 test('stale expected task state returns task_state_changed without mutation', () => {
@@ -298,7 +411,7 @@ test('continue retries rejected recovered artifact instead of resubmitting it', 
   failed.qualityReviewHistory.push(failed.reviewResult);
   failed.qualityFailureCount = 2;
   const blocked = hub.getBoard('proj-continue').blockTask(failed.id, {
-    blockKind: 'executor_quality_blocked',
+    blockKind: 'quality_gate_blocked',
     blockedReason: feedback,
     failureClass: 'quality_content_failed',
     qualityFailureCount: 2,

@@ -67,7 +67,7 @@ export function handleContinueProjectCore({
     });
   }
 
-  if (strategy !== 'notify_po_review' && isRecoveryBudgetExceeded(task, strategy)) {
+  if (strategy !== 'notify_po_review' && isRecoveryBudgetExceeded(task, strategy, agents)) {
     return remember(project, idempotencyKey, {
       ok: false,
       action: 'continue_project',
@@ -217,7 +217,7 @@ function recoverTaskSubmission({ project, task, intervention, recoverSubmission 
 }
 
 function notifyPoReview({ project, task, intervention }) {
-  if (task.status !== 'submitted' || !task.result || task.reviewResult) {
+  if (task.status !== 'submitted' || !task.result || hasCurrentReviewResult(task)) {
     return {
       ok: false,
       error: 'review_notification_not_applicable',
@@ -234,6 +234,16 @@ function notifyPoReview({ project, task, intervention }) {
     result: task.result,
     fromWorker: task.result?.participantId || task.result?.agent || task.assignedAgent || 'continue_project',
   };
+}
+
+function hasCurrentReviewResult(task = {}) {
+  if (!task.reviewResult) return false;
+  if (task.reviewResult.passed === false) {
+    const reviewedAt = Number(task.reviewResult.reviewedAt || 0);
+    const submittedAt = Number(task.updatedAt || task.recoveredAt || 0);
+    if (submittedAt && (!reviewedAt || reviewedAt < submittedAt)) return false;
+  }
+  return true;
 }
 
 function collectRecoverableArtifacts(task = {}, lease = {}) {
@@ -290,6 +300,38 @@ function completeRetryParent({ board, task }) {
 }
 
 function retryTask({ board, task, strategy, agents, dispatchProjectTasks, intervention }) {
+  const existingRetry = findPendingRetryChild(board, task);
+  if (existingRetry) {
+    const agentId = selectHealthyAgent(existingRetry, agents);
+    if (!agentId) {
+      return {
+        ok: false,
+        error: 'needs_conversation',
+        strategy: 'needs_conversation',
+        xiaokContext: buildXiaokContext({ intervention, task: existingRetry }),
+      };
+    }
+
+    existingRetry.assignedAgent = agentId;
+    existingRetry.recoveryStatus = 'redispatch_ready';
+    existingRetry.recoveryReason = `continue_project:${strategy}:existing_retry`;
+    const dispatch = dispatchProjectTasks
+      ? dispatchProjectTasks({ onlyTaskIds: [existingRetry.id] })
+      : { ok: false, dispatched: [], error: 'dispatch_unavailable' };
+    if (!dispatch.ok) return dispatch;
+    return {
+      ok: true,
+      retried: true,
+      dispatched: dispatch.dispatched || [],
+      skipped: dispatch.skipped || [],
+      blocked: dispatch.blocked || [],
+      projectGate: dispatch.projectGate || null,
+      taskId: existingRetry.id,
+      parentTaskId: task.id,
+      assignedAgent: agentId,
+    };
+  }
+
   const agentId = selectHealthyAgent(task, agents);
   if (!agentId) {
     return {
@@ -324,7 +366,9 @@ function retryTask({ board, task, strategy, agents, dispatchProjectTasks, interv
     pendingTask.repairInstruction = buildRepairInstruction(task);
   }
 
-  const dispatch = dispatchProjectTasks ? dispatchProjectTasks() : { ok: false, dispatched: [], error: 'dispatch_unavailable' };
+  const dispatch = dispatchProjectTasks
+    ? dispatchProjectTasks({ onlyTaskIds: [task.id] })
+    : { ok: false, dispatched: [], error: 'dispatch_unavailable' };
   if (!dispatch.ok) return dispatch;
   return {
     ok: true,
@@ -336,6 +380,13 @@ function retryTask({ board, task, strategy, agents, dispatchProjectTasks, interv
     taskId: task.id,
     assignedAgent: agentId,
   };
+}
+
+function findPendingRetryChild(board, task = {}) {
+  if (!board || !task?.id) return null;
+  return board.getAllTasks()
+    .filter(candidate => candidate?.parentTaskId === task.id && candidate.status === 'pending')
+    .sort((a, b) => Number(b.attempt || 1) - Number(a.attempt || 1))[0] || null;
 }
 
 function selectHealthyAgent(task, agents) {
@@ -378,6 +429,7 @@ function isRecoverableContentFailureAgent(agent = {}, task = {}) {
 
 function isAvailableAgent(agent = {}) {
   if (!agent || agent.archived) return false;
+  if (agent.brokerOnline === false) return false;
   return !['offline', 'error', 'failed', 'stopped', 'archived'].includes(String(agent.status || '').toLowerCase());
 }
 
@@ -391,9 +443,15 @@ function buildRepairInstruction(task = {}) {
   ].filter(Boolean).join('\n');
 }
 
-function isRecoveryBudgetExceeded(task, strategy) {
+function isRecoveryBudgetExceeded(task, strategy, agents = []) {
   const history = Array.isArray(task.continueRecoveryHistory) ? task.continueRecoveryHistory : [];
-  return history.filter(item => item.strategy === strategy && item.result === 'started').length >= MAX_SAME_STRATEGY_RECOVERIES;
+  const exceeded = history.filter(item => item.strategy === strategy && item.result === 'started').length >= MAX_SAME_STRATEGY_RECOVERIES;
+  if (!exceeded) return false;
+  if (strategy === 'retry_best_agent' && String(task.failureReason || task.lastFailureClass || '') === 'runtime_offline') {
+    const replacementAgent = selectHealthyAgent(task, agents);
+    if (replacementAgent && replacementAgent !== task.assignedAgent) return false;
+  }
+  return true;
 }
 
 function recordRecoveryAttempt(task, strategy, now) {

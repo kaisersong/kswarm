@@ -1,16 +1,32 @@
-# React + Vite
+# KSwarm Web UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + Vite project board for KSwarm.
 
-Currently, two official plugins are available:
+The web UI is a diagnostic and operation surface for the KSwarm hub:
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- project cards with lifecycle state
+- phase-aware task board
+- task start/completion/failure timestamps
+- PO review feedback and recovery hints
+- artifact preview/download links
+- agent status and runtime-health visibility
 
-## React Compiler
+The UI is intentionally thin. KSwarm server state is the source of truth; the browser only renders project state and sends explicit user actions such as approve, retry, dispatch, continue, deliver, or close.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Development
 
-## Expanding the ESLint configuration
+```bash
+npm install
+npm run dev
+```
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+By default the Vite server runs on `http://localhost:5173` or the next available port. The API server must be running separately:
+
+```bash
+cd ..
+node src/server/index.js
+```
+
+## Release Notes
+
+This UI follows the v0.8.0 Swarm reliability baseline: failed/blocked task states must stay visible, recovery actions must be explicit, and final deliverables should show user-facing artifact names instead of internal task IDs.

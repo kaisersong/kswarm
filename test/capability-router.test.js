@@ -7,7 +7,9 @@
 import assert from 'node:assert/strict';
 import { createUnknownRuntimeHealth, recordProbeResult } from '../src/core/runtime-health.js';
 import { evaluateTaskRoute, planTaskRoute } from '../src/core/capability-router.js';
-import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
+const PRESENTATION_PPTX_EXECUTOR_ID = 'kswarm.executor.presentation.pptx.v1';
+const REPORT_HTML_EXECUTOR_ID = 'kswarm.executor.report.html.v1';
+const SLIDE_HTML_EXECUTOR_ID = 'kswarm.executor.slide.html.v1';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -198,6 +200,48 @@ test('route planner can fallback worker work to another worker agent', () => {
   assert.equal(route.selectedAgentId, 'worker-b');
 });
 
+test('route planner skips offline assigned CLI even when stale health is healthy', () => {
+  const offlineAssigned = {
+    id: 'cli-claude',
+    status: 'offline',
+    roles: ['worker'],
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['planning'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+  const onlineWorker = {
+    id: 'xiaok-worker',
+    status: 'idle',
+    roles: ['worker'],
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['planning'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: {
+      id: 'draft',
+      title: '撰写第一轮分析报告',
+      assignedAgent: 'cli-claude',
+      requiredCapabilities: ['planning'],
+      requiredOutputs: ['markdown'],
+    },
+    agents: [offlineAssigned, onlineWorker],
+    now,
+  });
+
+  assert.equal(route.ok, true);
+  assert.equal(route.selectedAgentId, 'xiaok-worker');
+  assert.equal(route.skipped[0].agentId, 'cli-claude');
+  assert.equal(route.skipped[0].reason, 'runtime_offline');
+});
+
 test('route planner still allows a task explicitly assigned to PO', () => {
   const poOnly = {
     id: 'xiaok-po',
@@ -220,7 +264,7 @@ test('route planner still allows a task explicitly assigned to PO', () => {
   assert.equal(route.selectedAgentId, 'xiaok-po');
 });
 
-test('route planner selects registered presentation executor when no agent has pptx output capability', () => {
+test('route planner does not select presentation executor when no agent has pptx output capability', () => {
   const markdownOnly = {
     id: 'worker-md',
     runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
@@ -238,9 +282,89 @@ test('route planner selects registered presentation executor when no agent has p
     now,
   });
 
-  assert.equal(route.ok, true);
-  assert.equal(route.selectedExecutorId, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedExecutorId, null);
   assert.equal(route.selectedAgentId, null);
+  assert.equal(route.reason, 'output_missing:pptx');
+});
+
+test('route planner does not select report html executor for final report task', () => {
+  const markdownOnly = {
+    id: 'worker-md',
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['analysis', 'report_generation'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: { id: 'report', title: '生成本月AI产品动态分析报告', brief: '输出最终报告。', assignedAgent: 'worker-md' },
+    agents: [markdownOnly],
+    executors: [{ id: REPORT_HTML_EXECUTOR_ID, outputCapabilities: ['report_html'], taskCapabilities: ['report_generation'] }],
+    now,
+  });
+
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedExecutorId, null);
+  assert.equal(route.selectedAgentId, null);
+  assert.equal(route.reason, 'output_missing:report_html');
+});
+
+test('route planner treats markdown references as report renderer inputs but still requires an agent output capability', () => {
+  const markdownOnly = {
+    id: 'worker-md',
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['analysis', 'report_generation'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: {
+      id: 'report',
+      title: '使用 report renderer 生成最终HTML报告',
+      brief: '基于 artifacts/proj-1__item-3-2-report.md 作为素材，使用 report renderer 生成最终 .html 报告。',
+      assignedAgent: 'worker-md',
+    },
+    agents: [markdownOnly],
+    executors: [{ id: REPORT_HTML_EXECUTOR_ID, outputCapabilities: ['report_html'], taskCapabilities: ['report_generation'] }],
+    now,
+  });
+
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedExecutorId, null);
+  assert.equal(route.selectedAgentId, null);
+  assert.equal(route.reason, 'output_missing:report_html');
+});
+
+test('route planner does not select slide html executor for natural-language slide task', () => {
+  const markdownOnly = {
+    id: 'worker-md',
+    runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+      commandOk: true,
+      generationOk: true,
+      taskCapabilities: ['analysis', 'slide_generation'],
+      outputCapabilities: ['markdown'],
+    }, now),
+  };
+
+  const route = planTaskRoute({
+    task: { id: 'slides', title: '制作技术大会演示文稿', brief: '输出最终 HTML 幻灯片。', assignedAgent: 'worker-md' },
+    agents: [markdownOnly],
+    executors: [
+      { id: PRESENTATION_PPTX_EXECUTOR_ID, outputCapabilities: ['pptx'], taskCapabilities: ['presentation_generation'] },
+      { id: SLIDE_HTML_EXECUTOR_ID, outputCapabilities: ['slide_html'], taskCapabilities: ['slide_generation'] },
+    ],
+    now,
+  });
+
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedExecutorId, null);
+  assert.equal(route.reason, 'output_missing:slide_html');
 });
 
 test('route planner does not use presentation executor for generic tasks', () => {
@@ -266,7 +390,7 @@ test('route planner does not use presentation executor for generic tasks', () =>
   assert.equal(route.reason, 'runtime_limited');
 });
 
-test('executor routing ignores soft output requirements when hard pptx is satisfied', () => {
+test('executor routing is ignored even when hard pptx would be satisfied', () => {
   const route = planTaskRoute({
     task: {
       id: 'deck',
@@ -283,8 +407,9 @@ test('executor routing ignores soft output requirements when hard pptx is satisf
     now,
   });
 
-  assert.equal(route.ok, true);
-  assert.equal(route.selectedExecutorId, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(route.ok, false);
+  assert.equal(route.selectedExecutorId, null);
+  assert.equal(route.reason, 'no_route');
 });
 
 let passed = 0;

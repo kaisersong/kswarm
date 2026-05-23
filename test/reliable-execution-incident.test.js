@@ -6,7 +6,6 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../src/core/hub.js';
-import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -114,40 +113,38 @@ test('quality review failure can block a task directly after rework budget is ex
   assert.equal(blockedEvents.length, 1);
 });
 
-test('quality review failure blocks local executor output instead of leaving it in progress', () => {
+test('quality review failure requeues agent output instead of leaving it in progress', () => {
   const bridge = createMockBridge();
   const hub = createHub({ bridge, silent: true });
-  hub.createProject({ id: 'proj-local-executor', name: 'Local Executor', goal: 'goal', poAgent: 'po', members: [] });
-  hub.handleCreateTasks('proj-local-executor', [
+  hub.createProject({ id: 'proj-agent-output', name: 'Agent Output', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  hub.handleCreateTasks('proj-agent-output', [
     { id: 'story-source', title: '定义真实性基准并收集素材', assignedAgent: 'worker' },
   ], 'po');
-  hub.handleApprove('proj-local-executor');
+  hub.handleApprove('proj-agent-output');
 
-  const board = hub.getBoard('proj-local-executor');
-  board.transition('story-source', 'dispatched', { assignedExecutor: PRESENTATION_PPTX_EXECUTOR_ID });
+  const board = hub.getBoard('proj-agent-output');
+  board.transition('story-source', 'dispatched', { assignedAgent: 'worker' });
   assert.equal(board.getTask('story-source').assignedAgent, 'worker');
-  assert.equal(board.getTask('story-source').assignedExecutor, PRESENTATION_PPTX_EXECUTOR_ID);
+  assert.equal(board.getTask('story-source').assignedExecutor, null);
   const runId = board.getTask('story-source').activeRunId;
-  assert.equal(hub.handleAcceptTask('proj-local-executor', 'story-source', PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
-  assert.equal(hub.handleProgress('proj-local-executor', 'story-source', 'started', PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
-  assert.equal(hub.handleSubmitResult('proj-local-executor', 'story-source', {
-    summary: 'Registered presentation executor generated 16 slides for 定义真实性基准并收集素材.',
+  assert.equal(hub.handleAcceptTask('proj-agent-output', 'story-source', 'worker', runId).ok, true);
+  assert.equal(hub.handleProgress('proj-agent-output', 'story-source', 'started', 'worker', runId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-agent-output', 'story-source', {
+    summary: 'Worker generated 16 slides for 定义真实性基准并收集素材.',
     artifacts: [{ filename: 'story-source-deck.pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }],
-  }, PRESENTATION_PPTX_EXECUTOR_ID, runId).ok, true);
+  }, 'worker', runId).ok, true);
 
-  const review = hub.handleQualityReview('proj-local-executor', 'story-source', {
+  const review = hub.handleQualityReview('proj-agent-output', 'story-source', {
     passed: false,
     feedback: '产出物仅包含 PPTX 文件头部结构，缺少实际内容。',
     failureClass: 'quality_content_failed',
   }, 'po');
 
-  const task = board.getTask('story-source');
   assert.equal(review.ok, true);
-  assert.equal(review.blocked, true);
-  assert.equal(task.status, 'blocked');
-  assert.equal(task.lastFailureClass, 'quality_content_failed');
-  assert.match(task.blockedReason, /缺少实际内容/);
-  assert.equal(bridge.getSentOf('rework').length, 0);
+  assert.equal(review.rework, true);
+  assert.equal(board.getTask('story-source').status, 'dispatched');
+  assert.equal(board.getTask('story-source').lastFailureClass, 'quality_content_failed');
+  assert.equal(bridge.getSentOf('request_task').length, 1);
 });
 
 test('composite task creation is atomic and parent is not dispatched as ordinary work', () => {

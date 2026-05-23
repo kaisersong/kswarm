@@ -33,6 +33,43 @@ test('repeated quality failure blocks instead of looping forever', () => {
   assert.ok(decision.nextActions.some(a => a.includes('人工')));
 });
 
+test('quality review requesting future current-month data blocks for plan revision', () => {
+  const decision = superviseTaskFailure(
+    {
+      id: 'p1-item3',
+      title: '持续采集并归档原始数据',
+      qualityFailureCount: 0,
+      maxQualityReworks: 2,
+    },
+    {
+      source: 'quality_review',
+      failureClass: 'quality_content_failed',
+      feedback: '覆盖范围仅5月1日至20日，缺少5月21-31日数据，请补齐缺失日期。',
+    },
+    { now: Date.UTC(2026, 4, 20, 12, 0, 0) }
+  );
+
+  assert.equal(decision.action, 'block');
+  assert.equal(decision.blockKind, 'plan_revision_required');
+  assert.equal(decision.failureClass, 'quality_temporal_impossible');
+  assert.ok(decision.nextActions.some(a => a.includes('当前日期')));
+});
+
+test('quality review requesting past month completion still follows normal rework budget', () => {
+  const decision = superviseTaskFailure(
+    { id: 'p1-item3', qualityFailureCount: 0, maxQualityReworks: 2 },
+    {
+      source: 'quality_review',
+      failureClass: 'quality_content_failed',
+      feedback: '覆盖范围仅5月1日至20日，缺少5月21-31日数据，请补齐缺失日期。',
+    },
+    { now: Date.UTC(2026, 5, 2, 12, 0, 0) }
+  );
+
+  assert.equal(decision.action, 'rework');
+  assert.equal(decision.failureClass, 'quality_content_failed');
+});
+
 test('runtime failures retry within attempt budget and block after exhaustion', () => {
   const retry = superviseTaskFailure(
     { id: 'draft', attempt: 1, maxAttempts: 2 },

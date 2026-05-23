@@ -104,7 +104,9 @@ test('setOnline clears stale degraded health so restarted agents can route', asy
     assert.equal(online.runtimeId, 'pid-123');
     assert.equal(online.runtimeHealth.state, 'healthy');
     assert.equal(online.runtimeHealth.lastFailureClass, null);
-    assert.deepEqual(online.runtimeHealth.taskCapabilities, ['planning']);
+    assert.equal(online.runtimeHealth.taskCapabilities.includes('planning'), true);
+    assert.equal(online.runtimeHealth.taskCapabilities.includes('source_research'), true);
+    assert.equal(online.runtimeHealth.outputCapabilities.includes('report_html'), true);
 
     store.setOffline('worker');
     const offline = store.get('worker');

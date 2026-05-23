@@ -96,7 +96,7 @@ export function planProjectRecovery({
       continue;
     }
 
-    if (task.status === 'submitted' && task.result && !task.reviewResult) {
+    if (task.status === 'submitted' && task.result && !hasCurrentReviewResult(task)) {
       actions.push({
         type: 'notify_po_review',
         projectId: project.id,
@@ -112,3 +112,12 @@ export function planProjectRecovery({
   return { actions, diagnostics };
 }
 
+function hasCurrentReviewResult(task = {}) {
+  if (!task.reviewResult) return false;
+  if (task.reviewResult.passed === false) {
+    const reviewedAt = Number(task.reviewResult.reviewedAt || 0);
+    const submittedAt = Number(task.updatedAt || task.recoveredAt || 0);
+    if (submittedAt && (!reviewedAt || reviewedAt < submittedAt)) return false;
+  }
+  return true;
+}

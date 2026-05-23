@@ -142,6 +142,117 @@ test('submitted task waiting for review outranks stale retry child failure', () 
   assert.equal(result.primaryAction.strategy, 'notify_po_review');
 });
 
+test('fresh submitted task with stale failed review outranks non-blocking historical failure', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-current-review', name: 'Claude 本月动态分析', status: 'active' },
+    tasks: [
+      {
+        id: 'historical-failed',
+        title: '持续采集并归档原始数据',
+        status: 'failed',
+        updatedAt: 1779290057566,
+        assignedAgent: 'cli-xiaok',
+        failureReason: 'runtime_offline',
+        lastFailureClass: 'runtime_offline',
+        qualityFailureCount: 3,
+        qualityReviewHistory: [{
+          passed: false,
+          feedback: '旧任务未按每日目录归档，但后续任务暂未依赖它',
+          reviewedAt: 1779290000000,
+        }],
+      },
+      {
+        id: 'current-review',
+        title: '识别重要更新与变化趋势',
+        status: 'submitted',
+        updatedAt: 1779290477783,
+        assignedAgent: 'xiaok-worker',
+        result: {
+          summary: '新一轮返工后的分析笔记',
+          artifactManifest: [{ filename: 'analysis.md', path: 'artifacts/analysis.md' }],
+        },
+        reviewResult: {
+          passed: false,
+          feedback: '上一轮失败反馈',
+          reviewedAt: 1779290455173,
+        },
+        qualityReviewHistory: [{
+          passed: false,
+          feedback: '上一轮失败反馈',
+          reviewedAt: 1779290455173,
+        }],
+      },
+      { id: 'next', title: '撰写报告初稿', status: 'pending', dependencies: ['current-review'] },
+    ],
+    agents: [{ id: 'xiaok-worker', status: 'idle', runtimeHealth: { state: 'healthy' } }],
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryTaskId, 'current-review');
+  assert.equal(result.primaryAction.strategy, 'notify_po_review');
+  assert.match(result.message, /等待 PO 复审/);
+});
+
+test('downstream final deliverable blocker outranks non-blocking historical quality failure', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-final-blocker', name: 'Claude 本月动态分析', status: 'active' },
+    tasks: [
+      {
+        id: 'p1-item3',
+        title: '持续采集并归档原始数据',
+        status: 'failed',
+        updatedAt: 1779290057566,
+        assignedAgent: 'cli-xiaok',
+        failureReason: 'runtime_offline',
+        lastFailureClass: 'runtime_offline',
+        qualityFailureCount: 3,
+        qualityReviewHistory: [{
+          passed: false,
+          feedback: '旧任务仍有质量反馈，但当前后续任务不再依赖它',
+          reviewedAt: 1779290000000,
+        }],
+      },
+      {
+        id: 'p3-item2',
+        title: '内部审核与修订',
+        status: 'done',
+        updatedAt: 1779292514624,
+        result: {
+          summary: '报告已经通过内部审核',
+          artifactManifest: [{ filename: 'reviewed-report.md', path: 'artifacts/reviewed-report.md' }],
+        },
+      },
+      {
+        id: 'p4-item1',
+        title: '生成最终 Markdown 文件',
+        status: 'failed',
+        updatedAt: 1779292530907,
+        assignedAgent: 'cli-xiaok',
+        failureReason: 'runtime_offline',
+        lastFailureClass: 'runtime_offline',
+        dependencies: ['p3-item2'],
+      },
+      {
+        id: 'p4-item2',
+        title: '项目总结与复盘',
+        status: 'pending',
+        assignedAgent: 'xiaok-po',
+        dependencies: ['p4-item1'],
+      },
+    ],
+    agents: [
+      { id: 'cli-xiaok', status: 'idle', runtimeHealth: { state: 'healthy' } },
+      { id: 'xiaok-worker', status: 'idle', runtimeHealth: { state: 'healthy' } },
+    ],
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryTaskId, 'p4-item1');
+  assert.equal(result.primaryAction.strategy, 'retry_best_agent');
+  assert.equal(result.downstreamBlockedCount, 1);
+  assert.match(result.message, /后续 1 个任务/);
+});
+
 test('quality feedback returns repair retry strategy', () => {
   const result = deriveProjectIntervention({
     project: { id: 'proj-3', name: '报告项目', status: 'active' },
@@ -152,7 +263,7 @@ test('quality feedback returns repair retry strategy', () => {
         status: 'blocked',
         updatedAt: 1779093510000,
         assignedAgent: 'cli-qoder',
-        blockKind: 'executor_quality_blocked',
+        blockKind: 'quality_gate_blocked',
         blockedReason: '质量验收未通过',
         qualityFailureCount: 2,
         qualityReviewHistory: [{ passed: false, feedback: '缺少数据来源' }],
@@ -165,6 +276,43 @@ test('quality feedback returns repair retry strategy', () => {
   assert.equal(result.primaryTaskId, 'analysis');
   assert.equal(result.primaryAction.strategy, 'retry_with_repair_instruction');
   assert.match(result.primaryFailure.feedback, /缺少数据来源/);
+});
+
+test('plan revision required temporal block requires Xiaok conversation', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-temporal', name: 'Claude 本月动态分析', status: 'active' },
+    tasks: [
+      {
+        id: 'p1-item3',
+        title: '持续采集并归档原始数据',
+        status: 'blocked',
+        updatedAt: 1779289436398,
+        assignedAgent: 'cli-xiaok',
+        blockKind: 'plan_revision_required',
+        blockedReason: '覆盖范围仅5月1日至20日，缺少5月21-31日数据',
+        lastFailureClass: 'quality_temporal_impossible',
+        qualityFailureCount: 1,
+        reviewResult: {
+          passed: false,
+          feedback: '覆盖范围仅5月1日至20日，缺少5月21-31日数据',
+          reviewedAt: 1779289436398,
+        },
+        qualityReviewHistory: [{
+          passed: false,
+          feedback: '覆盖范围仅5月1日至20日，缺少5月21-31日数据',
+          reviewedAt: 1779289436398,
+        }],
+      },
+      { id: 'p2-item1', title: '清洗去重与分类', status: 'pending', dependencies: ['p1-item3'] },
+    ],
+    agents: [{ id: 'cli-xiaok', status: 'idle', runtimeHealth: { state: 'healthy' } }],
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryTaskId, 'p1-item3');
+  assert.equal(result.primaryAction.strategy, 'needs_conversation');
+  assert.equal(result.severity, 'warning');
+  assert.match(result.message, /需要让小K帮忙/);
 });
 
 test('repeated quality failures require Xiaok repair instead of another automatic retry', () => {
@@ -341,7 +489,7 @@ test('rejected recovered artifact uses repair retry instead of recover submissio
         result: { artifacts: [{ filename: 'data-baseline.json', path: '/tmp/data-baseline.json' }] },
         recoveryStatus: 'recovered',
         recoveredAt: 1779115404459,
-        blockKind: 'executor_quality_blocked',
+        blockKind: 'quality_gate_blocked',
         blockedReason: '缺失主要贸易伙伴进出口额、人民币汇率、政策变动清单、热点事件列表',
         qualityFailureCount: 2,
         reviewResult: {

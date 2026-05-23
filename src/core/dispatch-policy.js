@@ -2,14 +2,13 @@ import { planTaskRoute } from './capability-router.js';
 
 export const ACTIVE_TASK_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 
-export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agentProfiles = null, executors = [], now = Date.now(), agentConcurrency = {} } = {}) {
+export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agentProfiles = null, now = Date.now(), agentConcurrency = {} } = {}) {
   const taskMap = new Map(tasks.map(task => [task.id, task]));
   const shouldCheckCapabilities = hasAgentProfiles(agentProfiles);
   const activeCounts = countActiveTasksByAgent(
     allActiveTasks
       .filter(task => ACTIVE_TASK_STATUSES.has(task.status))
-      .filter(task => !isReworkReadyForDispatch(task))
-      .filter(task => !task.assignedExecutor),
+      .filter(task => !isReworkReadyForDispatch(task)),
   );
 
   const dispatchedTasks = [];
@@ -42,7 +41,7 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
     }
     if (shouldCheckCapabilities) {
       const availableAgents = listAgentProfiles(agentProfiles).filter(agent => !isAgentAtCapacity(agent.id, activeCounts, agentConcurrency));
-      const route = planTaskRoute({ task, agents: availableAgents, executors, now });
+      const route = planTaskRoute({ task, agents: availableAgents, now });
       if (!route.ok) {
         skipped.push({ taskId: task.id, reason: route.reason, agent: task.assignedAgent });
         continue;
@@ -51,7 +50,7 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
       const routedTask = {
         ...task,
         assignedAgent: selectedAgent || task.assignedAgent,
-        assignedExecutor: route.selectedExecutorId || null,
+        assignedExecutor: null,
         preferredAssignedAgent: task.assignedAgent,
         selectedRoute: route,
       };

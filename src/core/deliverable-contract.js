@@ -4,7 +4,20 @@ import { extname, isAbsolute, join } from 'node:path';
 const OUTPUT_EXTENSIONS = {
   markdown: new Set(['.md', '.markdown']),
   html: new Set(['.html', '.htm']),
+  report_html: new Set(['.html', '.htm']),
+  slide_html: new Set(['.html', '.htm']),
   pptx: new Set(['.pptx']),
+};
+
+const RENDERER_HTML_CONTRACTS = {
+  report_html: {
+    marker: 'data-template="kai-report-creator"',
+    minChars: 300,
+  },
+  slide_html: {
+    marker: 'data-generator="kai-slide-creator"',
+    minChars: 300,
+  },
 };
 
 export function validateDeliverableContract({
@@ -32,6 +45,13 @@ export function validateDeliverableContract({
         errors.push(`pptx artifact invalid: no parseable OOXML presentation package found`);
       }
     }
+
+    if (RENDERER_HTML_CONTRACTS[output.type]) {
+      const valid = candidates.some(candidate => isLikelyRendererHtmlFile(candidate.path, RENDERER_HTML_CONTRACTS[output.type]));
+      if (!valid) {
+        errors.push(`${output.type} artifact invalid: renderer marker or substantive content missing`);
+      }
+    }
   }
 
   const ok = errors.length === 0;
@@ -41,6 +61,24 @@ export function validateDeliverableContract({
     missing,
     failureClass: ok ? null : missing.length > 0 ? 'artifact_type_mismatch' : 'artifact_invalid',
   };
+}
+
+export function isLikelyRendererHtmlFile(path, contract) {
+  if (!path || !existsSync(path)) return false;
+  let content;
+  try {
+    content = readFileSync(path, 'utf-8');
+  } catch {
+    return false;
+  }
+  if (!content.includes(contract.marker)) return false;
+  const visible = content
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return visible.length >= contract.minChars;
 }
 
 export function isLikelyPptxFile(path) {

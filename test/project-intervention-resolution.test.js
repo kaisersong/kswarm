@@ -105,6 +105,79 @@ test('repair_and_submit writes artifact, recovers failed task, and notifies revi
   assert.equal(reviewMessages[0].toParticipantId, 'po');
 });
 
+test('repair_and_submit recovers blocked task with artifact path for PO review', () => {
+  const sent = [];
+  const bridge = { send: message => sent.push(message) };
+  const { hub, project, task } = setupFailedProject({ bridge });
+  const writer = tempArtifactWriter();
+  project.workFolder = writer.dir;
+  writeFileSync(join(writer.artifactsDir, 'blocked-repair.md'), STORY, 'utf8');
+
+  task.status = 'blocked';
+  task.failureReason = '产物文件为 none，请重新提交完整 Markdown 文件';
+  task.updatedAt = Date.now();
+
+  const result = hub.handleResolveProjectIntervention(project.id, {
+    idempotencyKey: 'repair-blocked-submit',
+    resolution: 'repair_and_submit',
+    fromAgent: 'xiaok-worker',
+    expectedPrimaryTaskId: task.id,
+    expectedTaskUpdatedAt: task.updatedAt,
+    summary: '提交已写入 artifacts 目录的修复产物',
+    artifacts: [
+      { path: 'artifacts/blocked-repair.md', mimeType: 'text/markdown' },
+    ],
+  }, writer);
+
+  const updated = hub.getBoard(project.id).getTask(task.id);
+  assert.equal(result.ok, true);
+  assert.equal(result.outcome, 'submitted_for_review');
+  assert.equal(updated.status, 'submitted');
+  assert.equal(updated.recoveredFromStatus, 'blocked');
+  assert.equal(updated.recoveryReason, 'intervention_repair_and_submit');
+  assert.equal(updated.result.workFolder, writer.dir);
+  assert.equal(updated.result.workspacePath, writer.dir);
+  assert.equal(updated.result.artifacts[0].relativePath, 'artifacts/blocked-repair.md');
+  assert.equal(sent.filter(message => message.kind === 'review_submission').length, 1);
+});
+
+test('repair_and_submit expands short summary so evidence-gated blocked task can pass review', () => {
+  const { hub, project, task } = setupFailedProject();
+  const writer = tempArtifactWriter();
+  writeFileSync(join(writer.artifactsDir, 'evidence-repair.md'), STORY, 'utf8');
+
+  task.status = 'blocked';
+  task.evidenceContract = { version: 1, kind: 'external_source_v1', required: true };
+  task.executionContract = { minSummaryChars: 50 };
+  task.updatedAt = Date.now();
+
+  const result = hub.handleResolveProjectIntervention(project.id, {
+    idempotencyKey: 'repair-short-summary',
+    resolution: 'repair_and_submit',
+    fromAgent: 'xiaok-worker',
+    expectedPrimaryTaskId: task.id,
+    expectedTaskUpdatedAt: task.updatedAt,
+    summary: '已修复',
+    artifacts: [
+      { path: 'artifacts/evidence-repair.md', mimeType: 'text/markdown' },
+    ],
+  }, writer);
+
+  assert.equal(result.ok, true);
+  assert.ok(result.result.summary.length >= 50);
+  assert.match(result.result.summary, /evidence-repair\.md/);
+
+  const review = hub.handleQualityReview(project.id, task.id, {
+    passed: true,
+    feedback: '产物文件满足验收要求',
+  }, 'po');
+  const updated = hub.getBoard(project.id).getTask(task.id);
+
+  assert.equal(review.ok, true);
+  assert.equal(review.rework, undefined);
+  assert.equal(updated.status, 'done');
+});
+
 test('repair_and_submit rejects stale task state without writing artifacts', () => {
   const { hub, project, task } = setupFailedProject();
   const writer = tempArtifactWriter();

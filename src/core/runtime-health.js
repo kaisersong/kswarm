@@ -1,6 +1,6 @@
 const DEFAULT_COOLDOWNS = [0, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 const ROUTABLE_STATES = new Set(['healthy']);
-const TASK_LEVEL_FAILURE_CLASSES = new Set(['model_empty_output']);
+const TASK_LEVEL_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 
 export function createUnknownRuntimeHealth(overrides = {}) {
   return {
@@ -113,6 +113,10 @@ export function recordRuntimeSuccess(current = {}, success = {}, now = Date.now(
 }
 
 export function isRoutable(agent = {}, requiredCapabilities = [], requiredOutputs = [], now = Date.now()) {
+  if (String(agent.status || '').toLowerCase() === 'offline') {
+    return { ok: false, reason: 'runtime_offline' };
+  }
+
   const health = normalizeHealth(agent.runtimeHealth);
   const state = health.state || 'unknown';
 

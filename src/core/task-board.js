@@ -22,6 +22,7 @@ import {
   makeRunId,
   normalizeExistingTask,
   normalizeTasksForProject,
+  resolveTaskRef,
 } from './task-identity.js';
 
 const VALID_TRANSITIONS = {
@@ -46,7 +47,10 @@ export function createTaskBoard(projectId = 'legacy-project') {
 
   function resolveTaskId(taskId) {
     if (tasks.has(taskId)) return taskId;
-    return aliases.get(taskId) || null;
+    const alias = aliases.get(taskId);
+    if (alias) return alias;
+    const resolved = resolveTaskRef(projectId, taskId, [...tasks.values()]);
+    return resolved?.taskId || null;
   }
 
   /**
@@ -68,7 +72,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         ...task,
         status: 'pending',
         assignedAgent: task.assignedAgent || null,
-        assignedExecutor: task.assignedExecutor || null,
+        assignedExecutor: null,
         result: null,
         attempt: task.attempt || 1,
         maxAttempts: task.maxAttempts || 2,
@@ -123,7 +127,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     task.updatedAt = now;
 
     if (meta.assignedAgent) task.assignedAgent = meta.assignedAgent;
-    if (Object.prototype.hasOwnProperty.call(meta, 'assignedExecutor')) task.assignedExecutor = meta.assignedExecutor || null;
+    if (Object.prototype.hasOwnProperty.call(meta, 'assignedExecutor')) task.assignedExecutor = null;
     if (Object.prototype.hasOwnProperty.call(meta, 'assignedRuntimeInstance')) task.assignedRuntimeInstance = meta.assignedRuntimeInstance || null;
     if (Object.prototype.hasOwnProperty.call(meta, 'result')) task.result = meta.result;
     if (meta.failureReason) task.failureReason = meta.failureReason;
@@ -149,7 +153,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         taskId: task.id,
         assignedAgent: task.assignedAgent || null,
         assignedRuntimeInstance: task.assignedRuntimeInstance || null,
-        assignedExecutor: task.assignedExecutor || null,
+        assignedExecutor: null,
         attempt: task.attempt || 1,
         status: 'dispatched',
         createdAt: now,
@@ -166,7 +170,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.runLease.status = 'accepted';
       task.runLease.assignedAgent = task.assignedAgent || meta.assignedAgent || task.runLease.assignedAgent || null;
       task.runLease.assignedRuntimeInstance = task.assignedRuntimeInstance || meta.assignedRuntimeInstance || task.runLease.assignedRuntimeInstance || null;
-      task.runLease.assignedExecutor = task.assignedExecutor || meta.assignedExecutor || task.runLease.assignedExecutor || null;
+      task.runLease.assignedExecutor = null;
       task.runLease.lastHeartbeatAt = now;
       task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
     }
@@ -190,10 +194,17 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.assignedRuntimeInstance = null;
       task.activeRunId = null;
       task.startedAt = null;
+      task.reviewResult = null;
       task.blockedAt = null;
       task.blockedReason = null;
       task.blockKind = null;
       task.nextActions = [];
+    }
+    if (newStatus === 'submitted') {
+      task.reviewResult = null;
+    }
+    if (newStatus === 'done') {
+      clearActiveFailureState(task);
     }
     if (['submitted', 'done', 'failed', 'blocked', 'cancelled'].includes(newStatus)) {
       if (task.runLease) {
@@ -256,6 +267,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     const oldStatus = parent.status;
     parent.status = 'done';
     parent.result = result;
+    clearActiveFailureState(parent);
     parent.completedAt = now;
     parent.updatedAt = now;
     parent.completedBy = meta.completedBy || 'composite_children';
@@ -272,6 +284,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     const oldStatus = parent.status;
     parent.status = 'done';
     parent.result = result;
+    clearActiveFailureState(parent);
     parent.completedAt = now;
     parent.updatedAt = now;
     parent.completedBy = meta.completedBy || 'retry_child';
@@ -290,7 +303,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
   function validateRun(taskId, runId, workerAgent) {
     const task = getTask(taskId);
     if (!task) return { ok: false, error: 'task_not_found' };
-    const assignedActor = task.assignedExecutor || task.assignedRuntimeInstance || task.assignedAgent;
+    const assignedActor = task.assignedRuntimeInstance || task.assignedAgent;
     if (workerAgent && assignedActor && assignedActor !== workerAgent) {
       return {
         ok: false,
@@ -315,7 +328,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
   function recoverSubmission(taskId, result, meta = {}) {
     const task = getTask(taskId);
     if (!task) return { ok: false, error: 'task_not_found' };
-    if (!['cancelled', 'failed', 'in_progress', 'accepted', 'dispatched'].includes(task.status)) {
+    if (!['cancelled', 'failed', 'blocked', 'in_progress', 'accepted', 'dispatched'].includes(task.status)) {
       return { ok: false, error: `cannot_recover_from_status: ${task.status}` };
     }
     const oldStatus = task.status;
@@ -408,10 +421,15 @@ export function createTaskBoard(projectId = 'legacy-project') {
 
   function isTaskDoneForProjectCompletion(task) {
     if (task.status === 'done' || task.status === 'cancelled') return true;
-    if (!task.parentTaskId) return false;
-    const parentId = resolveTaskId(task.parentTaskId) || task.parentTaskId;
+    const parentRef = task.parentTaskId || task.retryOfTaskId;
+    if (!parentRef) return false;
+    const parentId = resolveTaskId(parentRef) || parentRef;
     const parent = tasks.get(parentId);
-    return Boolean(parent && (parent.status === 'done' || parent.status === 'cancelled'));
+    return Boolean(
+      parent &&
+      (parent.status === 'done' || parent.status === 'cancelled') &&
+      (task.status === 'failed' || task.status === 'blocked' || task.status === 'cancelled')
+    );
   }
 
   function getTask(id) {
@@ -476,7 +494,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
     for (const task of taskArray) {
       const normalized = normalizeExistingTask(projectId, task);
       if (!isExecutableTaskInput(normalized)) continue;
-      clearStaleRecoveredReview(normalized);
+      clearStaleReview(normalized);
+      if (normalized.status === 'done') clearActiveFailureState(normalized);
       tasks.set(normalized.id, normalized);
     }
     rebuildAliases();
@@ -494,16 +513,25 @@ export function createTaskBoard(projectId = 'legacy-project') {
     }
   }
 
-  function clearStaleRecoveredReview(task) {
+  function clearStaleReview(task) {
     if (task.status !== 'submitted') return;
-    if (task.recoveryStatus !== 'recovered') return;
     if (task.reviewResult?.passed !== false) return;
-    const recoveredAt = Number(task.recoveredAt || 0);
+    const submittedAt = Number(task.updatedAt || task.recoveredAt || 0);
     const reviewedAt = Number(task.reviewResult.reviewedAt || 0);
-    if (!recoveredAt) return;
-    if (!reviewedAt || reviewedAt < recoveredAt) {
+    if (!submittedAt) return;
+    if (!reviewedAt || reviewedAt < submittedAt) {
       task.reviewResult = null;
     }
+  }
+
+  function clearActiveFailureState(task) {
+    task.failureReason = null;
+    task.failedAt = null;
+    task.lastFailureClass = null;
+    task.blockedAt = null;
+    task.blockedReason = null;
+    task.blockKind = null;
+    task.nextActions = [];
   }
 
   return {

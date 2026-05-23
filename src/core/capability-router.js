@@ -30,7 +30,7 @@ export function evaluateTaskRoute(task = {}, agent = null, now = Date.now()) {
   };
 }
 
-export function planTaskRoute({ task = {}, agents = [], executors = [], now = Date.now() } = {}) {
+export function planTaskRoute({ task = {}, agents = [], now = Date.now() } = {}) {
   const requirements = inferTaskRequirements(task);
   const orderedAgents = orderAgentsByPreference(agents, task.assignedAgent)
     .filter(agent => shouldConsiderAgentForTask(agent, task));
@@ -58,20 +58,6 @@ export function planTaskRoute({ task = {}, agents = [], executors = [], now = Da
       };
     }
     skipped.push({ agentId: agent?.id || null, reason: route.reason });
-  }
-
-  for (const executor of executors || []) {
-    const route = executorRoutable(executor, requirements);
-    if (route.ok) {
-      return {
-        ok: true,
-        selectedAgentId: null,
-        selectedExecutorId: executor.id,
-        skipped,
-        requirements,
-      };
-    }
-    skipped.push({ executorId: executor?.id || null, reason: route.reason });
   }
 
   return {
@@ -107,24 +93,6 @@ function shouldConsiderAgentForTask(agent, task = {}) {
   const roles = normalizeList(agent.roles);
   if (roles.length === 0) return true;
   return roles.includes('worker') || !roles.includes('project_owner');
-}
-
-function executorRoutable(executor = {}, requirements = {}) {
-  const taskCaps = new Set(normalizeList(executor.taskCapabilities));
-  const outputCaps = new Set(normalizeList(executor.outputCapabilities));
-  const requiredCapabilities = normalizeList(requirements.requiredCapabilities);
-  const requiredOutputs = normalizeHardOutputs(requirements.requiredOutputs);
-
-  if (requiredCapabilities.length === 0 && requiredOutputs.length === 0) {
-    return { ok: false, reason: 'executor_not_applicable' };
-  }
-  for (const capability of requiredCapabilities) {
-    if (!taskCaps.has(capability)) return { ok: false, reason: `capability_missing:${capability}` };
-  }
-  for (const output of requiredOutputs) {
-    if (!outputCaps.has(output)) return { ok: false, reason: `output_missing:${output}` };
-  }
-  return { ok: true };
 }
 
 function limitedAssignedRuntimeMatches({ agent, task, requirements, route }) {

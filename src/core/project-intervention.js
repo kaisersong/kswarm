@@ -17,6 +17,13 @@ export function deriveProjectIntervention({
     return noIntervention({ project, secondaryAction, reason: 'project_not_active' });
   }
 
+  // If all tasks finished successfully or were cancelled, project can idle without intervention.
+  // Failed/blocked tasks still need an intervention candidate.
+  const QUIET_TERMINAL_STATUSES = new Set(['done', 'cancelled']);
+  if (normalizedTasks.length > 0 && normalizedTasks.every(t => QUIET_TERMINAL_STATUSES.has(t.status))) {
+    return noIntervention({ project, secondaryAction, reason: 'all_tasks_terminal' });
+  }
+
   const taskMap = new Map(normalizedTasks.map(task => [task.id, task]));
   const candidate = selectPrimaryCandidate({
     project,
@@ -90,25 +97,47 @@ function selectPrimaryCandidate({ project, tasks, taskMap, agents, dispatchPlan,
     if (ACTIVE_STATUSES.has(task.status)) {
       if (hasUnexpiredLease(task, now)) continue;
       if (hasExpiredLease(task, now)) {
-        candidates.push({ task, strategy: chooseRetryStrategy(task, agents, 'restart_then_retry'), rank: 20 });
+        const strategy = chooseRetryStrategy(task, agents, 'restart_then_retry');
+        const downstreamBlockedCount = countDownstreamBlocked(task, tasks);
+        candidates.push({
+          task,
+          strategy,
+          downstreamBlockedCount,
+          rank: rankTask(task, strategy, downstreamBlockedCount),
+        });
       }
       continue;
     }
 
     if (isSubmittedAwaitingReview(task)) {
-      candidates.push({ task, strategy: 'notify_po_review', rank: rankTask(task, 'notify_po_review') });
+      const downstreamBlockedCount = countDownstreamBlocked(task, tasks);
+      candidates.push({
+        task,
+        strategy: 'notify_po_review',
+        downstreamBlockedCount,
+        rank: rankTask(task, 'notify_po_review', downstreamBlockedCount),
+      });
       continue;
     }
 
     if (!ATTENTION_STATUSES.has(task.status)) continue;
 
     const strategy = chooseAttentionStrategy(task, agents);
-    candidates.push({ task, strategy, rank: rankTask(task, strategy) });
+    const downstreamBlockedCount = countDownstreamBlocked(task, tasks);
+    candidates.push({
+      task,
+      strategy,
+      downstreamBlockedCount,
+      rank: rankTask(task, strategy, downstreamBlockedCount),
+    });
   }
 
   if (candidates.length === 0) return null;
   candidates.sort((left, right) => {
     if (left.rank !== right.rank) return left.rank - right.rank;
+    const leftBlocked = Number(left.downstreamBlockedCount || 0);
+    const rightBlocked = Number(right.downstreamBlockedCount || 0);
+    if (leftBlocked !== rightBlocked) return rightBlocked - leftBlocked;
     return latestTimestamp(right.task) - latestTimestamp(left.task);
   });
   return candidates[0];
@@ -139,6 +168,7 @@ function isRetryChildMaskingQualityDeadloop(task, taskMap) {
 }
 
 function chooseAttentionStrategy(task, agents) {
+  if (requiresPlanRevision(task)) return 'needs_conversation';
   const hasCurrentQuality = hasCurrentQualityRejection(task);
   const hasAnyQualityFeedback = hasCurrentQuality || hasQualityFeedback(task);
   if (hasAnyQualityFeedback && shouldEscalateQualityRepair(task)) return 'needs_conversation';
@@ -153,9 +183,22 @@ function chooseRetryStrategy(task, agents, preferredStrategy) {
   return preferredStrategy;
 }
 
-function rankTask(task, strategy) {
+function rankTask(task, strategy, downstreamBlockedCount = 0) {
+  const baseRank = baseTaskRank(task, strategy);
+  const isDownstreamBlocker = Number(downstreamBlockedCount || 0) > 0;
+  if (isDownstreamBlocker) {
+    return strategy === 'needs_conversation' && baseRank >= 90 ? 45 : baseRank;
+  }
+  if (ATTENTION_STATUSES.has(task?.status)) {
+    return Math.max(baseRank, 70);
+  }
+  return baseRank;
+}
+
+function baseTaskRank(task, strategy) {
   if (strategy === 'recover_submission') return 10;
   if (strategy === 'notify_po_review') return 12;
+  if (strategy === 'needs_conversation' && requiresPlanRevision(task)) return 14;
   if (strategy === 'needs_conversation' && hasQualityFeedback(task) && shouldEscalateQualityRepair(task)) return 15;
   if (strategy === 'retry_with_repair_instruction') return 20;
   if (strategy === 'restart_then_retry') return 30;
@@ -165,7 +208,17 @@ function rankTask(task, strategy) {
 }
 
 function isSubmittedAwaitingReview(task = {}) {
-  return task.status === 'submitted' && Boolean(task.result) && !task.reviewResult;
+  return task.status === 'submitted' && Boolean(task.result) && !hasCurrentReviewResult(task);
+}
+
+function hasCurrentReviewResult(task = {}) {
+  if (!task.reviewResult) return false;
+  if (task.reviewResult.passed === false) {
+    const reviewedAt = Number(task.reviewResult.reviewedAt || 0);
+    const submittedAt = latestTimestamp(task);
+    if (submittedAt && (!reviewedAt || reviewedAt < submittedAt)) return false;
+  }
+  return true;
 }
 
 function hasRecoverableArtifact(task) {
@@ -190,6 +243,11 @@ function hasQualityFeedback(task = {}) {
   if (String(task.lastFailureClass || '').startsWith('quality_')) return true;
   if (task.blockKind && String(task.blockKind).includes('quality')) return true;
   return latestFailedReview(task) !== null;
+}
+
+function requiresPlanRevision(task = {}) {
+  return task.blockKind === 'plan_revision_required' ||
+    task.lastFailureClass === 'quality_temporal_impossible';
 }
 
 function hasCurrentQualityRejection(task = {}) {

@@ -6,12 +6,11 @@
 
 import assert from 'node:assert/strict';
 import { createHub } from '../../src/core/hub.js';
-import { PRESENTATION_PPTX_EXECUTOR_ID } from '../../src/executors/presentation-pptx-executor.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('technical talk incident routes around degraded workers and blocks markdown-only pptx submissions', () => {
+test('technical talk incident routes around degraded workers and waits for a pptx-capable agent', () => {
   const bridgeMessages = [];
   const hub = createHub({
     silent: true,
@@ -23,9 +22,6 @@ test('technical talk incident routes around degraded workers and blocks markdown
       { id: '2de19e7a-cfc', runtimeHealth: { state: 'cooldown', cooldownUntil: Date.now() + 120_000, taskCapabilities: ['analysis'], outputCapabilities: ['markdown'] } },
       { id: 'cli-qoder', runtimeHealth: { state: 'healthy', taskCapabilities: ['presentation_generation'], outputCapabilities: ['markdown'] } },
       { id: 'cli-claude', runtimeHealth: { state: 'healthy', taskCapabilities: ['analysis', 'presentation_content', 'review_iteration'], outputCapabilities: ['markdown'] } },
-    ],
-    getExecutors: () => [
-      { id: PRESENTATION_PPTX_EXECUTOR_ID, taskCapabilities: ['presentation_generation'], outputCapabilities: ['pptx'] },
     ],
   });
 
@@ -43,16 +39,10 @@ test('technical talk incident routes around degraded workers and blocks markdown
   assert.equal(dispatch.ok, true);
   assert.equal(item7.assignedAgent !== '2de19e7a-cfc', true);
   assert.equal(item8.assignedAgent, 'cli-qoder');
-  assert.equal(item8.assignedExecutor, PRESENTATION_PPTX_EXECUTOR_ID);
-  assert.equal(item8.selectedRoute.selectedExecutorId, PRESENTATION_PPTX_EXECUTOR_ID);
-
-  const rejected = hub.handleSubmitResult('talk', 'item-8', {
-    summary: '已经完成逐页幻灯片内容，包含主题、结构、章节摘要、讲稿要点、受众分析、时间安排、演示节奏和后续建议。',
-    artifacts: [{ filename: 'item-8-report.md', path: 'artifacts/item-8-report.md', mimeType: 'text/markdown' }],
-  }, PRESENTATION_PPTX_EXECUTOR_ID, item8.activeRunId);
-
-  assert.equal(rejected.ok, false);
-  assert.equal(rejected.failureClass, 'artifact_type_mismatch');
+  assert.equal(item8.status, 'pending');
+  assert.equal(item8.assignedExecutor, null);
+  assert.equal(item8.selectedRoute, null);
+  assert.equal(dispatch.skipped.some(item => item.taskId.endsWith('item-8') && item.reason === 'output_missing:pptx'), true);
 });
 
 let passed = 0;

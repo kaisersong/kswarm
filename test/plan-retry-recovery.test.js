@@ -80,12 +80,29 @@ test('preserves a healthy custom project owner PO during plan retry', () => {
   assert.equal(result.reason, 'current_po_usable');
 });
 
+test('reassigns stale xiaok PO without runtime path to the dedicated desktop PO seed', () => {
+  const result = resolvePlanRetryPoAgent(
+    { ...project('created'), poAgent: '33db9546-bfa' },
+    [
+      { id: '33db9546-bfa', name: 'PO', runtimeType: 'xiaok', runtimePath: null, roles: ['project_owner'], status: 'idle' },
+      { id: 'xiaok-po', name: 'PO-Agent', runtimeType: 'xiaok', runtimeSource: 'desktop-agent-runtime', roles: ['project_owner'], status: 'offline' },
+      { id: 'xiaok-worker', name: 'Worker-Agent', runtimeType: 'xiaok', runtimeSource: 'desktop-agent-runtime', roles: ['worker'], status: 'offline' },
+    ],
+  );
+
+  assert.equal(result.poAgent, 'xiaok-po');
+  assert.equal(result.previousPoAgent, '33db9546-bfa');
+  assert.equal(result.changed, true);
+  assert.equal(result.reason, 'preferred_xiaok_po');
+});
+
 test('builds retry assign_po intent with the same project context as project creation', () => {
   const intent = buildPlanRetryAssignPoIntent({
     id: 'proj-test',
     name: 'Test Project',
     goal: 'Ship the report',
     requirements: 'Use markdown',
+    planningGuidance: 'Keep detailed output format in the plan.',
     members: ['xiaok-worker'],
   });
 
@@ -98,6 +115,7 @@ test('builds retry assign_po intent with the same project context as project cre
       name: 'Test Project',
       goal: 'Ship the report',
       requirements: 'Use markdown',
+      planningGuidance: 'Keep detailed output format in the plan.',
       members: ['xiaok-worker'],
     },
   });

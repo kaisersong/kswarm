@@ -42,9 +42,10 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 2. **Human approves** — Review the plan before execution starts
 3. **Phase-aware dispatch** — Only the current phase's tasks are dispatched; next phase waits
 4. **Runtime-safe execution** — dispatch routes through agent health, capability, and active-run leases
-5. **Quality review** — PO reads actual artifact content and evaluates against acceptance criteria
-6. **Rework loop** — Failed reviews send tasks back with specific feedback
-7. **Auto-synthesis** — When all phases complete, PO generates a final deliverable
+5. **File-based handoff** — large task context, requirements, evidence contracts, and artifact contracts are written to handoff files instead of oversized broker messages
+6. **Quality review** — PO reads actual artifact content and evaluates against acceptance criteria
+7. **Rework loop** — Failed reviews send tasks back with specific feedback
+8. **Auto-synthesis** — When all phases complete, PO generates a final deliverable
 
 ### Key Design Decisions
 
@@ -57,6 +58,7 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 | Runtime health gates | Agents that are online but unable to execute are degraded, cooled down, and routed around |
 | Deliverable contracts | Hard output requests such as PPTX are validated before PO review |
 | Recoverable planning | Interrupted PO planning can be retried from the project detail page |
+| Execution boundary | Xiaok Desktop seed agents must run in the full Desktop agent runtime; KSwarm does project management and never pretends to be an LLM worker |
 
 ---
 
@@ -72,7 +74,10 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 - **Runtime Watchdogs** — Heartbeats, stdout/stderr telemetry, and stale-run detection prevent silent CLI hangs
 - **Deliverable Contracts** — Explicit PPTX/HTML/Markdown tasks are validated before review
 - **Plan Retry Recovery** — Projects interrupted during PO planning can be restarted safely
-- **Local Executor Registry** — Explicit PPTX presentation tasks can use a deterministic registered executor when no agent can produce PPTX
+- **File Handoff Packages** — Task context is written to durable handoff packages so agents read large requirements and prior artifacts from files
+- **Evidence Contracts** — Recent/monthly research tasks can require source evidence and current-date grounding before review passes
+- **Formal Delivery Files** — Final delivery aliases use project/goal-based filenames instead of internal task IDs
+- **Runtime Boundary Enforcement** — KSwarm maintenance workers can manage state, logs, and packaging, but user tasks are handed to real agents
 - **Persistence** — Projects survive server restarts (debounced JSON state file)
 
 ### Web UI
@@ -217,6 +222,8 @@ npm run test:e2e-p0   # P0 integration scenarios
 ---
 
 ## Version History
+
+**v0.8.0** — Swarm execution boundary and evidence release: Xiaok Desktop seed agents are routed to the full Desktop agent runtime instead of local auto-worker execution; task handoff packages move large context and artifact contracts into files; source/evidence contracts calibrate recent and monthly research review; artifact-first completion prevents empty summary-only results; final deliverables use formal filenames and delivery aliases; failed/blocked historical retry children no longer hold project delivery hostage.
 
 **v0.7.0** — Reliable execution hardening: runtime probes and health cooldowns, capability-aware dispatch/retry routing, stalled-run watchdogs with heartbeat/stdout/stderr telemetry, strict deliverable contracts for PPTX/HTML/Markdown tasks, deterministic local executor fallback for explicit PPTX presentation tasks, restart recovery for active runs, and retryable planning when the PO planning phase is interrupted.
 

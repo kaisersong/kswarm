@@ -42,9 +42,10 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 2. **人类审批** — 在执行开始前审核计划
 3. **阶段感知派发** — 只派发当前阶段的任务；下一阶段等待
 4. **运行时安全执行** — 派发会结合 agent 健康、能力和 active-run lease
-5. **质量验收** — PO 读取实际产物内容，对照验收标准评估
-6. **返工循环** — 验收不通过的任务带具体反馈打回
-7. **自动汇总** — 所有阶段完成后，PO 生成最终交付物
+5. **文件化交接** — 大上下文、任务要求、证据合同和产物合同写入 handoff 文件，不再塞进超长 broker 消息
+6. **质量验收** — PO 读取实际产物内容，对照验收标准评估
+7. **返工循环** — 验收不通过的任务带具体反馈打回
+8. **自动汇总** — 所有阶段完成后，PO 生成最终交付物
 
 ### 核心设计决策
 
@@ -57,6 +58,7 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 | Runtime 健康门控 | 在线但无法执行的 agent 会被降级、冷却并绕开 |
 | 交付物合同 | PPTX 等强输出要求会在 PO 验收前校验 |
 | 可恢复规划 | PO 制定计划中断后可在项目详情页重新制定计划 |
+| 执行边界 | Xiaok Desktop 种子 agent 必须走完整 Desktop agent runtime；KSwarm 只做项目管理，不伪装成 LLM worker |
 
 ---
 
@@ -72,7 +74,10 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 - **Runtime Watchdog** — 通过 heartbeat、stdout/stderr telemetry 和 stale-run 检测避免 CLI 静默卡死
 - **交付物合同** — 显式 PPTX/HTML/Markdown 任务会在验收前校验产物类型
 - **计划重试恢复** — PO 制定计划阶段中断的项目可安全重新启动规划
-- **本地执行器注册表** — 明确要求 PPTX 的演示任务在没有 agent 能生成 PPTX 时，可使用确定性注册执行器
+- **文件化 Handoff Package** — 任务上下文写入可持久化交接包，agent 从文件读取大段要求和上游产物
+- **证据合同** — 本月/最近类调研任务可要求来源证据和当前日期基线，证据不足时不通过验收
+- **正式交付文件** — 最终交付 alias 使用项目/目标生成的文件名，而不是内部 task ID
+- **运行时边界约束** — KSwarm maintenance worker 只处理状态、日志、打包等项目管理工作，用户任务交给真正 agent 执行
 - **持久化** — 项目数据在服务器重启后保留（防抖 JSON 状态文件）
 
 ### Web UI
@@ -217,6 +222,8 @@ npm run test:e2e-p0   # P0 集成场景
 ---
 
 ## 版本历史
+
+**v0.8.0** — Swarm 执行边界与证据版本：Xiaok Desktop 种子 agent 任务改派到完整 Desktop agent runtime，不再由本地 auto-worker 执行；任务 handoff package 把大上下文和产物合同文件化；来源/证据合同校准本月、最近类调研验收；artifact-first 完成规则避免空产物摘要；最终交付物使用正式文件名和 delivery alias；失败/阻塞的历史 retry 子任务不再拖住项目交付。
 
 **v0.7.0** — 可靠执行加固：runtime 探测与健康冷却、基于能力的派发/重试路由、带 heartbeat/stdout/stderr telemetry 的卡住运行 watchdog、PPTX/HTML/Markdown 强交付物合同、显式 PPTX 演示任务的确定性本地执行器兜底、active run 重启恢复，以及 PO 制定计划中断后的重试入口。
 

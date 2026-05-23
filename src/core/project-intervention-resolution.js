@@ -152,9 +152,10 @@ export function resolveProjectIntervention({
 
   const fromAgent = String(request.fromAgent || 'human').trim() || 'human';
   const resultPayload = {
-    summary: request.summary || `Recovered submission for ${task.id}`,
+    summary: buildRepairSummary({ requestedSummary: request.summary, task, artifacts: submittedArtifacts }),
     participantId: fromAgent,
     artifacts: submittedArtifacts,
+    ...(project.workFolder ? { workFolder: project.workFolder, workspacePath: project.workFolder } : {}),
     recovered: true,
   };
 
@@ -277,6 +278,28 @@ function buildSubmittedArtifact(projectId, artifact, written = {}) {
     generatedAt: written.generatedAt || undefined,
     role: artifact.role || written.role || 'primary',
   };
+}
+
+function buildRepairSummary({ requestedSummary = '', task = {}, artifacts = [] } = {}) {
+  const summary = String(requestedSummary || '').trim();
+  const min = Number(task?.executionContract?.minSummaryChars ?? 50);
+  if (summary.length >= min && !isPlaceholderSummary(summary)) return summary;
+
+  const artifactNames = artifacts
+    .map(artifact => artifact?.filename || artifact?.relativePath || artifact?.path || '')
+    .filter(Boolean);
+  const artifactLabel = artifactNames.length > 0 ? artifactNames.join(', ') : '已登记的 artifact 文件';
+  const taskLabel = task?.title || task?.id || '当前任务';
+  const prefix = summary && !isPlaceholderSummary(summary) ? `${summary}。` : '';
+  return [
+    prefix,
+    `提交修复产物 ${artifactLabel}，作为任务“${taskLabel}”的主要可审核输出。`,
+    '本次修复只登记产物文件路径，不以内联文本替代交付内容；请 PO 按验收标准、证据要求和文件正文继续审核。',
+  ].join('');
+}
+
+function isPlaceholderSummary(value = '') {
+  return /^(done|ok|complete|completed|完成|已完成|已修复)$/i.test(String(value || '').trim());
 }
 
 function validateExpectedState(task, request, intervention) {

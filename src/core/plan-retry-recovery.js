@@ -3,6 +3,7 @@ const FINAL_STATUSES = new Set(['delivered', 'closed']);
 const XIAOK_PO_SEED_ID = 'xiaok-po';
 const XIAOK_LEGACY_SEED_ID = 'xiaok';
 const CLI_XIAOK_ID = 'cli-xiaok';
+const DESKTOP_AGENT_RUNTIME_SOURCE = 'desktop-agent-runtime';
 
 function taskCount(tasks) {
   return Array.isArray(tasks) ? tasks.length : 0;
@@ -28,8 +29,25 @@ function isXiaokRuntime(agent) {
   return agent?.runtimeType === 'xiaok' || agent?.id === XIAOK_PO_SEED_ID || agent?.id === CLI_XIAOK_ID;
 }
 
+function isDesktopRuntimeAgent(agent) {
+  return agent?.runtimeSource === DESKTOP_AGENT_RUNTIME_SOURCE || agent?.id === XIAOK_PO_SEED_ID;
+}
+
+function isStaleXiaokRuntimeWithoutExecutor(agent) {
+  return Boolean(
+    agent &&
+    isXiaokRuntime(agent) &&
+    !agent.runtimePath &&
+    !isDesktopRuntimeAgent(agent)
+  );
+}
+
 function isUsableCurrentPo(agent) {
-  return Boolean(agent) && !isArchived(agent) && agent.id !== XIAOK_LEGACY_SEED_ID && isProjectOwner(agent);
+  return Boolean(agent) &&
+    !isArchived(agent) &&
+    agent.id !== XIAOK_LEGACY_SEED_ID &&
+    !isStaleXiaokRuntimeWithoutExecutor(agent) &&
+    isProjectOwner(agent);
 }
 
 function activeAgents(agents) {
@@ -40,7 +58,7 @@ function findPreferredPoAgent(agents) {
   return (
     agents.find(agent => agent.id === XIAOK_PO_SEED_ID && isProjectOwner(agent)) ||
     agents.find(agent => agent.id === CLI_XIAOK_ID && isProjectOwner(agent)) ||
-    agents.find(agent => agent.id !== XIAOK_LEGACY_SEED_ID && isXiaokRuntime(agent) && isProjectOwner(agent)) ||
+    agents.find(agent => agent.id !== XIAOK_LEGACY_SEED_ID && isXiaokRuntime(agent) && !isStaleXiaokRuntimeWithoutExecutor(agent) && isProjectOwner(agent)) ||
     agents.find(agent => agent.id === XIAOK_LEGACY_SEED_ID && isProjectOwner(agent)) ||
     agents.find(isProjectOwner) ||
     null
@@ -117,6 +135,7 @@ export function buildPlanRetryAssignPoIntent(project) {
       name: project?.name || '',
       goal: project?.goal || '',
       requirements: project?.requirements || '',
+      planningGuidance: project?.planningGuidance || '',
       members: Array.isArray(project?.members) ? project.members : [],
     },
   };

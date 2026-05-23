@@ -5,7 +5,7 @@
  */
 
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, statSync } from 'node:fs';
-import { join, extname } from 'node:path';
+import { basename, join, extname } from 'node:path';
 
 /**
  * Aggregate project artifacts into a delivery package.
@@ -103,6 +103,167 @@ export function aggregateDelivery(projectWorkspace, projectMeta = {}) {
   };
 }
 
+export function selectUserFacingDeliveryTask(tasks = []) {
+  const candidates = (Array.isArray(tasks) ? tasks : [])
+    .filter(task => task?.status === 'done' && taskHasArtifacts(task));
+  if (candidates.length === 0) return null;
+
+  const explicitFinal = candidates.filter(task => isFinalDeliverableTitle(task.title) && !isSummaryTitle(task.title));
+  if (explicitFinal.length > 0) return latestCompleted(explicitFinal);
+
+  const leafTasks = candidates.filter(task => !hasDoneDependent(task, tasks));
+  const nonSummaryLeaf = leafTasks.filter(task => !isSummaryTitle(task.title));
+  if (nonSummaryLeaf.length > 0) return latestCompleted(nonSummaryLeaf);
+
+  const nonSummary = candidates.filter(task => !isSummaryTitle(task.title));
+  if (nonSummary.length > 0) return latestCompleted(nonSummary);
+
+  if (leafTasks.length > 0) return latestCompleted(leafTasks);
+  return latestCompleted(candidates);
+}
+
+export function buildUserFacingDeliveryFiles({
+  projectId = '',
+  projectName = '',
+  goal = '',
+  artifacts = [],
+  finalTask = null,
+  deliveryDir = '',
+} = {}) {
+  const submittedArtifacts = [
+    ...(Array.isArray(finalTask?.result?.artifacts) ? finalTask.result.artifacts : []),
+    ...(Array.isArray(finalTask?.result?.artifactManifest) ? finalTask.result.artifactManifest : []),
+  ].filter(artifact => artifact && artifact.filename);
+  if (submittedArtifacts.length > 0) {
+    return submittedArtifacts.map(artifact => toUserFacingFile({ projectId, projectName, goal, artifact, finalTask, deliveryDir }));
+  }
+
+  const taskRefs = new Set([finalTask?.id, finalTask?.localTaskId].filter(Boolean).map(String));
+  const selected = taskRefs.size > 0
+    ? artifacts.filter(artifact => taskRefs.has(String(artifact?.taskId || '')))
+    : [];
+  const files = selected.length > 0 ? selected : artifacts.slice(-1);
+
+  return files
+    .filter(artifact => artifact && artifact.filename)
+    .map(artifact => toUserFacingFile({ projectId, projectName, goal, artifact, finalTask, deliveryDir }));
+}
+
+function toUserFacingFile({ projectId = '', projectName = '', goal = '', artifact = {}, finalTask = null, deliveryDir = '' } = {}) {
+  const filename = String(artifact.filename);
+  const formalFilename = buildFormalDeliveryFilename({ projectName, goal, filename, artifact, finalTask });
+  if (deliveryDir && formalFilename && formalFilename !== filename) {
+    ensureDeliveryAlias({ deliveryDir, sourceFilename: filename, targetFilename: formalFilename });
+  }
+  const displayFilename = formalFilename || filename;
+  const usesDeliveryAlias = Boolean(deliveryDir && formalFilename && formalFilename !== filename && existsSync(join(deliveryDir, formalFilename)));
+  return {
+    name: displayFilename,
+    filename: displayFilename,
+    originalFilename: filename,
+    type: artifact.type,
+    mimeType: artifact.mimeType || getMimeType(filename, artifact.type),
+    size: artifact.size,
+    taskId: artifact.taskId || finalTask?.id || null,
+    url: usesDeliveryAlias
+      ? `/projects/${encodeURIComponent(projectId)}/delivery/${encodeURIComponent(displayFilename)}`
+      : artifact.url || (projectId ? `/projects/${encodeURIComponent(projectId)}/artifacts/${encodeURIComponent(filename)}` : undefined),
+    path: usesDeliveryAlias ? `delivery/${displayFilename}` : artifact.relativePath || artifact.path || `artifacts/${filename}`,
+  };
+}
+
+function buildFormalDeliveryFilename({ projectName = '', goal = '', filename = '', artifact = {}, finalTask = null } = {}) {
+  const ext = extname(filename).toLowerCase();
+  if (!ext) return '';
+  const hasFormalContext = String(projectName || goal || '').trim();
+  if (!hasFormalContext) return '';
+
+  const base = chooseFormalDeliveryBase({ projectName, goal, artifact, finalTask });
+  const safeBase = sanitizeFilenamePart(base);
+  if (!safeBase) return '';
+  return `${safeBase}${ext}`;
+}
+
+function chooseFormalDeliveryBase({ projectName = '', goal = '', artifact = {}, finalTask = null } = {}) {
+  const project = String(projectName || '').trim();
+  const target = project || extractReportNameFromGoal(goal) || String(finalTask?.title || '').trim() || '项目交付物';
+  const isReport = isReportArtifact(artifact, finalTask);
+  if (isReport && !/报告|report/i.test(target)) return `${target}报告`;
+  return target;
+}
+
+function extractReportNameFromGoal(goal = '') {
+  const text = String(goal || '').trim();
+  const match = text.match(/(?:输出|生成|撰写|制作|创建)\s*([^，。,；;\n]+?报告)/);
+  if (match) return match[1].trim();
+  return text;
+}
+
+function isReportArtifact(artifact = {}, finalTask = null) {
+  const text = [
+    artifact.filename,
+    artifact.type,
+    artifact.mimeType,
+    finalTask?.title,
+  ].filter(Boolean).join(' ');
+  return /report|报告|report_html|text\/html|\.html?$/i.test(text);
+}
+
+function sanitizeFilenamePart(value = '') {
+  return String(value || '')
+    .replace(/[\\/:*?"<>|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
+function ensureDeliveryAlias({ deliveryDir = '', sourceFilename = '', targetFilename = '' } = {}) {
+  if (!deliveryDir || !sourceFilename || !targetFilename || sourceFilename === targetFilename) return;
+  const targetPath = join(deliveryDir, targetFilename);
+  if (existsSync(targetPath)) return;
+
+  const sourceCandidates = [
+    join(deliveryDir, sourceFilename),
+    join(deliveryDir, basename(sourceFilename)),
+    join(deliveryDir, '..', 'artifacts', sourceFilename),
+  ];
+  const sourcePath = sourceCandidates.find(candidate => existsSync(candidate));
+  if (!sourcePath) return;
+  copyFileSync(sourcePath, targetPath);
+}
+
+function taskHasArtifacts(task = {}) {
+  const result = task.result || {};
+  return (
+    (Array.isArray(result.artifactManifest) && result.artifactManifest.length > 0) ||
+    (Array.isArray(result.artifacts) && result.artifacts.length > 0)
+  );
+}
+
+function isFinalDeliverableTitle(title = '') {
+  return /最终|交付|定稿|final|deliverable|markdown|pptx|报告|report/i.test(String(title || ''));
+}
+
+function isSummaryTitle(title = '') {
+  return /总结|复盘|小结|synthesis|summary|retrospective/i.test(String(title || ''));
+}
+
+function hasDoneDependent(task, tasks) {
+  const taskRefs = new Set([task.id, task.localTaskId, task.title].filter(Boolean));
+  return (Array.isArray(tasks) ? tasks : []).some(candidate => {
+    if (!candidate || candidate.id === task.id || candidate.status !== 'done') return false;
+    return (candidate.dependencies || []).some(dep => taskRefs.has(dep));
+  });
+}
+
+function latestCompleted(tasks) {
+  return [...tasks].sort((left, right) => latestTaskTimestamp(right) - latestTaskTimestamp(left))[0] || null;
+}
+
+function latestTaskTimestamp(task = {}) {
+  return Number(task.completedAt || task.updatedAt || task.createdAt || 0);
+}
+
 /**
  * Extract task ID from artifact filename convention: <taskId>-report.md
  */
@@ -122,4 +283,33 @@ function getArtifactType(ext) {
     '.docx': 'document', '.xlsx': 'spreadsheet',
   };
   return types[ext] || 'binary';
+}
+
+function getMimeType(filename, type) {
+  const ext = extname(filename).toLowerCase();
+  const byExt = {
+    '.md': 'text/markdown',
+    '.markdown': 'text/markdown',
+    '.txt': 'text/plain',
+    '.json': 'application/json',
+    '.html': 'text/html',
+    '.htm': 'text/html',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  };
+  if (byExt[ext]) return byExt[ext];
+  const byType = {
+    markdown: 'text/markdown',
+    text: 'text/plain',
+    data: 'application/json',
+    html: 'text/html',
+    image: 'image/*',
+    document: 'application/octet-stream',
+  };
+  return byType[type] || undefined;
 }

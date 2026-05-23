@@ -5,6 +5,9 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   enrichTaskWithExecutionContract,
   inferExecutionContract,
@@ -27,6 +30,47 @@ test('review tasks receive a structured evidence contract', () => {
   assert.ok(task.evidenceContract.requiredArtifacts.includes('review-evidence.json'));
   assert.ok(task.evidenceContract.requiredFields.includes('verdict'));
   assert.ok(task.evidenceContract.requiredFields.includes('findings'));
+});
+
+test('revision tasks mentioning review feedback are not treated as review tasks', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'final-report',
+    title: '修订并生成最终HTML报告',
+    brief: '根据对抗性评审建议，修改报告初稿并重新使用 report renderer 生成最终HTML报告。',
+    acceptanceCriteria: '交付最终HTML报告和修改说明（Markdown）。最终报告无逻辑矛盾，格式正确。',
+    assignedAgent: 'worker',
+  });
+
+  assert.notEqual(task.evidenceContract?.kind, 'review_iteration_v1');
+  assert.deepEqual(task.evidenceContract?.requiredArtifacts, undefined);
+});
+
+test('stale persisted review evidence contract is discarded for final revision deliverables', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'final-report',
+    title: '修订并生成最终HTML报告',
+    brief: '根据对抗性评审建议，修改报告初稿。重新使用 report renderer 生成最终HTML报告，同时提供修改说明文档。',
+    acceptanceCriteria: '交付最终HTML报告（report renderer生成）和修改说明（Markdown）。修改说明列出每条评审意见的处理情况。',
+    assignedAgent: 'worker',
+    evidenceContract: {
+      version: 1,
+      kind: 'review_iteration_v1',
+      requiredArtifacts: ['review-evidence.json'],
+      requiredFields: ['verdict', 'findings'],
+    },
+  });
+
+  assert.notEqual(task.evidenceContract?.kind, 'review_iteration_v1');
+
+  const result = validateTaskResultAgainstContract(task, {
+    summary: '已经根据对抗性评审完成最终报告修订，并重新生成 HTML 报告，同时附带可追踪的修改说明，供最终质量检查和交付使用。',
+    artifacts: [
+      { filename: 'report-kingdee-may-2026.html', path: 'artifacts/report-kingdee-may-2026.html', mimeType: 'text/html' },
+      { filename: 'revision-log-v2.0.md', path: 'artifacts/revision-log-v2.0.md', mimeType: 'text/markdown' },
+    ],
+  });
+
+  assert.equal(result.ok, true);
 });
 
 test('plain deliverable tasks still reject empty or placeholder results', () => {
@@ -90,6 +134,80 @@ test('contract validation accepts artifact manifests with filename or relativePa
   assert.equal(result.ok, true);
 });
 
+test('review evidence contract reads verdict and findings from review-evidence artifact in workspace', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kswarm-review-evidence-'));
+  try {
+    mkdirSync(join(dir, 'artifacts'), { recursive: true });
+    writeFileSync(join(dir, 'artifacts', 'review-evidence.json'), JSON.stringify({
+      verdict: 'pass',
+      findings: [
+        { severity: 'minor', message: '来源覆盖完整，后续报告阶段可直接引用。' },
+      ],
+    }), 'utf-8');
+
+    const task = enrichTaskWithExecutionContract({
+      id: 'review-source-evidence',
+      title: '验证信息准确性与完整性',
+      assignedAgent: 'reviewer',
+      evidenceContract: {
+        kind: 'review_iteration_v1',
+        requiredArtifacts: ['review-evidence.json'],
+        requiredFields: ['verdict', 'findings'],
+      },
+    });
+
+    const result = validateTaskResultAgainstContract(task, {
+      summary: '完成信息准确性与完整性验证，核对了关键产品动态、发布日期、来源链接、竞品对照、后续报告可引用边界和风险提示依据。',
+      artifacts: [{
+        filename: 'review-evidence.json',
+        relativePath: 'artifacts/review-evidence.json',
+        mimeType: 'application/json',
+      }],
+    }, { workspacePath: dir });
+
+    assert.equal(result.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('review evidence contract ignores review-evidence artifacts outside workspace', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kswarm-review-evidence-safe-'));
+  const outside = mkdtempSync(join(tmpdir(), 'kswarm-review-evidence-outside-'));
+  try {
+    writeFileSync(join(outside, 'review-evidence.json'), JSON.stringify({
+      verdict: 'pass',
+      findings: [{ severity: 'minor', message: 'This file is outside the workspace.' }],
+    }), 'utf-8');
+
+    const task = enrichTaskWithExecutionContract({
+      id: 'review-source-evidence',
+      title: '验证信息准确性与完整性',
+      assignedAgent: 'reviewer',
+      evidenceContract: {
+        kind: 'review_iteration_v1',
+        requiredArtifacts: ['review-evidence.json'],
+        requiredFields: ['verdict', 'findings'],
+      },
+    });
+
+    const result = validateTaskResultAgainstContract(task, {
+      summary: '完成信息准确性与完整性验证，核对了关键产品动态、发布日期、来源链接、竞品对照、后续报告可引用边界和风险提示依据。',
+      artifacts: [{
+        filename: 'review-evidence.json',
+        path: join(outside, 'review-evidence.json'),
+        mimeType: 'application/json',
+      }],
+    }, { workspacePath: dir });
+
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes('verdict')));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test('explicit pptx tasks reject markdown-only submissions before review', () => {
   const task = enrichTaskWithExecutionContract({
     id: 'talk-deck',
@@ -106,6 +224,37 @@ test('explicit pptx tasks reject markdown-only submissions before review', () =>
   assert.equal(result.ok, false);
   assert.equal(result.failureClass, 'artifact_type_mismatch');
   assert.ok(result.errors.some(e => e.includes('missing required output: pptx')));
+});
+
+test('report_html tasks validate artifact manifests relative to result workFolder', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kswarm-execution-contract-'));
+  try {
+    mkdirSync(join(dir, 'artifacts'), { recursive: true });
+    const body = '金蝶本月产品分析报告 '.repeat(40);
+    writeFileSync(join(dir, 'artifacts', 'kingdee-report.html'), `<!doctype html>
+<html><body><main data-template="kai-report-creator"><h1>金蝶本月产品分析报告</h1><p>${body}</p></main></body></html>`, 'utf-8');
+
+    const task = enrichTaskWithExecutionContract({
+      id: 'render-report',
+      title: '使用report renderer生成HTML报告',
+      brief: '输出最终 HTML 报告',
+      assignedAgent: 'worker',
+    });
+
+    const result = validateTaskResultAgainstContract(task, {
+      summary: '已经生成面向研发高层阅读的金蝶本月产品分析 HTML 报告，包含标题、正文、结构化章节和可打开的 HTML 文件。',
+      workFolder: dir,
+      artifacts: [{
+        filename: 'kingdee-report.html',
+        relativePath: 'artifacts/kingdee-report.html',
+        mimeType: 'text/html',
+      }],
+    });
+
+    assert.equal(result.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 let passed = 0;

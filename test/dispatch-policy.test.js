@@ -7,7 +7,9 @@
 import assert from 'node:assert/strict';
 import { planDispatch } from '../src/core/dispatch-policy.js';
 import { createUnknownRuntimeHealth, recordProbeResult } from '../src/core/runtime-health.js';
-import { PRESENTATION_PPTX_EXECUTOR_ID } from '../src/executors/presentation-pptx-executor.js';
+
+const PRESENTATION_PPTX_EXECUTOR_ID = 'kswarm.executor.presentation.pptx.v1';
+const REPORT_HTML_EXECUTOR_ID = 'kswarm.executor.report.html.v1';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -99,7 +101,7 @@ test('dispatch planning reports Xiaok capacity wait after pooled capacity is ful
   assert.equal(plan.projectGate, 'waiting_for_xiaok_capacity');
 });
 
-test('dispatch planning does not mark preferred agent busy for active local executor runs', () => {
+test('dispatch planning treats stale assignedExecutor tasks as active agent work', () => {
   const plan = planDispatch({
     projectId: 'proj-b',
     tasks: [
@@ -116,8 +118,10 @@ test('dispatch planning does not mark preferred agent busy for active local exec
     ],
   });
 
-  assert.deepEqual(plan.dispatchedTasks.map(task => task.id), ['proj-b__task-1']);
-  assert.deepEqual(plan.skipped, []);
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.deepEqual(plan.skipped, [
+    { taskId: 'proj-b__task-1', reason: 'agent_busy', agent: 'worker' },
+  ]);
 });
 
 test('dispatch planning allows independent tasks from later phases when dependencies are satisfied', () => {
@@ -201,6 +205,45 @@ test('dispatch planning can skip assigned agents that are not capable of require
   assert.deepEqual(plan.dispatchedTasks, []);
   assert.deepEqual(plan.skipped, [
     { taskId: 'deck', reason: 'output_missing:pptx', agent: 'worker-md' },
+  ]);
+  assert.equal(plan.projectGate, 'waiting_for_capable_agent');
+});
+
+test('dispatch planning never assigns a local executor for report html output', () => {
+  const now = 1779050000000;
+  const plan = planDispatch({
+    projectId: 'proj-report',
+    tasks: [
+      {
+        id: 'report',
+        title: '生成本月AI产品动态分析报告',
+        brief: '输出最终 HTML 报告。',
+        status: 'pending',
+        assignedAgent: 'worker-md',
+        dependencies: [],
+      },
+    ],
+    allActiveTasks: [],
+    agentProfiles: [
+      {
+        id: 'worker-md',
+        runtimeHealth: recordProbeResult(createUnknownRuntimeHealth(), {
+          commandOk: true,
+          generationOk: true,
+          taskCapabilities: ['analysis', 'report_generation'],
+          outputCapabilities: ['markdown'],
+        }, now),
+      },
+    ],
+    executors: [
+      { id: REPORT_HTML_EXECUTOR_ID, taskCapabilities: ['report_generation'], outputCapabilities: ['report_html'] },
+    ],
+    now,
+  });
+
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.deepEqual(plan.skipped, [
+    { taskId: 'report', reason: 'output_missing:report_html', agent: 'worker-md' },
   ]);
   assert.equal(plan.projectGate, 'waiting_for_capable_agent');
 });

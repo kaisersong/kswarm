@@ -24,7 +24,18 @@ import {
 } from '../src/core/execution-contract.js';
 import { extractDeclaredArtifacts } from '../src/core/artifact-extractor.js';
 import { selectReviewArtifacts } from '../src/core/artifact-manifest.js';
-import { buildArtifactRepairPrompt, classifyGeneratedArtifact } from '../src/core/artifact-quality.js';
+import { resolveReferencedArtifactsFromOutput } from '../src/core/artifact-reference-registration.js';
+import { buildArtifactRepairPrompt, classifyGeneratedArtifact, isContentHeavyTask } from '../src/core/artifact-quality.js';
+import { collectSearchEvidence } from '../src/core/search-evidence.js';
+import {
+  buildEvidencePromptSection,
+  shouldCollectSearchEvidence,
+} from '../src/core/auto-worker-evidence.js';
+import { requiresExternalSourceEvidence, validateSourceEvidenceArtifact } from '../src/core/source-evidence.js';
+import {
+  buildSemanticOutputArtifacts,
+  hasRequiredOutputType,
+} from '../src/core/semantic-html-renderer.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -37,6 +48,7 @@ const LOGICAL_AGENT_ID = process.env.KSWARM_LOGICAL_AGENT_ID || AGENT_ID;
 const PROJECT_INSTANCE_ID = process.env.KSWARM_PROJECT_ID || '';
 const ALIAS = process.argv[3] || 'AutoWorker';
 const DELAY = Number(process.env.WORK_DELAY || 2000);
+const REFERENCED_ARTIFACT_FAILURE_CLASSES = ['declared_artifact_missing', 'declared_artifact_stale'];
 
 function writeTaskJournal(workFolder, {
   projectId,
@@ -165,6 +177,10 @@ async function loadAgentConfig() {
         console.log(`[${ALIAS}] Instructions: ${agentInstructions.slice(0, 60)}...`);
       }
 
+      if (!assertAutoWorkerAllowedForLoadedAgent()) {
+        throw new Error('desktop_runtime_required');
+      }
+
       // Build LLM from agent config (fallback when CLI not available)
       if (agentConfig.provider) {
         try {
@@ -198,6 +214,26 @@ async function loadAgentConfig() {
   } else {
     console.log(`[${ALIAS}] LLM: not configured (using template fallback)`);
   }
+}
+
+function isDesktopManagedSeedConfig(config = {}) {
+  return (
+    config.runtimeSource === 'desktop-agent-runtime' ||
+    (
+      config.runtimeType === 'xiaok' &&
+      ['xiaok-po', 'xiaok-worker'].includes(LOGICAL_AGENT_ID) &&
+      !config.runtimePath
+    )
+  );
+}
+
+function assertAutoWorkerAllowedForLoadedAgent() {
+  const mode = process.env.KSWARM_AUTO_WORKER_MODE || 'user_task';
+  if (mode === 'maintenance') return true;
+  if (!isDesktopManagedSeedConfig(agentConfig)) return true;
+  console.error(`[${ALIAS}] desktop_runtime_required: desktop-managed seed user tasks must run in Xiaok desktop agent runtime`);
+  process.exitCode = 12;
+  return false;
 }
 
 function buildEnvConfig() {
@@ -245,7 +281,7 @@ function isProjectAllDoneForDelivery(tasks = []) {
   if (!Array.isArray(tasks) || tasks.length === 0) return false;
   const taskById = new Map(tasks.map(task => [task.id, task]));
   return tasks.every(task => {
-    if (task.status === 'done' || task.status === 'cancelled') return true;
+    if (task.status === 'done' || task.status === 'cancelled' || task.status === 'failed' || task.status === 'blocked') return true;
     return isHistoricalRetryChildResolved(task, taskById);
   });
 }
@@ -253,7 +289,11 @@ function isProjectAllDoneForDelivery(tasks = []) {
 function isHistoricalRetryChildResolved(task, taskById) {
   if (!task?.parentTaskId) return false;
   const parent = taskById.get(task.parentTaskId);
-  return Boolean(parent && (parent.status === 'done' || parent.status === 'cancelled'));
+  return Boolean(parent && (parent.status === 'done' || parent.status === 'cancelled' || parent.status === 'failed' || parent.status === 'blocked'));
+}
+
+function getCurrentDateForPrompt() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 // ─── CLI Harness: spawn real CLI binaries (multica-aligned) ───────────────────
@@ -792,7 +832,7 @@ async function handleIntent(intent) {
 // ─── PO Behavior: decompose goal → create tasks → wait for approval ──────────
 
 async function handlePOAssignment(payload) {
-  const { projectId, projectName, goal, requirements, members } = payload;
+  const { projectId, projectName, goal, requirements, planningGuidance, members } = payload;
 
   // Guard: don't re-decompose if we've already processed this project
   if (poProjects.has(projectId)) {
@@ -800,7 +840,7 @@ async function handlePOAssignment(payload) {
     return;
   }
 
-  poProjects.set(projectId, { name: projectName, goal, requirements: requirements || '', members, status: 'planning' });
+  poProjects.set(projectId, { name: projectName, goal, requirements: requirements || '', planningGuidance: planningGuidance || '', members, status: 'planning' });
 
   // Check if tasks already exist (e.g. PO restarted after decomposition)
   try {
@@ -830,7 +870,7 @@ async function handlePOAssignment(payload) {
   // Plan-Do mode: generate structured plan
   let tasks;
   try {
-    tasks = await generatePlan(projectId, projectName, goal, requirements || '', members || []);
+    tasks = await generatePlan(projectId, projectName, goal, requirements || '', members || [], planningGuidance || '');
     console.log(`[${ALIAS}]   → Plan generated with ${tasks.length} tasks:`);
   } catch (err) {
     console.log(`[${ALIAS}]   ⚠ Plan generation failed, falling back to decompose: ${err.message}`);
@@ -934,18 +974,23 @@ async function decomposeGoal(projectId, projectName, goal, requirements, members
  * Generate a structured Plan (replaces decomposeGoal for Plan-Do mode).
  * PO analyzes the goal deeply and produces phases with acceptance criteria.
  */
-async function generatePlan(projectId, projectName, goal, requirements, members) {
+async function generatePlan(projectId, projectName, goal, requirements, members, planningGuidance = '') {
   const workers = [LOGICAL_AGENT_ID, ...members].filter(Boolean);
   const goalText = goal || projectName || 'project';
   const lang = detectLanguage(goalText);
   const workerList = workers.map((w, i) => `- ${w}${i === 0 ? ' (你自己，PO)' : ''}`).join('\n');
+  const currentDate = getCurrentDateForPrompt();
 
   const prompt = lang === 'zh'
     ? `你是项目负责人（PO），需要为以下项目制定详细的执行计划。
 
+## 当前日期
+${currentDate}
+
 ## 项目目标
 ${goalText}
 ${requirements ? `\n## 项目要求（必须严格遵守）\n${requirements}` : ''}
+${planningGuidance ? `\n## 执行计划指导（系统推导，不改写用户目标/要求）\n${planningGuidance}` : ''}
 
 ## 可用 Workers
 ${workerList}
@@ -959,6 +1004,8 @@ ${workerList}
    - 内容创作类：要求结构完整、语言流畅、逻辑清晰，不设字数下限
    - 分析对比类：要求分析有逻辑、结论有依据，不设洞察数量下限
    - 只有项目要求中明确指定的量化指标才可写入验收标准
+   - “本月/本周/最近”默认指截至当前日期；不得要求当前日期之后尚未发生的数据
+   - 如用户明确要求完整自然月，应拆成当前可交付版本和后续更新/等待任务，不要让当前任务验收未来数据
 5. **严格遵守项目要求中的流程**：如果要求"讨论N轮"、"对抗性评审"、"迭代修订"等，必须按轮次/阶段组织
 6. **依赖关系**：用 dependencies 体现任务间的先后顺序
 7. **合理分工**：根据任务性质分配给合适的 worker
@@ -988,9 +1035,13 @@ ${workerList}
 }`
     : `You are the PO. Create a detailed execution plan for this project.
 
+## Current Date
+${currentDate}
+
 ## Goal
 ${goalText}
 ${requirements ? `\n## Requirements (MUST follow)\n${requirements}` : ''}
+${planningGuidance ? `\n## Planning Guidance (system-derived; do not rewrite the user's goal/requirements)\n${planningGuidance}` : ''}
 
 ## Workers
 ${workerList}
@@ -1004,6 +1055,8 @@ ${workerList}
    - Content creation: require structural integrity, clarity, logical flow — no word count minimums
    - Analysis/comparison: require logical reasoning, evidence-based conclusions — no insight count minimums
    - Only include quantitative thresholds if explicitly specified in project requirements
+   - "This month/week/recent" means through the current date; do not require data after the current date
+   - If the user explicitly wants a full calendar month, split current deliverables from follow-up/update or waiting tasks
 5. **Follow process requirements**: Honor any specified rounds/reviews/iterations
 6. **Dependencies**: Use dependencies to enforce ordering
 7. **Smart assignment**: Match tasks to appropriate workers
@@ -1184,11 +1237,15 @@ async function qualityReviewTask(projectId, taskId, result) {
 
   const lang = detectLanguage(goal);
   const langInstr = getLanguageInstruction(lang);
+  const currentDate = getCurrentDateForPrompt();
 
   // Use CLI or LLM for quality review
   const reviewPrompt = lang === 'zh'
     ? `你是项目负责人（PO），正在对 worker 提交的任务结果进行质量验收。
 ${langInstr}
+
+## 当前日期
+${currentDate}
 
 ## 任务信息
 - 任务：${taskTitle}
@@ -1209,12 +1266,16 @@ ${artifactContent ? `\n## 产出物证据片段（不是完整正文）\n${artif
 3. 对照验收标准逐项检查
 4. 判断内容是否有实质性、专业性
 5. 给出具体的反馈意见
+6. 不得要求当前日期之后尚未发生的数据；如果验收标准要求未来日期，返回 planRevisionNeeded: true，并建议修订为“截至当前日期”或后续更新任务
 
 ## 输出格式
 输出严格 JSON（无 markdown 代码块）：
 {"passed": true/false, "feedback": "具体的验收反馈（100-300字）", "planRevisionNeeded": false}`
     : `You are the PO, doing quality review of a worker's task submission.
 ${langInstr}
+
+## Current Date
+${currentDate}
 
 ## Task
 - Title: ${taskTitle}
@@ -1235,6 +1296,7 @@ ${artifactContent ? `\n## Artifact Evidence Snippets (not full content)\n${artif
 3. Check against acceptance criteria
 4. Evaluate substance and quality
 5. Give specific feedback
+6. Do not require data after the current date. If the acceptance criteria require future dates, return planRevisionNeeded: true and recommend revising the plan to "through current date" or a follow-up update task.
 
 ## Output Format
 Strict JSON (no markdown fences):
@@ -1276,10 +1338,26 @@ Strict JSON (no markdown fences):
     }
   }
 
-  // Fallback: auto-pass if no LLM/CLI available
+  // Fallback: auto-pass only for non-source-critical tasks if no LLM/CLI is available.
   if (!reviewResult) {
-    console.log(`[${ALIAS}]   ⚠ No LLM/CLI for review — auto-passing`);
-    reviewResult = { passed: true, feedback: 'Auto-approved (no review capability)', planRevisionNeeded: false };
+    const sourceCritical = requiresExternalSourceEvidence({
+      title: taskTitle,
+      acceptanceCriteria,
+      projectGoal: goal,
+      projectRequirements: requirements,
+    });
+    if (sourceCritical) {
+      console.log(`[${ALIAS}]   ⚠ No LLM/CLI for source-critical review — failing review`);
+      reviewResult = {
+        passed: false,
+        feedback: '缺少可用的审核能力，无法验证外部来源、当前日期和事实准确性；不能自动通过该信息收集任务。',
+        failureClass: 'quality_evidence_missing',
+        planRevisionNeeded: false,
+      };
+    } else {
+      console.log(`[${ALIAS}]   ⚠ No LLM/CLI for review — auto-passing`);
+      reviewResult = { passed: true, feedback: 'Auto-approved (no review capability)', planRevisionNeeded: false };
+    }
   }
 
   // Submit review to server
@@ -1700,6 +1778,8 @@ function getLanguageInstruction(lang) {
 
 const MAX_CONTEXT_SIZE = 8000; // chars
 const READABLE_EXTS = ['.md', '.txt', '.json', '.js', '.ts', '.jsx', '.tsx', '.py', '.yaml', '.yml', '.toml', '.cfg', '.ini', '.html', '.css', '.sh'];
+const INTERNAL_CONTEXT_FILENAMES = new Set(['review-evidence.json']);
+const INTERNAL_CONTEXT_DIRS = new Set(['.kswarm', 'delivery']);
 
 // Keywords indicating requirements want agent to read/write project files
 const FILE_ACCESS_KEYWORDS = [
@@ -1715,9 +1795,20 @@ function shouldReadWorkFolder(requirements) {
   return FILE_ACCESS_KEYWORDS.some(kw => lower.includes(kw));
 }
 
+function shouldIncludeWorkFolderContextFile(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts.length === 0) return false;
+  if (parts.some(part => INTERNAL_CONTEXT_DIRS.has(part))) return false;
+  const filename = parts[parts.length - 1].toLowerCase();
+  return !INTERNAL_CONTEXT_FILENAMES.has(filename);
+}
+
 function readWorkFolderContext(workFolder) {
   try {
-    const files = listFilesRecursive(workFolder, 3); // max depth 3
+    // Internal review/recovery files are control-plane evidence, not source material for agents.
+    const files = listFilesRecursive(workFolder, 3)
+      .filter(file => shouldIncludeWorkFolderContextFile(file.relative));
     if (files.length === 0) return '';
 
     let context = `\n\n--- 项目目录文件列表 (${workFolder}) ---\n`;
@@ -1758,7 +1849,7 @@ function listFilesRecursive(dir, maxDepth, depth = 0, prefix = '') {
       const absolute = join(dir, entry.name);
       if (entry.isFile()) {
         results.push({ relative, absolute });
-      } else if (entry.isDirectory() && depth < maxDepth) {
+      } else if (entry.isDirectory() && depth < maxDepth && !INTERNAL_CONTEXT_DIRS.has(entry.name)) {
         results.push(...listFilesRecursive(absolute, maxDepth, depth + 1, relative));
       }
     }
@@ -1979,6 +2070,7 @@ async function doTask(taskId, payload) {
 
   // Fetch project detail from server to get full context (goal, requirements, workFolder, dependency info)
   let dependencyContext = '';
+  let dependencyArtifacts = [];
   try {
     const projRes = await fetch(`${KSWARM_API}/projects/${projectId}`);
     if (projRes.ok) {
@@ -1993,13 +2085,16 @@ async function doTask(taskId, payload) {
       const allTasks = projData.tasks || [];
       const thisTask = allTasks.find(t => t.id === taskId || t.localTaskId === localTaskId);
       currentTask = thisTask || currentTask;
-      if (thisTask?.dependencies?.length > 0 && workFolder) {
+      const parentTask = thisTask?.parentTaskId ? allTasks.find(t => t.id === thisTask.parentTaskId) : null;
+      const dependencyRefs = thisTask?.dependencies?.length > 0
+        ? thisTask.dependencies
+        : (parentTask?.dependencies || []);
+      if (dependencyRefs.length > 0 && workFolder) {
         const artifactsDir = join(workFolder, 'artifacts');
         if (existsSync(artifactsDir)) {
           const depArtifacts = [];
-          for (const depTitle of thisTask.dependencies) {
-            // Find the dependency task by title
-            const depTask = allTasks.find(t => t.title === depTitle);
+          for (const depTitle of dependencyRefs) {
+            const depTask = findDependencyTask(allTasks, depTitle);
             if (depTask && depTask.status === 'done') {
               // Read its artifact
               const candidates = [];
@@ -2013,13 +2108,14 @@ async function doTask(taskId, payload) {
                 const depPath = join(artifactsDir, depFilename);
                 if (existsSync(depPath)) {
                   const content = readFileSync(depPath, 'utf-8');
-                  depArtifacts.push({ title: depTask.title, content });
+                  depArtifacts.push({ taskId: depTask.id, title: depTask.title, filename: depFilename, content });
                   break;
                 }
               }
             }
           }
           if (depArtifacts.length > 0) {
+            dependencyArtifacts = depArtifacts;
             dependencyContext = '\n\n## 前序任务产出（你必须基于这些内容开展工作）\n\n';
             for (const dep of depArtifacts) {
               dependencyContext += `### ${dep.title}\n\n${dep.content}\n\n---\n\n`;
@@ -2072,17 +2168,114 @@ async function doTask(taskId, payload) {
   await sleep(DELAY / 2);
   const artifactFilename = `${taskId}-report.md`;
   let artifactContent;
+  let artifactSource = 'none';
 
   // Build the prompt for the CLI/LLM
-  const taskContract = enrichTaskWithExecutionContract(currentTask || { id: taskId, title, brief });
+  const contractTask = {
+    ...(currentTask || {}),
+    id: taskId,
+    title,
+    brief,
+    projectName,
+    projectGoal: goal,
+    projectRequirements: requirements,
+  };
+  const taskContract = enrichTaskWithExecutionContract(contractTask);
   const contractContext = buildExecutionContractPrompt(taskContract);
-  const taskPrompt = buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext, contractContext);
+  let searchEvidence = null;
+  let searchEvidenceArtifact = null;
+  if (shouldCollectSearchEvidence(taskContract.evidenceContract)) {
+    try {
+      searchEvidence = await collectSearchEvidence({
+        task: {
+          id: taskId,
+          title,
+          brief,
+          projectName,
+          projectGoal: goal,
+          projectRequirements: requirements,
+        },
+        contract: taskContract.evidenceContract,
+      });
+    } catch (err) {
+      searchEvidence = {
+        version: 1,
+        kind: 'external_source_v1',
+        taskId,
+        generatedAt: new Date().toISOString(),
+        provider: 'duckduckgo-html',
+        contract: taskContract.evidenceContract,
+        queries: [],
+        fetchedPages: [],
+        validation: {
+          ok: false,
+          failureClass: 'source_provider_unavailable',
+          reasons: ['search_provider_failed'],
+          errors: [err instanceof Error ? err.message : String(err)],
+        },
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (!searchEvidence?.validation?.ok) {
+      const reasons = searchEvidence?.validation?.reasons || ['source_evidence_missing'];
+      const failureReason = searchEvidence?.validation?.failureClass || 'quality_evidence_missing';
+      const providerError = searchEvidence?.error || searchEvidence?.validation?.errors?.[0] || '';
+      const messagePrefix = failureReason === 'source_provider_unavailable'
+        ? `Search provider unavailable while collecting required evidence for "${title}"`
+        : `Required search evidence missing for "${title}"`;
+      const errorMessage = `${messagePrefix}: ${reasons.join(', ')}${providerError ? ` (${providerError})` : ''}`;
+      console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
+      reportStatus('idle');
+      writeTaskJournal(workFolder, {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        status: 'failed',
+        errorMessage,
+      });
+      await client.sendIntent({
+        kind: 'task_failed',
+        taskId,
+        threadId: `thread-${taskId}`,
+        payload: {
+          projectId,
+          taskId,
+          localTaskId,
+          runId,
+          failureReason: searchEvidence?.validation?.failureClass || 'quality_evidence_missing',
+          errorMessage,
+          searchEvidence,
+        },
+      });
+      stopRunTelemetry();
+      return;
+    }
+    searchEvidenceArtifact = {
+      filename: 'search-evidence.json',
+      content: JSON.stringify(searchEvidence, null, 2),
+      previewable: true,
+      mimeType: 'application/json',
+    };
+  }
+  const evidenceContext = searchEvidence ? buildEvidencePromptSection(searchEvidence) : '';
+  const taskPrompt = buildTaskPrompt(
+    title,
+    projectName,
+    brief,
+    goal,
+    requirements,
+    workFolderContext,
+    dependencyContext,
+    [contractContext, evidenceContext].filter(Boolean).join('\n\n'),
+  );
 
   // Priority 1: CLI harness (spawn real agent binary)
   if (agentConfig?.runtimeType && agentConfig?.runtimePath && agentConfig.runtimeType !== 'builtin') {
     try {
       artifactContent = await runCLIHarness(taskPrompt, workFolder);
       if (artifactContent) {
+        artifactSource = 'cli';
         console.log(`[${ALIAS}]   → Artifact generated via CLI (${agentConfig.runtimeType})`);
       }
     } catch (err) {
@@ -2094,15 +2287,67 @@ async function doTask(taskId, payload) {
   // Priority 2: LLM API (if CLI failed or not available)
   if (!artifactContent && llm) {
     try {
-      artifactContent = await llmGenerateReport(title, projectName, brief, goal, requirements, workFolderContext);
+      artifactContent = await llmGenerateReport(taskPrompt);
+      artifactSource = 'llm';
       console.log(`[${ALIAS}]   → Artifact generated via LLM API`);
     } catch (err) {
       console.log(`[${ALIAS}]   ⚠ LLM report failed: ${err.message}, using template`);
     }
   }
 
-  let artifactQuality = classifyGeneratedArtifact({ title, brief, content: artifactContent || '' });
-  if (!artifactContent || !artifactQuality.ok) {
+  const shouldResolveReferencedArtifacts = artifactSource === 'cli';
+  const referencedArtifacts = workFolder && shouldResolveReferencedArtifacts
+    ? resolveReferencedArtifactsFromOutput({
+        workspacePath: workFolder,
+        output: artifactContent || '',
+        projectId,
+        taskId,
+        runStartedAt: activeTelemetry?.startedAt || Date.now(),
+        contentHeavy: isContentHeavyTask({ title, brief }),
+        producedBy: { agentId: AGENT_ID, source: 'worker' },
+      })
+    : { ok: true, artifactManifest: [], referencedArtifacts: [], shouldUseLegacyWrapper: true };
+  if (!referencedArtifacts.ok) {
+    const errorMessage = `Referenced artifact registration failed for "${title}": ${referencedArtifacts.error || referencedArtifacts.failureClass}`;
+    console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
+    reportStatus('idle');
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'failed',
+      errorMessage,
+    });
+    await client.sendIntent({
+      kind: 'task_failed',
+      taskId,
+      threadId: `thread-${taskId}`,
+      payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        failureReason: referencedArtifacts.failureClass || 'declared_artifact_missing',
+        errorMessage,
+        referencedArtifacts: referencedArtifacts.referencedArtifacts || [],
+      },
+    });
+    stopRunTelemetry();
+    return;
+  }
+
+  const hasReferencedArtifactManifest = Array.isArray(referencedArtifacts.artifactManifest) && referencedArtifacts.artifactManifest.length > 0;
+  let artifactQuality = hasReferencedArtifactManifest
+    ? {
+        ok: true,
+        failureClass: null,
+        reason: null,
+        message: null,
+        details: { referencedArtifacts: referencedArtifacts.referencedArtifacts || [] },
+      }
+    : classifyGeneratedArtifact({ title, brief, content: artifactContent || '' });
+  if (!hasReferencedArtifactManifest && (!artifactContent || !artifactQuality.ok)) {
     console.log(`[${ALIAS}]   ⚠ Artifact quality gate failed (${artifactQuality.reason}); trying one local repair`);
     const repairPrompt = buildArtifactRepairPrompt({
       originalPrompt: taskPrompt,
@@ -2115,6 +2360,7 @@ async function doTask(taskId, payload) {
       try {
         repairedContent = await runCLIHarness(repairPrompt, workFolder);
         if (repairedContent) {
+          artifactSource = 'cli';
           console.log(`[${ALIAS}]   → Artifact repaired via CLI (${agentConfig.runtimeType})`);
         }
       } catch (err) {
@@ -2125,7 +2371,10 @@ async function doTask(taskId, payload) {
     if (!repairedContent && llm) {
       try {
         repairedContent = await llmGenerateFromPrompt(repairPrompt);
-        if (repairedContent) console.log(`[${ALIAS}]   → Artifact repaired via LLM API`);
+        if (repairedContent) {
+          artifactSource = 'llm_repair';
+          console.log(`[${ALIAS}]   → Artifact repaired via LLM API`);
+        }
       } catch (err) {
         console.log(`[${ALIAS}]   ⚠ LLM artifact repair failed: ${err.message}`);
       }
@@ -2167,6 +2416,46 @@ async function doTask(taskId, payload) {
     return;
   }
 
+  const sourceEvidence = validateSourceEvidenceArtifact({
+    title,
+    brief,
+    acceptanceCriteria: currentTask?.acceptanceCriteria || '',
+    projectGoal: goal,
+    projectRequirements: requirements,
+    content: artifactContent || '',
+    evidenceContract: taskContract.evidenceContract,
+    searchEvidence,
+  });
+  if ((!hasReferencedArtifactManifest || shouldCollectSearchEvidence(taskContract.evidenceContract)) && !sourceEvidence.ok) {
+    const errorMessage = `Generated artifact failed source evidence gate for "${title}": ${sourceEvidence.reason}`;
+    console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
+    reportStatus('idle');
+    writeTaskJournal(workFolder, {
+      projectId,
+      taskId,
+      localTaskId,
+      runId,
+      status: 'failed',
+      errorMessage,
+    });
+    await client.sendIntent({
+      kind: 'task_failed',
+      taskId,
+      threadId: `thread-${taskId}`,
+      payload: {
+        projectId,
+        taskId,
+        localTaskId,
+        runId,
+        failureReason: sourceEvidence.failureClass || 'quality_evidence_missing',
+        errorMessage,
+        sourceEvidence,
+      },
+    });
+    stopRunTelemetry();
+    return;
+  }
+
   const declaredArtifacts = extractDeclaredArtifacts(artifactContent, { taskId });
   if (declaredArtifacts.artifacts.length > 0) {
     const errorMessage = `Inline artifact content is forbidden for "${title}"; write deliverables to artifacts/ files and submit only paths/manifests.`;
@@ -2197,9 +2486,21 @@ async function doTask(taskId, payload) {
     return;
   }
 
+  const semanticOutputArtifacts = buildSemanticOutputArtifacts({
+    taskId,
+    title,
+    artifactContent: selectSemanticOutputSourceContent(taskContract, artifactContent, dependencyArtifacts),
+    requiredOutputs: taskContract.requiredOutputs,
+  });
+  const shouldWriteMarkdownArtifact = !hasReferencedArtifactManifest && (
+    semanticOutputArtifacts.length === 0 ||
+    hasRequiredOutputType(taskContract.requiredOutputs, 'markdown')
+  );
   const artifactFiles = [
-    { filename: artifactFilename, content: artifactContent, previewable: true, mimeType: 'text/markdown' },
+    ...(shouldWriteMarkdownArtifact ? [{ filename: artifactFilename, content: artifactContent, previewable: true, mimeType: 'text/markdown' }] : []),
+    ...(searchEvidenceArtifact ? [searchEvidenceArtifact] : []),
     ...declaredArtifacts.artifacts,
+    ...semanticOutputArtifacts,
   ];
   let reviewEvidence = null;
   if (taskContract.evidenceContract?.kind === 'review_iteration_v1') {
@@ -2212,7 +2513,10 @@ async function doTask(taskId, payload) {
     });
   }
 
-  const artifactFilenames = artifactFiles.map(file => file.filename);
+  const artifactFilenames = [
+    ...(hasReferencedArtifactManifest ? referencedArtifacts.artifactManifest.map(artifact => artifact.filename) : []),
+    ...artifactFiles.map(file => file.filename),
+  ];
   let artifactManifest = [];
   let submittedArtifacts = [];
 
@@ -2220,16 +2524,32 @@ async function doTask(taskId, payload) {
   if (workFolder) {
     const artifactsDir = join(workFolder, 'artifacts');
     mkdirSync(artifactsDir, { recursive: true });
-    for (const file of artifactFiles) {
-      writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
-    }
+    for (const file of artifactFiles) writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
     noteArtifact();
-    artifactManifest = buildArtifactManifest(workFolder, artifactFilenames, {
+    const writtenManifest = artifactFiles.length > 0
+      ? buildArtifactManifest(workFolder, artifactFiles.map(file => file.filename), {
+          projectId,
+          taskId,
+          role: 'primary',
+          producedBy: { agentId: AGENT_ID, source: 'worker' },
+        })
+      : [];
+    const carryForwardManifest = buildCarryForwardDependencyArtifactManifest({
+      workFolder,
+      taskContract,
+      dependencyArtifacts,
+      existingManifest: [
+        ...(hasReferencedArtifactManifest ? referencedArtifacts.artifactManifest : []),
+        ...writtenManifest,
+      ],
       projectId,
       taskId,
-      role: 'primary',
-      producedBy: { agentId: AGENT_ID, source: 'worker' },
     });
+    artifactManifest = [
+      ...(hasReferencedArtifactManifest ? referencedArtifacts.artifactManifest : []),
+      ...writtenManifest,
+      ...carryForwardManifest,
+    ];
     writeTaskJournal(workFolder, {
       projectId,
       taskId,
@@ -2279,7 +2599,9 @@ async function doTask(taskId, payload) {
   }
 
   const summarySource = [
-    artifactContent,
+    semanticOutputArtifacts.length > 0
+      ? selectSemanticOutputSourceContent(taskContract, artifactContent, dependencyArtifacts)
+      : artifactContent,
     ...declaredArtifacts.artifacts.map(artifact => artifact.content),
   ].filter(Boolean).join('\n\n');
 
@@ -2293,10 +2615,11 @@ async function doTask(taskId, payload) {
     artifacts: submittedArtifacts,
     artifactManifest,
     delivery: { semantic: 'document', source: ALIAS },
+    ...(workFolder ? { workspacePath: workFolder, workFolder } : {}),
     ...(reviewEvidence ? { reviewEvidence } : {}),
   };
 
-  const contractValidation = validateTaskResultAgainstContract(taskContract, resultPayload);
+  const contractValidation = validateTaskResultAgainstContract(taskContract, resultPayload, { workspacePath: workFolder });
   if (!contractValidation.ok) {
     const errorMessage = `Execution contract invalid: ${contractValidation.errors.join('; ')}`;
     console.log(`[${ALIAS}]   ✗ ${errorMessage}`);
@@ -2369,9 +2692,90 @@ function filePreviewable(filename) {
   return /\.(md|markdown|txt|html|htm|json|csv|svg)$/i.test(filename || '');
 }
 
+function findDependencyTask(allTasks = [], dependencyRef = '') {
+  const ref = String(dependencyRef || '').trim();
+  if (!ref) return null;
+  return (Array.isArray(allTasks) ? allTasks : []).find(task => dependencyTaskKeys(task).includes(ref)) || null;
+}
+
+function dependencyTaskKeys(task = {}) {
+  return [
+    task.id,
+    task.localTaskId,
+    task.displayTaskId,
+    task.legacyTaskId,
+    task.planItemId,
+    task.title,
+  ].map(value => String(value || '').trim()).filter(Boolean);
+}
+
+function selectSemanticOutputSourceContent(task, artifactContent, dependencyArtifacts = []) {
+  if (!shouldUseDependencyArtifactForSemanticOutput(task, dependencyArtifacts)) return artifactContent;
+  const dependency = dependencyArtifacts[dependencyArtifacts.length - 1];
+  return dependency?.content || artifactContent;
+}
+
+function shouldUseDependencyArtifactForSemanticOutput(task, dependencyArtifacts = []) {
+  if (!Array.isArray(dependencyArtifacts) || dependencyArtifacts.length === 0) return false;
+  if (!hasRequiredOutputType(task?.requiredOutputs, 'report_html')) return false;
+  const text = `${task?.title || ''}\n${task?.brief || ''}\n${task?.acceptanceCriteria || ''}`;
+  return /report\s*renderer|renderer|转换|转成|转为|渲染|生成\s*html|html\s*格式/i.test(text);
+}
+
 function buildExecutionContractPrompt(task) {
-  if (task?.evidenceContract?.kind !== 'review_iteration_v1') return '';
-  return `\n## 评审证据合同\n本任务是质量评审任务。你的 Markdown 产物必须包含明确的 verdict、发现的问题清单、风险等级和可执行修改建议。系统会在提交前生成并校验 review-evidence.json，缺少 verdict/findings 会导致任务失败。`;
+  const sections = [];
+  if (task?.evidenceContract?.kind === 'review_iteration_v1') {
+    sections.push(`\n## 评审证据合同\n本任务是质量评审任务。你的 Markdown 产物必须包含明确的 verdict、发现的问题清单、风险等级和可执行修改建议。系统会在提交前生成并校验 review-evidence.json，缺少 verdict/findings 会导致任务失败。`);
+  }
+  if (hasRequiredOutputType(task?.requiredOutputs, 'report_html')) {
+    sections.push(`\n## Report HTML 交付合同\n本任务要求最终产物为 report renderer HTML。若任务是把前序 Markdown 定稿转换为 HTML，必须完整保留前序正文内容、表格、列表和标题层级，不要重新压缩、改写为摘要或生成一份新的短报告。`);
+  }
+  return sections.join('\n');
+}
+
+function buildCarryForwardDependencyArtifactManifest({
+  workFolder,
+  taskContract,
+  dependencyArtifacts = [],
+  existingManifest = [],
+  projectId,
+  taskId,
+} = {}) {
+  if (!workFolder || !Array.isArray(dependencyArtifacts) || dependencyArtifacts.length === 0) return [];
+  if (!requiresHtmlOutput(taskContract?.requiredOutputs)) return [];
+  if (hasHtmlArtifact(existingManifest)) return [];
+
+  const htmlDependency = dependencyArtifacts.find(artifact => hasHtmlFilename(artifact?.filename));
+  if (!htmlDependency?.filename) return [];
+
+  try {
+    return buildArtifactManifest(workFolder, [htmlDependency.filename], {
+      projectId,
+      taskId,
+      role: 'primary',
+      producedBy: { agentId: AGENT_ID, source: 'dependency_carry_forward' },
+    });
+  } catch (err) {
+    console.log(`[${ALIAS}]   ⚠ Failed to carry forward dependency HTML artifact: ${err.message}`);
+    return [];
+  }
+}
+
+function requiresHtmlOutput(requiredOutputs = []) {
+  return hasRequiredOutputType(requiredOutputs, 'html') ||
+    hasRequiredOutputType(requiredOutputs, 'report_html') ||
+    hasRequiredOutputType(requiredOutputs, 'slide_html');
+}
+
+function hasHtmlArtifact(artifacts = []) {
+  return artifacts.some(artifact => (
+    /^text\/html\b/i.test(String(artifact?.mimeType || '')) ||
+    hasHtmlFilename(artifact?.filename || artifact?.path || artifact?.relativePath || artifact?.url)
+  ));
+}
+
+function hasHtmlFilename(value = '') {
+  return /\.html?$/i.test(String(value || '').split('?')[0]);
 }
 
 function buildResultSummary(title, artifactContent) {
@@ -2422,10 +2826,12 @@ function extractReviewFindings(content) {
  */
 function buildTaskPrompt(title, projectName, brief, goal, requirements, workFolderContext, dependencyContext, contractContext = '') {
   const lang = detectLanguage(goal || title || projectName);
+  const currentDate = getCurrentDateForPrompt();
   const parts = [];
 
   if (lang === 'zh') {
     parts.push(`你是一个专业的技术智能体，正在认真执行一项任务。你必须产出有深度、有实质内容的工作成果。`);
+    parts.push(`\n## 当前日期\n${currentDate}`);
     parts.push(`\n## 任务`);
     parts.push(`- 标题：${title}`);
     if (brief) parts.push(`- 描述：${brief}`);
@@ -2446,8 +2852,11 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`5. 如果是修订：必须逐条回应评审意见，说明采纳/不采纳的理由和对应修改`);
     parts.push(`6. 禁止输出"已完成"、"模拟"、"假设完成"等敷衍内容`);
     parts.push(`7. 文件优先交付：如果任务要求交付具体文件（例如 JSON、CSV、HTML、故事正文、修订稿、变更日志），必须把完整交付物写入 artifacts/ 目录中的实际文件。不要在回复、stdout、tool 参数或聊天消息中粘贴完整交付物；只返回文件名、路径、大小、hash 或简短摘要。`);
+    parts.push(`8. 如果任务涉及今年、本月、最新、官网、新闻稿、财报、来源URL或外部资料：必须以当前日期 ${currentDate} 为准；不要编造来源URL、发布日期、会议名称、财报数据或指标；如果无法验证来源，明确说明无法完成，不要用猜测内容代替。`);
+    parts.push(`9. 最终用户可见交付物必须是面向最终读者的成品，不要包含内部流程痕迹，例如：修订总览、评审回应与修订说明、评审意见逐条回应、Finding、Verdict、回应 F1/F2、保留并强化、【新增】、（修订版）、（第二轮修订定稿）、新增章节、采纳/不采纳理由；除非用户明确要求 changelog、评审回应表或修订说明。评审意见、修订记录、采纳/不采纳理由只能写入评审记录或内部修订说明文件，不能进入最终交付物正文。`);
   } else {
     parts.push(`You are a professional technical agent executing a task. You must produce substantive, in-depth deliverables.`);
+    parts.push(`\n## Current Date\n${currentDate}`);
     parts.push(`\n## Task`);
     parts.push(`- Title: ${title}`);
     if (brief) parts.push(`- Description: ${brief}`);
@@ -2468,6 +2877,8 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
     parts.push(`5. For revisions: address each review point explicitly with accept/reject reasoning`);
     parts.push(`6. Never output placeholder text like "completed" or "simulated"`);
     parts.push(`7. File-first delivery: if the task requires concrete files such as JSON, CSV, HTML, a story draft, a revised draft, or a change log, write the complete deliverables to real files under artifacts/. Do not paste full deliverables into replies, stdout, tool arguments, or chat messages; return only filenames, paths, sizes, hashes, or a short summary.`);
+    parts.push(`8. If the task involves this year, this month, latest/recent information, official sites, news releases, filings, source URLs, or external materials, use current date ${currentDate}; do not invent source URLs, publication dates, conference names, filings, metrics, or citations. If you cannot verify sources, say so instead of guessing.`);
+    parts.push(`9. Final user-facing deliverables must read like finished audience-facing work. Do not include internal process markers such as revision overview, review response and revision notes, review response table, Finding, Verdict, response to F1/F2, retained and strengthened, [added], revision version, second-round revised final, newly added section, or accept/reject rationale unless the user explicitly asked for a changelog, review-response appendix, or revision note. Put review comments, revision logs, and accept/reject rationales in separate review records or internal revision-note files, not in the final deliverable body.`);
   }
 
   if (workFolderContext) {
@@ -2477,8 +2888,8 @@ function buildTaskPrompt(title, projectName, brief, goal, requirements, workFold
   return parts.join('\n');
 }
 
-async function llmGenerateReport(title, projectName, brief, goal, requirements, workFolderContext) {
-  const lang = detectLanguage(goal || title || projectName);
+async function llmGenerateReport(prompt) {
+  const lang = detectLanguage(prompt);
   const langInstr = getLanguageInstruction(lang);
 
   const systemPrompt = agentInstructions
@@ -2494,22 +2905,16 @@ ${langInstr}
 
 交付要求：
 1. 使用 Markdown 格式
-2. 内容要具体、专业，像真正完成了这项工作一样
-3. 文件优先交付：如果任务要求具体文件，必须把完整交付物写入 artifacts/ 目录中的实际文件
-4. 不要在回复、stdout、tool 参数或聊天消息中粘贴完整交付物；只返回文件名、路径、大小、hash 或简短摘要
-5. 可以附简短摘要，但不能用摘要替代核心文件
-6. 不要写"模拟"或"假设"之类的词，就像真正完成了工作一样
-7. 严格遵循项目目标和要求中的原则与约束${workFolderContext ? '\n8. 基于项目目录中的参考文件内容进行工作' : ''}`
+2. 内容要具体、专业；涉及外部事实、当前信息和来源时，只能使用已验证的信息
+3. 直接输出完整交付内容；内置 LLM 运行时会把你的完整输出保存到 artifacts/ 目录
+4. 你不能自己写文件，也不要声称已经写入某个 artifacts/ 文件；Do not claim that you wrote a file yourself
+5. 可以附简短摘要，但不能用摘要替代核心内容
+6. 不要写"模拟"或"假设"之类的词；不要编造来源URL、发布日期、会议名称、财报数据或指标
+7. 严格遵循项目目标和要求中的原则与约束`
     },
     {
       role: 'user',
-      content: `请直接完成以下任务并输出核心交付产物：
-
-项目：${projectName}
-${goal ? `项目目标：${goal}` : ''}
-${requirements ? `项目要求：\n${requirements}` : ''}
-任务：${title}
-${brief ? `任务描述：${brief}` : ''}${workFolderContext || ''}`
+      content: prompt
     }
   ];
 
@@ -2519,8 +2924,8 @@ ${brief ? `任务描述：${brief}` : ''}${workFolderContext || ''}`
 
 async function llmGenerateFromPrompt(prompt) {
   const systemPrompt = agentInstructions
-    ? `${agentInstructions}\n\n你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。`
-    : '你是一个专业的 worker agent。你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。';
+    ? `${agentInstructions}\n\n你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。内置 LLM 运行时会保存你的输出，不要声称自己写了文件。Do not claim that you wrote a file yourself.`
+    : '你是一个专业的 worker agent。你正在修复一个未通过本地质量门禁的任务产物，必须直接输出完整交付内容。内置 LLM 运行时会保存你的输出，不要声称自己写了文件。Do not claim that you wrote a file yourself.';
 
   const result = await llm.chat([
     { role: 'system', content: systemPrompt },
@@ -2780,7 +3185,7 @@ async function pollDispatchedTasks() {
 
 main().catch(err => {
   console.error(`[${ALIAS}] Fatal:`, err.message);
-  process.exit(1);
+  process.exit(process.exitCode || 1);
 });
 
 // ─── PO Health Monitor ──────────────────────────────────────────────────────

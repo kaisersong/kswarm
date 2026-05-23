@@ -7,7 +7,7 @@
  * - The failure history pattern
  */
 
-const RETRYABLE_FAILURES = new Set(['agent_error', 'timeout', 'runtime_offline', 'runtime_recovery', 'runtime_stalled', 'runtime_generation_unavailable', 'model_empty_output']);
+const RETRYABLE_FAILURES = new Set(['agent_error', 'timeout', 'runtime_offline', 'runtime_recovery', 'runtime_stalled', 'runtime_generation_unavailable', 'source_provider_unavailable', 'model_empty_output']);
 
 /**
  * @param {{ attempt: number, maxAttempts?: number, failureReason?: string }} task
@@ -25,6 +25,7 @@ export function shouldAutoRetry(task) {
  * @returns {object}
  */
 export function createRetryTask(parentTask) {
+  const dependencyRefs = cloneList(parentTask.dependencyRefs) || cloneList(parentTask.dependencies) || [];
   return {
     id: `${parentTask.id}-retry-${parentTask.attempt || 1}`,
     title: parentTask.title,
@@ -33,15 +34,32 @@ export function createRetryTask(parentTask) {
     phase: parentTask.phase || 0,
     phaseId: parentTask.phaseId,
     assignedAgent: parentTask.assignedAgent || null,
+    requiredOutputs: cloneList(parentTask.requiredOutputs),
+    requiredCapabilities: cloneList(parentTask.requiredCapabilities),
+    executionContract: cloneObject(parentTask.executionContract),
+    evidenceContract: cloneObject(parentTask.evidenceContract),
     // Inherit model from parent so retry uses same provider
     model: parentTask.model,
-    dependencies: [],
+    dependencies: dependencyRefs,
+    dependencyRefs,
+    unresolvedDependencies: cloneList(parentTask.unresolvedDependencies) || [],
+    parentPlanItemId: parentTask.planItemId || null,
     // Track lineage
     parentTaskId: parentTask.id,
     attempt: (parentTask.attempt || 1) + 1,
     maxAttempts: parentTask.maxAttempts || 2,
     failureReason: parentTask.failureReason || null,
   };
+}
+
+function cloneList(value) {
+  if (!Array.isArray(value)) return value;
+  return value.map(item => (item && typeof item === 'object' ? { ...item } : item));
+}
+
+function cloneObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value || null;
+  return { ...value };
 }
 
 /**

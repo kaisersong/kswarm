@@ -86,6 +86,27 @@ test('dependencies resolve by unique title and local ID', () => {
   assert.deepEqual(result.tasks[2].dependencies, ['proj-a__item-2']);
 });
 
+test('near-title dependency resolves when there is one high-confidence title match', () => {
+  const result = normalizeTasksForProject('proj-a', [
+    { id: 'p1-item1', title: '建立官方信息监控渠道', dependencies: [] },
+    { id: 'p2-item1', title: '清洗去重与分类', dependencies: ['收集官方信息监控渠道'] },
+  ]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.tasks[1].dependencies, ['proj-a__p1-item1']);
+  assert.deepEqual(result.tasks[1].unresolvedDependencies, []);
+});
+
+test('near-title dependency remains unresolved when the shared phrase is too generic', () => {
+  const result = normalizeTasksForProject('proj-a', [
+    { id: 'p1-item1', title: '建立官方信息监控渠道', dependencies: [] },
+    { id: 'p1-item2', title: '收集社区信息监控渠道', dependencies: [] },
+    { id: 'p2-item1', title: '清洗去重与分类', dependencies: ['收集行业信息监控渠道'] },
+  ]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.tasks[2].dependencies, []);
+  assert.deepEqual(result.tasks[2].unresolvedDependencies, ['收集行业信息监控渠道']);
+});
+
 test('duplicate titles are not used as aliases', () => {
   const result = normalizeTasksForProject('proj-a', [
     { id: 'item-1', title: 'Same', dependencies: [] },

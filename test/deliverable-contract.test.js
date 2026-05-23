@@ -67,6 +67,61 @@ test('hard pptx requirement accepts a minimal parseable pptx package marker', ()
   assert.equal(validation.ok, true);
 }));
 
+test('report_html requires report renderer html with substantive content', () => withTempDir((dir) => {
+  const mdPath = join(dir, 'report.md');
+  writeFileSync(mdPath, '# Report\n\ncontent', 'utf-8');
+  const genericHtmlPath = join(dir, 'generic.html');
+  writeFileSync(genericHtmlPath, '<!DOCTYPE html><html><body>' + '正文'.repeat(240) + '</body></html>', 'utf-8');
+  const markerOnlyPath = join(dir, 'marker-only.html');
+  writeFileSync(markerOnlyPath, '<!DOCTYPE html><html data-template="kai-report-creator"></html>', 'utf-8');
+  const reportPath = join(dir, 'report.html');
+  writeFileSync(reportPath, '<!DOCTYPE html><html data-template="kai-report-creator"><body>' + '正文'.repeat(240) + '</body></html>', 'utf-8');
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'report.md', path: mdPath, mimeType: 'text/markdown' }],
+  }).ok, false);
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'generic.html', path: genericHtmlPath, mimeType: 'text/html' }],
+  }).ok, false);
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'marker-only.html', path: markerOnlyPath, mimeType: 'text/html' }],
+  }).ok, false);
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'report.html', path: reportPath, mimeType: 'text/html' }],
+  }).ok, true);
+}));
+
+test('slide_html requires slide renderer html with substantive content', () => withTempDir((dir) => {
+  const genericHtmlPath = join(dir, 'generic.html');
+  writeFileSync(genericHtmlPath, '<!DOCTYPE html><html><body>' + '正文'.repeat(240) + '</body></html>', 'utf-8');
+  const markerOnlyPath = join(dir, 'marker-only.html');
+  writeFileSync(markerOnlyPath, '<!DOCTYPE html><html data-generator="kai-slide-creator"></html>', 'utf-8');
+  const slidePath = join(dir, 'slides.html');
+  writeFileSync(slidePath, '<!DOCTYPE html><html data-generator="kai-slide-creator"><body>' + 'Slide'.repeat(240) + '</body></html>', 'utf-8');
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'slide_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'generic.html', path: genericHtmlPath, mimeType: 'text/html' }],
+  }).ok, false);
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'slide_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'marker-only.html', path: markerOnlyPath, mimeType: 'text/html' }],
+  }).ok, false);
+
+  assert.equal(validateDeliverableContract({
+    requiredOutputs: [{ type: 'slide_html', enforcement: 'hard' }],
+    artifacts: [{ filename: 'slides.html', path: slidePath, mimeType: 'text/html' }],
+  }).ok, true);
+}));
+
 test('soft presentation content requirement does not reject markdown artifacts', () => withTempDir((dir) => {
   const mdPath = join(dir, 'slides.md');
   writeFileSync(mdPath, '# Slide 1\n\n- Point', 'utf-8');
