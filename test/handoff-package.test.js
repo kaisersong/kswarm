@@ -15,6 +15,7 @@ try {
       title: 'Research',
       brief: 'Collect sources',
       acceptanceCriteria: 'Include source links',
+      requiredOutputs: [{ type: 'markdown', enforcement: 'hard' }, { kind: 'report_html' }, 'json'],
       evidenceContract: { version: 1, kind: 'external_source_v1', required: true },
       executionContract: { version: 1, requireMeaningfulSummary: true },
       repairInstruction: 'Previous submission had no artifacts',
@@ -33,6 +34,7 @@ try {
   assert.equal(persisted.project.id, 'proj-1');
   assert.equal(persisted.task.id, 'proj-1__item-1');
   assert.equal(persisted.task.acceptanceCriteria, 'Include source links');
+  assert.deepEqual(persisted.task.requiredOutputs, ['markdown', 'report_html', 'json']);
   assert.equal(persisted.task.evidenceContract.required, true);
   assert.equal(persisted.task.executionContract.requireMeaningfulSummary, true);
   assert.equal(persisted.task.repairInstruction, 'Previous submission had no artifacts');

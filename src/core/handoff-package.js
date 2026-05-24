@@ -36,7 +36,7 @@ export function createTaskHandoffPackage({
       title: task.title,
       brief: task.brief || '',
       acceptanceCriteria: task.acceptanceCriteria || '',
-      requiredOutputs: task.requiredOutputs || [],
+      requiredOutputs: normalizeRequiredOutputTypes(task.requiredOutputs),
       outputContract: task.outputContract || null,
       executionContract: task.executionContract || null,
       evidenceContract: task.evidenceContract || null,
@@ -49,4 +49,17 @@ export function createTaskHandoffPackage({
   };
   writeFileSync(handoffPath, JSON.stringify(handoff, null, 2), 'utf-8');
   return { ok: true, handoffPath, handoff };
+}
+
+function normalizeRequiredOutputTypes(outputs = []) {
+  if (!Array.isArray(outputs)) return [];
+  const normalized = [];
+  for (const output of outputs) {
+    const type = typeof output === 'string'
+      ? output
+      : output?.type || output?.format || output?.kind || output?.mimeType || '';
+    const value = String(type || '').trim();
+    if (value && !normalized.includes(value)) normalized.push(value);
+  }
+  return normalized;
 }
