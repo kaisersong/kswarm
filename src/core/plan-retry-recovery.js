@@ -1,3 +1,5 @@
+import { appendQualityPlanningGuidance } from './quality-rules.js';
+
 const PRE_APPROVAL_STATUSES = new Set(['draft', 'created', 'planning']);
 const FINAL_STATUSES = new Set(['delivered', 'closed']);
 const XIAOK_PO_SEED_ID = 'xiaok-po';
@@ -47,6 +49,18 @@ function isUsableCurrentPo(agent) {
     !isArchived(agent) &&
     agent.id !== XIAOK_LEGACY_SEED_ID &&
     !isStaleXiaokRuntimeWithoutExecutor(agent) &&
+    isProjectOwner(agent);
+}
+
+function currentPoSelectionSource(project) {
+  return project?.agentSelection?.poAgent?.source || null;
+}
+
+function isPreservableExplicitCurrentPo(project, agent) {
+  return currentPoSelectionSource(project) === 'explicit_user' &&
+    Boolean(agent) &&
+    !isArchived(agent) &&
+    agent.id !== XIAOK_LEGACY_SEED_ID &&
     isProjectOwner(agent);
 }
 
@@ -103,6 +117,15 @@ export function resolvePlanRetryPoAgent(project, agents = []) {
   const active = activeAgents(agents);
   const current = active.find(agent => agent.id === previousPoAgent) || null;
 
+  if (isPreservableExplicitCurrentPo(project, current)) {
+    return {
+      poAgent: current.id,
+      previousPoAgent,
+      changed: false,
+      reason: 'explicit_user_po_preserved',
+    };
+  }
+
   if (isUsableCurrentPo(current)) {
     return {
       poAgent: current.id,
@@ -135,7 +158,7 @@ export function buildPlanRetryAssignPoIntent(project) {
       name: project?.name || '',
       goal: project?.goal || '',
       requirements: project?.requirements || '',
-      planningGuidance: project?.planningGuidance || '',
+      planningGuidance: appendQualityPlanningGuidance(project?.planningGuidance || '', project?.qualityPlanningGuidance || ''),
       members: Array.isArray(project?.members) ? project.members : [],
     },
   };

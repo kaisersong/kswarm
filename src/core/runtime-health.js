@@ -1,6 +1,7 @@
 const DEFAULT_COOLDOWNS = [0, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 const ROUTABLE_STATES = new Set(['healthy']);
 const TASK_LEVEL_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
+const OUTPUT_CONTRACT_FAILURE_CLASSES = new Set(['artifact_type_mismatch', 'artifact_missing', 'artifact_invalid', 'inline_artifact_forbidden', 'artifact_hash_mismatch', 'artifact_path_escape']);
 
 export function createUnknownRuntimeHealth(overrides = {}) {
   return {
@@ -13,6 +14,7 @@ export function createUnknownRuntimeHealth(overrides = {}) {
     lastFailureClass: null,
     lastError: null,
     consecutiveRuntimeFailures: 0,
+    consecutiveTaskFailures: 0,
     cooldownUntil: null,
     childPid: null,
     activeRunId: null,
@@ -65,13 +67,38 @@ export function recordRuntimeFailure(current = {}, failure = {}, now = Date.now(
   const base = normalizeHealth(current);
   const failureClass = failure.failureClass || 'agent_error';
 
-  if (TASK_LEVEL_FAILURE_CLASSES.has(failureClass)) {
+  if (OUTPUT_CONTRACT_FAILURE_CLASSES.has(failureClass)) {
     return {
       ...base,
       checkedAt: now,
       lastFailureAt: now,
       lastFailureClass: failureClass,
       lastError: failure.error || failure.errorMessage || failure.feedback || null,
+      consecutiveRuntimeFailures: 0,
+    };
+  }
+
+  if (TASK_LEVEL_FAILURE_CLASSES.has(failureClass)) {
+    const priorTaskFailure = TASK_LEVEL_FAILURE_CLASSES.has(base.lastFailureClass) &&
+      base.lastFailureAt &&
+      (!base.lastSuccessAt || Number(base.lastSuccessAt) < Number(base.lastFailureAt));
+    const taskFailureCount = priorTaskFailure
+      ? Number(base.consecutiveTaskFailures || 1) + 1
+      : 1;
+    const taskFailureCooldownThreshold = options.taskFailureCooldownThreshold ?? 2;
+    const cooldownUntil = taskFailureCount >= taskFailureCooldownThreshold
+      ? now + cooldownForCount(taskFailureCount, options.taskFailureCooldowns || options.cooldowns)
+      : base.cooldownUntil;
+
+    return {
+      ...base,
+      state: cooldownUntil ? 'cooldown' : base.state,
+      checkedAt: now,
+      lastFailureAt: now,
+      lastFailureClass: failureClass,
+      lastError: failure.error || failure.errorMessage || failure.feedback || null,
+      consecutiveTaskFailures: taskFailureCount,
+      cooldownUntil,
     };
   }
 
@@ -104,6 +131,7 @@ export function recordRuntimeSuccess(current = {}, success = {}, now = Date.now(
     lastFailureClass: null,
     lastError: null,
     consecutiveRuntimeFailures: 0,
+    consecutiveTaskFailures: 0,
     cooldownUntil: null,
     activeTaskId: success.taskId || null,
     activeRunId: success.runId || null,
@@ -118,11 +146,12 @@ export function isRoutable(agent = {}, requiredCapabilities = [], requiredOutput
   }
 
   const health = normalizeHealth(agent.runtimeHealth);
-  const state = health.state || 'unknown';
+  let state = health.state || 'unknown';
 
   if (state === 'cooldown' && (!health.cooldownUntil || now < health.cooldownUntil)) {
     return { ok: false, reason: 'runtime_cooldown' };
   }
+  if (state === 'cooldown') state = 'healthy';
   const spawnableLocalRuntime = agent.runtimeType === 'xiaok' || agent.runtimeType === 'builtin';
   if (!ROUTABLE_STATES.has(state) && !(spawnableLocalRuntime && state === 'unknown')) {
     return { ok: false, reason: `runtime_${state}` };

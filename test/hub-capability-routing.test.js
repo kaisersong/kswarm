@@ -203,12 +203,15 @@ test('offline assigned CLI is skipped on dispatch and retry when an online proje
   );
 
   assert.equal(failed.ok, true);
-  assert.equal(failed.retried, true);
-  assert.equal(failed.retryDispatched, true);
-  const retry = board.getTask(failed.retryTaskId);
-  assert.equal(retry.status, 'dispatched');
-  assert.equal(retry.assignedAgent, 'xiaok-worker');
-  assert.equal(retry.preferredAssignedAgent, 'cli-claude');
+  assert.equal(failed.retried, false);
+  assert.equal(failed.replaced, true);
+  assert.equal(failed.replacementDispatched, true);
+  assert.equal(failed.retryTaskId, undefined);
+  const replaced = board.getTask(original.id);
+  assert.equal(replaced.status, 'dispatched');
+  assert.equal(replaced.assignedAgent, 'xiaok-worker');
+  assert.equal(replaced.replacementHistory.at(-1).fromAgentId, 'cli-claude');
+  assert.ok(replaced.activeRunId);
 });
 
 test('runtime failure retry for generic task does not fall back to presentation executor', () => {

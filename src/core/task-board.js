@@ -448,8 +448,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
   /**
    * 获取某阶段的完成状态
    */
-  function getPhaseStatus(phaseId) {
-    const phaseTasks = [...tasks.values()].filter(t => t.phaseId === phaseId);
+  function getPhaseStatus(phaseId, sourceTasks = [...tasks.values()]) {
+    const phaseTasks = sourceTasks.filter(t => t.phaseId === phaseId);
     return {
       total: phaseTasks.length,
       pending: phaseTasks.filter(t => t.status === 'pending').length,
@@ -464,12 +464,30 @@ export function createTaskBoard(projectId = 'legacy-project') {
    */
   function getPlanProgress() {
     const all = [...tasks.values()];
-    const phaseIds = [...new Set(all.map(t => t.phaseId).filter(Boolean))];
-    return {
-      phases: phaseIds.map(id => ({ phaseId: id, ...getPhaseStatus(id) })),
+    const planTasks = all.filter(task => !isRetryAttempt(task));
+    const phaseIds = [...new Set(planTasks.map(t => t.phaseId).filter(Boolean))];
+    const executionAttempts = {
       total: all.length,
+      failed: all.filter(t => t.status === 'failed').length,
+      pending: all.filter(t => t.status === 'pending').length,
       done: all.filter(t => t.status === 'done').length,
+      inProgress: all.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
     };
+    return {
+      phases: phaseIds.map(id => ({ phaseId: id, ...getPhaseStatus(id, planTasks) })),
+      total: planTasks.length,
+      pending: planTasks.filter(t => t.status === 'pending').length,
+      done: planTasks.filter(t => t.status === 'done').length,
+      failed: planTasks.filter(t => t.status === 'failed').length,
+      inProgress: planTasks.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
+      executionAttempts,
+    };
+  }
+
+  function isRetryAttempt(task = {}) {
+    if (!task.parentTaskId && !task.retryOfTaskId) return false;
+    if (Number(task.attempt || 1) > 1) return true;
+    return /-retry-\d+$/.test(String(task.id || ''));
   }
 
   function getStats() {

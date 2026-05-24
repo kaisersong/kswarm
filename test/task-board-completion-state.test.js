@@ -120,6 +120,38 @@ test('loadTasks normalizes persisted done tasks with stale active failure fields
   assert.equal(failedTask.lastFailureClass, 'runtime_offline');
 });
 
+test('plan progress excludes retry attempt children while execution attempts count them', () => {
+  const board = createTaskBoard('proj-progress');
+  assert.equal(board.addTasksChecked([
+    { id: 'item-1', title: 'Collect evidence', assignedAgent: 'worker', phaseId: 'phase-1' },
+    { id: 'item-2', title: 'Write report', assignedAgent: 'worker', phaseId: 'phase-1', dependencies: ['item-1'] },
+  ]).ok, true);
+  assert.equal(board.transition('item-1', 'failed', {
+    failureReason: 'runtime_offline',
+    failureClass: 'runtime_offline',
+  }).ok, true);
+  assert.equal(board.addTasksChecked([
+    {
+      id: 'item-1-retry-1',
+      title: 'Collect evidence',
+      assignedAgent: 'worker',
+      phaseId: 'phase-1',
+      parentTaskId: 'item-1',
+      attempt: 2,
+      failureReason: 'runtime_offline',
+    },
+  ]).ok, true);
+
+  const progress = board.getPlanProgress();
+
+  assert.equal(progress.total, 2);
+  assert.equal(progress.failed, 1);
+  assert.equal(progress.pending, 1);
+  assert.equal(progress.executionAttempts.total, 3);
+  assert.equal(progress.executionAttempts.failed, 1);
+  assert.equal(progress.phases[0].total, 2);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

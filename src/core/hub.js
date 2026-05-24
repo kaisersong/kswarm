@@ -30,10 +30,17 @@ import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
 import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
+import { deriveProjectPreparation } from './agent-readiness.js';
+import { planAgentReplacement } from './agent-replacement.js';
+import {
+  appendQualityPlanningGuidance,
+  buildQualityPromptExcerpt,
+  compileEffectiveQualityRuleSet,
+} from './quality-rules.js';
 
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, runtimeInstanceAllocator = null } = {}) {
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
@@ -189,17 +196,32 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
   // ─── Project lifecycle ─────────────────────────────────────────────
 
-  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary }) {
+  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null }) {
+    const createdAt = Date.now();
+    const qualityRuleSet = compileEffectiveQualityRuleSet({
+      goal: goal || '',
+      requirements: requirements || '',
+      overlays: typeof getQualityOverlays === 'function' ? getQualityOverlays() : [],
+      now: createdAt,
+    });
+    const qualityPlanningGuidance = qualityRuleSet.rules.length > 0
+      ? buildQualityPromptExcerpt(qualityRuleSet, { role: 'po', budgetChars: 1600 }).text
+      : '';
+    const effectivePlanningGuidance = appendQualityPlanningGuidance(planningGuidance || '', qualityPlanningGuidance);
     const project = {
       id,
       name,
       goal,
       requirements: requirements || '',
       planningGuidance: planningGuidance || '',
+      qualityRuleSet,
+      qualityPlanningGuidance,
+      agentSelection: normalizeAgentSelection({ poAgent, members, agentSelection }),
+      preparation: null,
       poAgent,
       members,
       status: 'created',  // created → planning → active → closed
-      createdAt: Date.now(),
+      createdAt,
       closedAt: null,
       closedBy: null,
       deliverable: null,
@@ -215,16 +237,72 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     eventLog.emit('project.created', { projectId: id, projectName: name, po: poAgent });
     recordHumanAction('create_project', { projectId: id, projectName: name, poAgent });
 
-    if (bridge) {
-      bridge.send({
-        type: 'intent', kind: 'assign_po',
-        projectId: id, toParticipantId: poAgent,
-        payload: { name, goal, requirements: requirements || '', planningGuidance: planningGuidance || '' },
+    if (preparationContext) {
+      project.preparation = deriveProjectPreparation({
+        ...preparationContext,
+        project,
+      });
+      eventLog.emit('project.preparation_checked', {
+        projectId: id,
+        state: project.preparation.state,
+        blockers: project.preparation.blockers,
       });
     }
 
-    eventLog.emit('po.assigned', { projectId: id, agent: poAgent });
+    if (!project.preparation || project.preparation.state === 'ready') {
+      sendAssignPo(project, effectivePlanningGuidance);
+    }
     return project;
+  }
+
+  function normalizeAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
+    return {
+      ...(agentSelection && typeof agentSelection === 'object' ? agentSelection : {}),
+      poAgent: {
+        agentId: agentSelection?.poAgent?.agentId || poAgent,
+        source: agentSelection?.poAgent?.source || 'system_migration',
+      },
+      members: Array.isArray(agentSelection?.members)
+        ? agentSelection.members.map(member => ({
+            agentId: member?.agentId || member?.id || member,
+            source: member?.source || 'system_migration',
+          })).filter(member => member.agentId)
+        : (Array.isArray(members) ? members : []).map(agentId => ({
+            agentId,
+            source: 'system_migration',
+          })),
+    };
+  }
+
+  function selectionForTask(project, task) {
+    const assignedAgent = normalizeAgentId(task?.assignedAgent);
+    if (!project?.agentSelection || !assignedAgent) return { agentId: assignedAgent, source: 'system_migration' };
+    if (normalizeAgentId(project.agentSelection.poAgent?.agentId) === assignedAgent) {
+      return { agentId: assignedAgent, source: project.agentSelection.poAgent?.source || 'system_migration' };
+    }
+    const member = (Array.isArray(project.agentSelection.members) ? project.agentSelection.members : [])
+      .find(item => normalizeAgentId(item?.agentId || item?.id || item) === assignedAgent);
+    return {
+      agentId: assignedAgent,
+      source: member?.source || 'system_migration',
+    };
+  }
+
+  function sendAssignPo(project, effectivePlanningGuidance) {
+    if (bridge) {
+      bridge.send({
+        type: 'intent', kind: 'assign_po',
+        projectId: project.id, toParticipantId: project.poAgent,
+        payload: {
+          name: project.name,
+          goal: project.goal,
+          requirements: project.requirements || '',
+          planningGuidance: effectivePlanningGuidance ?? appendQualityPlanningGuidance(project.planningGuidance || '', project.qualityPlanningGuidance || ''),
+        },
+      });
+    }
+
+    eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
   }
 
   // ─── Human actions ─────────────────────────────────────────────────
@@ -275,7 +353,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     bridge.send({
       type: 'intent', kind: 'assign_po',
       projectId: project.id, toParticipantId: project.poAgent,
-      payload: { name: project.name, goal: project.goal, requirements: project.requirements || '', planningGuidance: project.planningGuidance || '' },
+      payload: {
+        name: project.name,
+        goal: project.goal,
+        requirements: project.requirements || '',
+        planningGuidance: appendQualityPlanningGuidance(project.planningGuidance || '', project.qualityPlanningGuidance || ''),
+      },
     });
 
     eventLog.emit('plan.retry', { projectId, po: project.poAgent, previousStatus: normalized.previousStatus });
@@ -592,6 +675,87 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       projectId, taskId: task.id, taskTitle: task.title, failureReason: reason,
       errorMessage: errorMessage || '',
     });
+
+    const replacement = planAgentReplacement({
+      task,
+      failureClass: reason,
+      agents: getProjectAgentProfiles(project),
+      selection: selectionForTask(project, task),
+      priorReplacements: task.replacementHistory || [],
+      replacementBudget: project.agentSelection?.replacementBudget || {},
+    });
+    if (replacement.action === 'repair_output_contract') {
+      return {
+        ok: true,
+        taskId: task.id,
+        retried: false,
+        replacement,
+        failureReason: reason,
+      };
+    }
+    if (replacement.action === 'replace' && replacement.toAgentId) {
+      const reset = board.transition(task.id, 'pending', { failureReason: reason, failureClass: reason });
+      if (!reset.ok) return reset;
+      const replacedTask = board.getTask(task.id);
+      replacedTask.assignedAgent = replacement.toAgentId;
+      replacedTask.replacementHistory = Array.isArray(replacedTask.replacementHistory) ? replacedTask.replacementHistory : [];
+      replacedTask.replacementHistory.push({
+        at: Date.now(),
+        fromAgentId: replacement.fromAgentId,
+        toAgentId: replacement.toAgentId,
+        failureClass: reason,
+        source: selectionForTask(project, task).source || 'system_migration',
+      });
+      replacedTask.recoveryStatus = 'redispatch_ready';
+      replacedTask.recoveryReason = 'agent_replaced_after_basic_invocation_failure';
+      eventLog.emit('task.agent_replaced', {
+        projectId,
+        taskId: replacedTask.id,
+        fromAgentId: replacement.fromAgentId,
+        toAgentId: replacement.toAgentId,
+        failureReason: reason,
+      });
+      const dispatch = project.status === 'active'
+        ? handleRequestDispatch(projectId, project.poAgent, { onlyTaskIds: [replacedTask.id] })
+        : { ok: false, dispatched: [], skipped: [], error: 'project_not_active' };
+      return {
+        ok: true,
+        taskId: replacedTask.id,
+        retried: false,
+        replaced: true,
+        replacement,
+        fromAgentId: replacement.fromAgentId,
+        toAgentId: replacement.toAgentId,
+        replacementDispatched: dispatch.ok ? dispatch.dispatched.includes(replacedTask.id) : false,
+        replacementDispatch: dispatch,
+        failureReason: reason,
+      };
+    }
+    if (replacement.action === 'needs_user_confirmation') {
+      const blocked = board.blockTask(task.id, {
+        blockKind: 'agent_replacement_confirmation_required',
+        blockedReason: '显式选择的智能体不可用，需要确认是否更换执行者。',
+        failureClass: reason,
+        nextActions: [
+          {
+            id: 'replace_agent_confirm',
+            label: '确认更换执行者',
+            candidates: replacement.candidates,
+          },
+        ],
+      });
+      const blockedTask = board.getTask(task.id);
+      blockedTask.replacementPlan = replacement;
+      return {
+        ok: blocked.ok,
+        taskId: task.id,
+        retried: false,
+        replaced: false,
+        replacement,
+        blocked: true,
+        failureReason: reason,
+      };
+    }
 
     // Decide: auto-retry or not
     const shouldRetry = shouldAutoRetry(task);

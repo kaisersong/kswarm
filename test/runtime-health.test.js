@@ -104,6 +104,49 @@ test('model empty output is task-level and does not degrade runtime routing', ()
   assert.equal(isRoutable({ runtimeHealth: afterEmpty }, ['analysis'], [{ type: 'markdown' }], now + 2000).ok, true);
 });
 
+test('repeated task-level empty output enters cooldown until a success clears it', () => {
+  const healthy = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
+    outputCapabilities: ['markdown'],
+    taskCapabilities: ['analysis'],
+  }, now);
+
+  const firstEmpty = recordRuntimeFailure(healthy, {
+    failureClass: 'model_empty_output',
+    error: 'content_too_short',
+  }, now + 1000);
+  const secondEmpty = recordRuntimeFailure(firstEmpty, {
+    failureClass: 'model_empty_output',
+    error: 'content_too_short',
+  }, now + 2000);
+
+  assert.equal(secondEmpty.state, 'cooldown');
+  assert.equal(secondEmpty.consecutiveRuntimeFailures, 0);
+  assert.equal(secondEmpty.consecutiveTaskFailures, 2);
+  assert.equal(isRoutable({ runtimeHealth: secondEmpty }, ['analysis'], [{ type: 'markdown' }], now + 3000).reason, 'runtime_cooldown');
+
+  const recovered = recordRuntimeSuccess(secondEmpty, {
+    outputCapabilities: ['markdown'],
+    taskCapabilities: ['analysis'],
+  }, now + 4000);
+
+  assert.equal(recovered.state, 'healthy');
+  assert.equal(recovered.consecutiveTaskFailures, 0);
+  assert.equal(isRoutable({ runtimeHealth: recovered }, ['analysis'], [{ type: 'markdown' }], now + 5000).ok, true);
+});
+
+test('expired cooldown with known capabilities is routable again', () => {
+  const health = {
+    state: 'cooldown',
+    cooldownUntil: now - 1_000,
+    outputCapabilities: ['markdown'],
+    taskCapabilities: ['research'],
+  };
+
+  const route = isRoutable({ status: 'idle', runtimeHealth: health }, ['research'], [{ type: 'markdown' }], now);
+
+  assert.equal(route.ok, true);
+});
+
 test('source provider unavailable is task-level and does not degrade runtime routing', () => {
   const healthy = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
     outputCapabilities: ['markdown'],
@@ -122,6 +165,23 @@ test('source provider unavailable is task-level and does not degrade runtime rou
     isRoutable({ runtimeHealth: afterProviderFailure }, ['source_research'], [{ type: 'markdown' }], now + 2000).ok,
     true,
   );
+});
+
+test('artifact type mismatch is output-contract failure and does not degrade runtime routing', () => {
+  const healthy = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
+    outputCapabilities: ['markdown'],
+    taskCapabilities: ['research'],
+  }, now);
+
+  const afterMismatch = recordRuntimeFailure(healthy, {
+    failureClass: 'artifact_type_mismatch',
+    error: 'missing required output: markdown',
+  }, now + 1000);
+
+  assert.equal(afterMismatch.state, 'healthy');
+  assert.equal(afterMismatch.consecutiveRuntimeFailures, 0);
+  assert.equal(afterMismatch.lastFailureClass, 'artifact_type_mismatch');
+  assert.equal(isRoutable({ runtimeHealth: afterMismatch }, ['research'], [{ type: 'markdown' }], now + 2000).ok, true);
 });
 
 test('successful task records capabilities and routability checks task and output capabilities', () => {

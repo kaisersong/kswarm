@@ -106,6 +106,37 @@ test('submitted task without review exposes notify PO review intervention', () =
   assert.match(result.message, /后续 2 个任务/);
 });
 
+test('artifact type mismatch exposes output contract repair strategy with missing output', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-output-contract', name: 'OpenAI动态分析', status: 'active' },
+    tasks: [
+      {
+        id: 'item-1',
+        title: 'OpenAI 5月动态搜索',
+        status: 'failed',
+        updatedAt: 1779553938379,
+        assignedAgent: 'xiaok-po',
+        failureReason: 'artifact_type_mismatch',
+        lastFailureClass: 'artifact_type_mismatch',
+        rejectedSubmissions: [{
+          failureClass: 'artifact_type_mismatch',
+          missing: ['markdown'],
+          errors: ['missing required output: markdown'],
+        }],
+      },
+      { id: 'item-2', title: '综合分析', status: 'pending', dependencies: ['item-1'] },
+    ],
+    agents: [{ id: 'xiaok-po', status: 'idle', runtimeHealth: { state: 'healthy' } }],
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryTaskId, 'item-1');
+  assert.equal(result.primaryAction.strategy, 'repair_output_contract');
+  assert.equal(result.primaryFailure.reason, 'artifact_type_mismatch');
+  assert.deepEqual(result.primaryFailure.missing, ['markdown']);
+  assert.match(result.message, /缺少必须产物/);
+});
+
 test('submitted task waiting for review outranks stale retry child failure', () => {
   const result = deriveProjectIntervention({
     project: { id: 'proj-review-mixed', name: 'OpenAI本月分析', status: 'active' },

@@ -24,6 +24,38 @@ test('blocked tasks make the project health blocked with actionable reasons', ()
   assert.ok(health.reasons[0].message.includes('没有独立评审'));
 });
 
+test('preparation blocker is surfaced before task state', () => {
+  const health = deriveProjectHealth({
+    project: {
+      id: 'proj-prep',
+      status: 'created',
+      preparation: {
+        state: 'blocked',
+        blockers: [{ agentId: 'xiaok-po', reason: 'broker_participant_missing', selectedBy: 'default_seed' }],
+      },
+    },
+    tasks: [],
+  });
+
+  assert.equal(health.state, 'preparation_blocked');
+  assert.equal(health.gate, 'project_preparation');
+  assert.equal(health.reasons[0].agentId, 'xiaok-po');
+  assert.equal(health.reasons[0].message, 'broker_participant_missing');
+});
+
+test('output contract repair requirement has a dedicated health state', () => {
+  const health = deriveProjectHealth({
+    project: { id: 'proj-output', status: 'active' },
+    tasks: [
+      { id: 'item-1', status: 'failed', lastFailureClass: 'artifact_type_mismatch', rejectedSubmissions: [{ missing: ['markdown'] }] },
+    ],
+  });
+
+  assert.equal(health.state, 'repair_output_contract');
+  assert.equal(health.gate, 'output_contract');
+  assert.deepEqual(health.reasons[0].missing, ['markdown']);
+});
+
 test('submitted tasks are surfaced as needs_review before idle', () => {
   const health = deriveProjectHealth({
     project: { id: 'proj-a', status: 'active' },

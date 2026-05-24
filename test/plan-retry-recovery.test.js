@@ -96,6 +96,27 @@ test('reassigns stale xiaok PO without runtime path to the dedicated desktop PO 
   assert.equal(result.reason, 'preferred_xiaok_po');
 });
 
+test('preserves an explicit user-selected PO for readiness gate instead of replacing during retry normalization', () => {
+  const result = resolvePlanRetryPoAgent(
+    {
+      ...project('created'),
+      poAgent: '33db9546-bfa',
+      agentSelection: {
+        poAgent: { agentId: '33db9546-bfa', source: 'explicit_user' },
+      },
+    },
+    [
+      { id: '33db9546-bfa', name: 'Chosen PO', runtimeType: 'xiaok', runtimePath: null, roles: ['project_owner'], status: 'idle' },
+      { id: 'xiaok-po', name: 'PO-Agent', runtimeType: 'xiaok', runtimeSource: 'desktop-agent-runtime', roles: ['project_owner'], status: 'offline' },
+    ],
+  );
+
+  assert.equal(result.poAgent, '33db9546-bfa');
+  assert.equal(result.previousPoAgent, '33db9546-bfa');
+  assert.equal(result.changed, false);
+  assert.equal(result.reason, 'explicit_user_po_preserved');
+});
+
 test('builds retry assign_po intent with the same project context as project creation', () => {
   const intent = buildPlanRetryAssignPoIntent({
     id: 'proj-test',
@@ -103,6 +124,7 @@ test('builds retry assign_po intent with the same project context as project cre
     goal: 'Ship the report',
     requirements: 'Use markdown',
     planningGuidance: 'Keep detailed output format in the plan.',
+    qualityPlanningGuidance: 'Effective project-management rules:\n- [hard] executive_report.final_artifact_polish: final report only.',
     members: ['xiaok-worker'],
   });
 
@@ -115,7 +137,12 @@ test('builds retry assign_po intent with the same project context as project cre
       name: 'Test Project',
       goal: 'Ship the report',
       requirements: 'Use markdown',
-      planningGuidance: 'Keep detailed output format in the plan.',
+      planningGuidance: [
+        'Keep detailed output format in the plan.',
+        '',
+        'Effective project-management rules:',
+        '- [hard] executive_report.final_artifact_polish: final report only.',
+      ].join('\n'),
       members: ['xiaok-worker'],
     },
   });

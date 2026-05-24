@@ -2,6 +2,7 @@ const ACTIVE_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 const ATTENTION_STATUSES = new Set(['failed', 'blocked']);
 const DONE_STATUSES = new Set(['done', 'cancelled']);
 const MAX_AUTO_QUALITY_RETRIES = 2;
+const OUTPUT_CONTRACT_FAILURES = new Set(['artifact_type_mismatch', 'artifact_missing', 'artifact_invalid', 'inline_artifact_forbidden', 'artifact_hash_mismatch', 'artifact_path_escape']);
 
 export function deriveProjectIntervention({
   project = {},
@@ -169,6 +170,8 @@ function isRetryChildMaskingQualityDeadloop(task, taskMap) {
 
 function chooseAttentionStrategy(task, agents) {
   if (requiresPlanRevision(task)) return 'needs_conversation';
+  if (task.blockKind === 'agent_replacement_confirmation_required') return 'replace_agent_confirm';
+  if (hasOutputContractFailure(task)) return 'repair_output_contract';
   const hasCurrentQuality = hasCurrentQualityRejection(task);
   const hasAnyQualityFeedback = hasCurrentQuality || hasQualityFeedback(task);
   if (hasAnyQualityFeedback && shouldEscalateQualityRepair(task)) return 'needs_conversation';
@@ -197,6 +200,8 @@ function rankTask(task, strategy, downstreamBlockedCount = 0) {
 
 function baseTaskRank(task, strategy) {
   if (strategy === 'recover_submission') return 10;
+  if (strategy === 'repair_output_contract') return 11;
+  if (strategy === 'replace_agent_confirm') return 13;
   if (strategy === 'notify_po_review') return 12;
   if (strategy === 'needs_conversation' && requiresPlanRevision(task)) return 14;
   if (strategy === 'needs_conversation' && hasQualityFeedback(task) && shouldEscalateQualityRepair(task)) return 15;
@@ -243,6 +248,13 @@ function hasQualityFeedback(task = {}) {
   if (String(task.lastFailureClass || '').startsWith('quality_')) return true;
   if (task.blockKind && String(task.blockKind).includes('quality')) return true;
   return latestFailedReview(task) !== null;
+}
+
+function hasOutputContractFailure(task = {}) {
+  if (OUTPUT_CONTRACT_FAILURES.has(String(task.lastFailureClass || ''))) return true;
+  if (OUTPUT_CONTRACT_FAILURES.has(String(task.failureReason || ''))) return true;
+  const rejected = Array.isArray(task.rejectedSubmissions) ? task.rejectedSubmissions : [];
+  return rejected.some(submission => OUTPUT_CONTRACT_FAILURES.has(String(submission?.failureClass || '')));
 }
 
 function requiresPlanRevision(task = {}) {
@@ -329,13 +341,24 @@ function countDownstreamBlocked(rootTask, tasks) {
 
 function describeFailure(task = {}) {
   const failedReview = latestFailedReview(task);
+  const missing = latestMissingOutputs(task);
   return {
     reason: task.failureReason || task.blockedReason || task.lastFailureClass || null,
     feedback: failedReview?.feedback || task.reviewResult?.feedback || task.blockedReason || task.failureReason || '',
     assignedAgent: task.assignedAgent || null,
     status: task.status || null,
     qualityFailureCount: Number(task.qualityFailureCount || 0),
+    ...(missing.length > 0 ? { missing } : {}),
   };
+}
+
+function latestMissingOutputs(task = {}) {
+  const rejected = Array.isArray(task.rejectedSubmissions) ? task.rejectedSubmissions : [];
+  for (let index = rejected.length - 1; index >= 0; index -= 1) {
+    const missing = rejected[index]?.missing;
+    if (Array.isArray(missing) && missing.length > 0) return missing.map(String);
+  }
+  return Array.isArray(task.missingOutputs) ? task.missingOutputs.map(String) : [];
 }
 
 function buildMessage({ task, strategy, downstreamBlockedCount }) {
@@ -350,6 +373,14 @@ function buildMessage({ task, strategy, downstreamBlockedCount }) {
   }
   if (strategy === 'notify_po_review') {
     return `${task.title || task.id} 已提交，等待 PO 复审；可以重新通知 PO。${suffix}`;
+  }
+  if (strategy === 'repair_output_contract') {
+    const missing = latestMissingOutputs(task);
+    const missingText = missing.length > 0 ? `缺少必须产物：${missing.join('、')}。` : '缺少必须产物。';
+    return `${task.title || task.id} ${missingText}需要补交正确格式后提交 PO 复审。${suffix}`;
+  }
+  if (strategy === 'replace_agent_confirm') {
+    return `${task.title || task.id} 的显式选择智能体不可用，需要确认是否更换执行者。${suffix}`;
   }
   if (strategy === 'complete_retry_parent') {
     return `${task.title || task.id} 的重试结果已完成，可以补齐父任务状态。${suffix}`;

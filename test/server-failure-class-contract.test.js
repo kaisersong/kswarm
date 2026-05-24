@@ -13,13 +13,16 @@ const source = readFileSync(join(process.cwd(), 'src/server/index.js'), 'utf-8')
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
-test('server recognizes source provider failures for diagnostics', () => {
+test('server runtime failure list excludes task and output contract failures', () => {
   const block = source.slice(
     source.indexOf('const AGENT_RUNTIME_FAILURE_CLASSES'),
     source.indexOf('function recordAgentRuntimeFailure')
   );
 
-  assert.match(block, /source_provider_unavailable/);
+  assert.match(block, /runtime_offline/);
+  assert.match(block, /model_empty_output/);
+  assert.doesNotMatch(block, /source_provider_unavailable/);
+  assert.doesNotMatch(block, /artifact_type_mismatch/);
 });
 
 let passed = 0;

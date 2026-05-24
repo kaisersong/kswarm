@@ -37,10 +37,17 @@ import { probeAgentRuntime } from '../core/runtime-probe.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
 import {
+  deriveProjectPreparation,
+  normalizeReadinessProbeResult,
+} from '../core/agent-readiness.js';
+import {
   XIAOK_PO_AGENT_ID,
   XIAOK_WORKER_AGENT_ID,
   createRuntimeInstancePool,
 } from '../core/runtime-instance-pool.js';
+import { appendQualityPlanningGuidance } from '../core/quality-rules.js';
+import { createQualityOverlayStore } from '../core/quality-overlays.js';
+import { handleQualityApiRequest } from './quality-api.js';
 import {
   getProjectWorkspace as getProjectWorkspaceRecord,
   initProjectWorkspace as initProjectWorkspaceRecord,
@@ -63,11 +70,18 @@ const runtimeInstancePool = createRuntimeInstancePool();
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const PROJECTS_DIR = join(KSWARM_HOME, 'projects');
 mkdirSync(PROJECTS_DIR, { recursive: true });
+const qualityOverlayStore = createQualityOverlayStore(join(KSWARM_HOME, 'quality-overlays.json'));
 
 // ─── Hub Instance ─────────────────────────────────────────────────
 let agentStore = null;
 let brokerOnlineAgentIds = null;
 let brokerOnlineAgentIdsUpdatedAt = 0;
+let brokerOnlineParticipants = [];
+const readinessProbeCache = new Map();
+const readinessProbeWaiters = new Map();
+const pendingProbeByAgentId = new Map();
+const READINESS_PROBE_TIMEOUT_MS = 10_000;
+const READINESS_PROBE_TTL_MS = 5 * 60_000;
 
 function listAgentProfilesForRouting() {
   const agents = agentStore?.list({ includeArchived: false }) || [];
@@ -94,6 +108,7 @@ const hub = createHub({
   silent: false,
   dataDir: join(KSWARM_HOME, 'state.json'),
   getAgentProfiles: () => listAgentProfilesForRouting(),
+  getQualityOverlays: () => qualityOverlayStore.listOverlays(),
   runtimeInstanceAllocator: {
     getAgentConcurrency: () => runtimeInstancePool.getAgentConcurrency(),
     reserveWorkerInstance: reservation => reserveWorkerRuntimeInstance(reservation),
@@ -354,10 +369,12 @@ async function refreshBrokerOnlineAgentIds() {
     if (!res.ok) {
       brokerOnlineAgentIds = null;
       brokerOnlineAgentIdsUpdatedAt = 0;
+      brokerOnlineParticipants = [];
       return null;
     }
     const data = await res.json();
     const participants = data.participants || data || [];
+    brokerOnlineParticipants = participants;
     brokerOnlineAgentIds = new Set(
       participants
         .filter(p => p.kind === 'agent' && p.inboxMode === 'realtime')
@@ -368,12 +385,242 @@ async function refreshBrokerOnlineAgentIds() {
   } catch {
     brokerOnlineAgentIds = null;
     brokerOnlineAgentIdsUpdatedAt = 0;
+    brokerOnlineParticipants = [];
     return null;
   }
 }
 
 async function getOnlineAgentIds() {
   return await refreshBrokerOnlineAgentIds() || new Set();
+}
+
+function normalizeProjectAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
+  const poSource = agentSelection?.poAgent?.source || 'system_migration';
+  return {
+    ...(agentSelection && typeof agentSelection === 'object' ? agentSelection : {}),
+    poAgent: {
+      agentId: agentSelection?.poAgent?.agentId || poAgent,
+      source: poSource,
+    },
+    members: Array.isArray(agentSelection?.members)
+      ? agentSelection.members.map((member, index) => ({
+          agentId: member?.agentId || member?.id || member || members[index],
+          source: member?.source || 'system_migration',
+        })).filter(member => member.agentId)
+      : (Array.isArray(members) ? members : []).map(agentId => ({
+          agentId,
+          source: 'system_migration',
+        })),
+  };
+}
+
+function selectedAgentIdsForPreparation(project) {
+  const ids = [];
+  const po = project?.agentSelection?.poAgent?.agentId || project?.poAgent;
+  if (po) ids.push({ agentId: po, role: 'project_owner' });
+  const members = Array.isArray(project?.agentSelection?.members) && project.agentSelection.members.length > 0
+    ? project.agentSelection.members.map(member => member?.agentId || member?.id || member)
+    : project?.members || [];
+  for (const memberId of members) {
+    if (memberId) ids.push({ agentId: memberId, role: 'worker' });
+  }
+  return ids;
+}
+
+function isDesktopRuntimeAgent(agent) {
+  return Boolean(agent && (agent.runtimeSource === 'desktop-agent-runtime' || agent.id === XIAOK_PO_AGENT_ID || agent.id === XIAOK_WORKER_AGENT_ID));
+}
+
+function getCachedReadinessProbe(agentId, now = Date.now()) {
+  const cached = readinessProbeCache.get(agentId);
+  if (!cached) return null;
+  if (cached.expiresAt && now > cached.expiresAt) {
+    readinessProbeCache.delete(agentId);
+    return null;
+  }
+  return cached;
+}
+
+async function requestReadinessProbe({ projectId, agentId, role, forceProbe = false } = {}) {
+  const now = Date.now();
+  const cached = !forceProbe ? getCachedReadinessProbe(agentId, now) : null;
+  if (cached) return cached;
+
+  const pending = pendingProbeByAgentId.get(agentId);
+  if (pending && !forceProbe && now - pending.startedAt < READINESS_PROBE_TIMEOUT_MS) {
+    return pending.promise;
+  }
+
+  if (!brokerClient || !brokerClient.isConnected()) {
+    const result = normalizeReadinessProbeResult({
+      agentId,
+      ok: false,
+      reason: 'broker_unavailable',
+    }, now);
+    readinessProbeCache.set(agentId, result);
+    return result;
+  }
+
+  const probeId = `probe-${projectId || 'project'}-${agentId}-${now}`;
+  const promise = new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      readinessProbeWaiters.delete(probeId);
+      pendingProbeByAgentId.delete(agentId);
+      const result = normalizeReadinessProbeResult({
+        agentId,
+        probeId,
+        ok: false,
+        reason: 'readiness_probe_timeout',
+      }, Date.now());
+      readinessProbeCache.set(agentId, result);
+      resolve(result);
+    }, READINESS_PROBE_TIMEOUT_MS);
+
+    readinessProbeWaiters.set(probeId, {
+      agentId,
+      resolve: result => {
+        clearTimeout(timeout);
+        readinessProbeWaiters.delete(probeId);
+        pendingProbeByAgentId.delete(agentId);
+        resolve(result);
+      },
+    });
+
+    brokerClient.sendTo(agentId, 'readiness_probe', {
+      taskId: probeId,
+      threadId: `thread-${projectId || probeId}`,
+      payload: { probeId, projectId, agentId, role },
+    }).catch(error => {
+      clearTimeout(timeout);
+      readinessProbeWaiters.delete(probeId);
+      pendingProbeByAgentId.delete(agentId);
+      const result = normalizeReadinessProbeResult({
+        agentId,
+        probeId,
+        ok: false,
+        reason: error?.message || 'readiness_probe_send_failed',
+      }, Date.now());
+      readinessProbeCache.set(agentId, result);
+      resolve(result);
+    });
+  });
+
+  pendingProbeByAgentId.set(agentId, { probeId, startedAt: now, promise });
+  return promise;
+}
+
+function handleReadinessProbeResult(intent) {
+  const payload = intent?.payload || {};
+  const now = Date.now();
+  const normalized = normalizeReadinessProbeResult({
+    ...payload,
+    agentId: payload.agentId || intent.fromParticipantId,
+    participantId: payload.participantId || intent.fromParticipantId,
+    expiresAt: now + READINESS_PROBE_TTL_MS,
+  }, now);
+  if (normalized.agentId) readinessProbeCache.set(normalized.agentId, normalized);
+  const waiter = normalized.probeId ? readinessProbeWaiters.get(normalized.probeId) : null;
+  if (waiter && (!waiter.agentId || waiter.agentId === normalized.agentId)) {
+    waiter.resolve(normalized);
+  }
+}
+
+function runtimeCapacityByAgentId() {
+  const summary = runtimeInstancePool.summarizeByAgent();
+  const concurrency = runtimeInstancePool.getAgentConcurrency();
+  const result = {};
+  for (const [agentId, item] of Object.entries(summary)) {
+    const total = Number(item.total || 0);
+    const failed = Number(item.failed || 0);
+    const offline = Number(item.offline || 0);
+    const idle = Number(item.idle || 0);
+    const starting = Number(item.starting || 0);
+    const working = Number(item.working || 0);
+    const limit = Number(concurrency[agentId] || 0);
+    if (total > 0 && failed + offline >= total) {
+      result[agentId] = { capacity: 'failed', canCreateRuntimeInstance: limit > total };
+    } else if (idle > 0 || starting > 0 || (limit && total < limit)) {
+      result[agentId] = { capacity: 'available', canCreateRuntimeInstance: limit ? total < limit : null };
+    } else if (working > 0 && limit && working >= limit) {
+      result[agentId] = { capacity: 'busy', canCreateRuntimeInstance: false };
+    } else {
+      result[agentId] = { capacity: 'unknown', canCreateRuntimeInstance: null };
+    }
+  }
+  return result;
+}
+
+async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
+  if (!project) return null;
+  await refreshBrokerOnlineAgentIds();
+  const selected = selectedAgentIdsForPreparation(project);
+  const agents = listAgentProfilesForRouting();
+
+  for (const selectedAgent of selected) {
+    const agent = agents.find(candidate => candidate.id === selectedAgent.agentId) || agentStore?.get(selectedAgent.agentId);
+    if (!isDesktopRuntimeAgent(agent)) continue;
+    if (!(brokerOnlineAgentIds instanceof Set) || !brokerOnlineAgentIds.has(selectedAgent.agentId)) continue;
+    await requestReadinessProbe({
+      projectId: project.id,
+      agentId: selectedAgent.agentId,
+      role: selectedAgent.role,
+      forceProbe,
+    });
+  }
+
+  const probeResults = {};
+  for (const { agentId } of selected) {
+    const cached = getCachedReadinessProbe(agentId, Date.now());
+    if (cached) probeResults[agentId] = cached;
+  }
+
+  project.preparation = deriveProjectPreparation({
+    project,
+    agents,
+    participants: brokerOnlineParticipants,
+    probeResults,
+    capacityByAgentId: runtimeCapacityByAgentId(),
+    now: Date.now(),
+  });
+  project.updatedAt = Date.now();
+  hub.persistState();
+  return project.preparation;
+}
+
+async function ensureProjectAgentsStarted(project) {
+  if (!project?.poAgent) return { poTarget: null };
+  let poTarget = project.poAgent;
+  if (isDefaultRuntimePo(project.poAgent)) {
+    const ensuredPo = ensureProjectPoRuntime(project);
+    if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
+    else log('warn', 'Failed to ensure project PO runtime', { projectId: project.id, poAgent: project.poAgent, error: ensuredPo.error });
+  } else {
+    await autoStartAgent(project.poAgent);
+  }
+  for (const agentId of project.members || []) {
+    if (!isDefaultRuntimeWorker(agentId)) await autoStartAgent(agentId);
+  }
+  return { poTarget };
+}
+
+async function sendAssignPoForProject(project, { delayMs = 0 } = {}) {
+  if (!project?.poAgent || !brokerClient || !brokerClient.isConnected()) return { sent: false, reason: 'broker_unavailable' };
+  const { poTarget } = await ensureProjectAgentsStarted(project);
+  if (!poTarget) return { sent: false, reason: 'po_target_missing' };
+  if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+  await brokerClient.sendTo(poTarget, 'assign_po', {
+    taskId: project.id,
+    threadId: `thread-${project.id}`,
+    payload: {
+      projectId: project.id,
+      projectName: project.name,
+      goal: project.goal || '',
+      requirements: project.requirements || '',
+      planningGuidance: appendQualityPlanningGuidance(project.planningGuidance || '', project.qualityPlanningGuidance || ''),
+      members: project.members || [],
+    },
+  });
+  return { sent: true, poTarget };
 }
 
 async function sendRecoveryReviewSubmission({ projectId, taskId, fromWorker, result }) {
@@ -453,6 +700,16 @@ function handleBrokerIntent(intent) {
   const { kind, taskId, fromParticipantId, payload } = intent;
 
   switch (kind) {
+    case 'readiness_probe_result': {
+      handleReadinessProbeResult(intent);
+      log('info', 'Readiness probe result received', {
+        fromParticipantId,
+        probeId: payload?.probeId,
+        ok: payload?.ok,
+        reason: payload?.reason || null,
+      });
+      break;
+    }
     case 'accept_task': {
       const resolved = resolveIncomingTask(taskId, payload);
       if (!resolved.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, resolved);
@@ -911,6 +1168,19 @@ async function handleRequest(req, res) {
       return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length });
     }
 
+    if (path.startsWith('/quality/')) {
+      const body = req.method === 'POST' ? await parseBody(req) : null;
+      const result = handleQualityApiRequest({
+        method: req.method,
+        path,
+        query: Object.fromEntries(url.searchParams.entries()),
+        body,
+        hub,
+        overlayStore: qualityOverlayStore,
+      });
+      if (result.handled) return json(res, result.body, result.status);
+    }
+
     // ── Projects list ──
     if (path === '/projects' && req.method === 'GET') {
       const projects = hub.listProjects().map(p => {
@@ -933,57 +1203,40 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary } = body;
+      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
-      const poResolution = resolvePlanRetryPoAgent({ poAgent }, agentStore.list({ includeArchived: false }));
-      const resolvedPoAgent = poResolution.poAgent || poAgent;
+      const resolvedPoAgent = poAgent;
       const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== resolvedPoAgent) : [];
+      const normalizedAgentSelection = normalizeProjectAgentSelection({
+        poAgent: resolvedPoAgent,
+        members: resolvedMembers,
+        agentSelection,
+      });
       const id = `proj-${Date.now()}`;
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary });
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
       project.workFolder = ws.path;
-      
+
+      await ensureProjectAgentsStarted(project);
+      const preparation = await prepareProjectForPlanning(project);
+      let planningStart = { sent: false, reason: 'preparation_blocked' };
+      if (preparation?.state === 'ready') {
+        planningStart = await sendAssignPoForProject(project, { delayMs: 0 })
+          .catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }));
+      }
+
       log('info', `Project created: ${name}`, {
         id,
         po: resolvedPoAgent,
         requestedPo: poAgent,
-        poReassigned: poResolution.changed,
+        poReassigned: false,
         workspace: ws.path,
+        preparationState: project.preparation?.state || null,
+        planningStart,
       });
       broadcast({ type: 'project_created', project });
-
-      // Auto-start custom agents. Default Xiaok seeds are started as runtime instances on demand.
-      let poTarget = resolvedPoAgent;
-      if (isDefaultRuntimePo(resolvedPoAgent)) {
-        const ensuredPo = ensureProjectPoRuntime(project);
-        if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
-        else log('warn', 'Failed to ensure project PO runtime on create', { projectId: id, poAgent: resolvedPoAgent, error: ensuredPo.error });
-      } else {
-        await autoStartAgent(resolvedPoAgent);
-      }
-      for (const agentId of resolvedMembers) {
-        if (!isDefaultRuntimeWorker(agentId)) await autoStartAgent(agentId);
-      }
-
-      // Send assign_po immediately so PO can start generating the Plan
-      if (brokerClient && brokerClient.isConnected()) {
-        setTimeout(() => {
-          brokerClient.sendTo(poTarget, 'assign_po', {
-            taskId: id,
-            threadId: `thread-${id}`,
-            payload: {
-              projectId: id,
-              projectName: name,
-              goal: goal || '',
-              requirements: requirements || '',
-              planningGuidance: planningGuidance || '',
-              members: resolvedMembers,
-            },
-          }).catch(err => log('warn', 'Failed to send assign_po on create', { target: poTarget, error: err.message }));
-        }, 1000);
-      }
 
       return json(res, { ok: true, project }, 201);
     }
@@ -1015,6 +1268,23 @@ async function handleRequest(req, res) {
         projectHealth,
         projectIntervention,
       });
+    }
+
+    // ── Project preparation gate ──
+    const prepareMatch = path.match(/^\/projects\/([^/]+)\/prepare$/);
+    if (prepareMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const project = hub.getProject(prepareMatch[1]);
+      if (!project) return json(res, { ok: false, error: 'project_not_found' }, 404);
+      const preparation = await prepareProjectForPlanning(project, { forceProbe: Boolean(body?.forceProbe) });
+      let startedPlanning = false;
+      let planningStart = null;
+      if (preparation?.state === 'ready' && project.status === 'created' && !project.plan) {
+        planningStart = await sendAssignPoForProject(project).catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }));
+        startedPlanning = Boolean(planningStart?.sent);
+      }
+      broadcast({ type: 'project_prepared', projectId: project.id, preparation, startedPlanning });
+      return json(res, { ok: true, preparation, startedPlanning, planningStart });
     }
 
     // ── Delete project (Human only) ──
@@ -1123,6 +1393,18 @@ async function handleRequest(req, res) {
     // ── Project approve (Human action) ──
     const approveMatch = path.match(/^\/projects\/([^/]+)\/approve$/);
     if (approveMatch && req.method === 'POST') {
+      const projectForApproval = hub.getProject(approveMatch[1]);
+      if (!projectForApproval) return json(res, { ok: false, error: 'project_not_found' }, 404);
+      if (projectForApproval.status !== 'active') {
+        const preparation = await prepareProjectForPlanning(projectForApproval);
+        if (preparation?.state !== 'ready') {
+          return json(res, {
+            ok: false,
+            error: 'project_preparation_required',
+            preparation,
+          }, 409);
+        }
+      }
       const result = hub.handleApprove(approveMatch[1]);
       if (result.ok) {
         if (result.alreadyActive) {
@@ -1180,6 +1462,14 @@ async function handleRequest(req, res) {
       if (poResolution.changed && poResolution.poAgent) {
         project.poAgent = poResolution.poAgent;
       }
+      project.agentSelection = normalizeProjectAgentSelection({
+        poAgent: project.poAgent,
+        members: project.members || [],
+        agentSelection: project.agentSelection || null,
+      });
+      if (poResolution.changed && project.agentSelection?.poAgent) {
+        project.agentSelection.poAgent = { agentId: project.poAgent, source: 'system_migration' };
+      }
 
       // Auto-start PO and member agents
       let poStarted = false;
@@ -1223,6 +1513,22 @@ async function handleRequest(req, res) {
       }
 
       hub.persistState();
+
+      const preparation = await prepareProjectForPlanning(project);
+      if (preparation?.state !== 'ready') {
+        return json(res, {
+          ok: false,
+          error: 'project_preparation_required',
+          preparation,
+          po: project.poAgent,
+          poAgent: project.poAgent,
+          previousPoAgent: originalPoAgent,
+          poReassigned: Boolean(poResolution.changed),
+          poResolutionReason: poResolution.reason,
+          previousStatus: normalized.previousStatus,
+          status: project.status,
+        }, 409);
+      }
 
       // Send assign_po intent via brokerClient
       if (brokerClient && brokerClient.isConnected() && poTarget) {
@@ -2238,11 +2544,7 @@ const AGENT_RUNTIME_FAILURE_CLASSES = new Set([
   'runtime_recovery',
   'runtime_stalled',
   'runtime_generation_unavailable',
-  'source_provider_unavailable',
   'model_empty_output',
-  'quality_evidence_missing',
-  'artifact_type_mismatch',
-  'artifact_invalid',
 ]);
 
 function recordAgentRuntimeFailure(agentId, failureClass, errorMessage) {

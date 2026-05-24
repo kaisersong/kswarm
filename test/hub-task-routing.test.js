@@ -49,21 +49,38 @@ test('createProject preserves user fields and sends planningGuidance only as pla
   const project = hub.createProject({
     id: 'proj-guidance',
     name: 'Guidance',
-    goal: '输出OpenAI本月分析报告，最终用 Markdown 交付',
+    goal: '本月产品分析，给高层报告',
     requirements: '不要改写我的目标和要求。',
     planningGuidance: '计划中细化：最终任务交付 Markdown 报告。',
     poAgent: 'po',
     members: ['worker'],
   });
 
-  assert.equal(project.goal, '输出OpenAI本月分析报告，最终用 Markdown 交付');
+  assert.equal(project.goal, '本月产品分析，给高层报告');
   assert.equal(project.requirements, '不要改写我的目标和要求。');
   assert.equal(project.planningGuidance, '计划中细化：最终任务交付 Markdown 报告。');
+  assert.deepEqual(project.qualityRuleSet.knowledgePacks.map(pack => pack.id), ['executive_report', 'research']);
+  assert.equal(project.qualityRuleSet.requestSignals.explicitCountRequirement, null);
+  assert.equal(
+    project.qualityRuleSet.rules.some(rule => rule.severity === 'hard' && rule.metadata?.kind === 'fixed_count'),
+    false,
+  );
 
   const [assignPo] = bridge.getSentOf('assign_po');
-  assert.equal(assignPo.payload.goal, '输出OpenAI本月分析报告，最终用 Markdown 交付');
+  assert.equal(assignPo.payload.goal, '本月产品分析，给高层报告');
   assert.equal(assignPo.payload.requirements, '不要改写我的目标和要求。');
-  assert.equal(assignPo.payload.planningGuidance, '计划中细化：最终任务交付 Markdown 报告。');
+  assert.match(assignPo.payload.planningGuidance, /^计划中细化：最终任务交付 Markdown 报告。/);
+  assert.match(assignPo.payload.planningGuidance, /Effective project-management rules/);
+  assert.match(assignPo.payload.planningGuidance, /research\.source_date_gap_disclosure/);
+  assert.match(assignPo.payload.planningGuidance, /executive_report\.final_artifact_polish/);
+  assert.doesNotMatch(assignPo.payload.planningGuidance, /至少10|at least 10/);
+
+  const retry = hub.handleRetryPlan('proj-guidance');
+  assert.equal(retry.ok, true);
+  const retryAssignPo = bridge.getSentOf('assign_po').at(-1);
+  assert.equal(retryAssignPo.payload.goal, '本月产品分析，给高层报告');
+  assert.equal(retryAssignPo.payload.requirements, '不要改写我的目标和要求。');
+  assert.equal(retryAssignPo.payload.planningGuidance, assignPo.payload.planningGuidance);
 });
 
 test('same local task IDs in different projects stay isolated', () => {
@@ -296,6 +313,115 @@ test('worker failure requires active runId and creates a retry run', () => {
   assert.notEqual(retry.activeRunId, runId);
 });
 
+test('basic invocation failure replaces default-selected worker without creating retry child', () => {
+  const agents = [
+    { id: 'bad-worker', roles: ['worker'], runtimeHealth: { state: 'degraded', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+    { id: 'xiaok-worker', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+  ];
+  const hub = createHub({ silent: true, getAgentProfiles: () => agents });
+  hub.createProject({
+    id: 'proj-replace',
+    name: 'Replace',
+    goal: 'goal',
+    poAgent: 'po',
+    members: ['bad-worker', 'xiaok-worker'],
+    agentSelection: {
+      poAgent: { agentId: 'po', source: 'system_migration' },
+      members: [
+        { agentId: 'bad-worker', source: 'default_seed' },
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+      ],
+    },
+  });
+  assert.equal(hub.handleCreateTasks('proj-replace', [
+    { id: 'item-1', title: 'Research', brief: 'Do research', assignedAgent: 'bad-worker', requiredOutputs: ['markdown'], requiredCapabilities: ['research'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-replace').ok, true);
+
+  const failed = hub.handleTaskFail('proj-replace', 'item-1', 'runtime_offline', 'offline');
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.replaced, true);
+  assert.equal(failed.replacementDispatched, true);
+  assert.equal(failed.retryTaskId, undefined);
+  const tasks = hub.getBoard('proj-replace').getAllTasks();
+  assert.equal(tasks.length, 1);
+  const task = hub.getBoard('proj-replace').getTask('item-1');
+  assert.equal(task.status, 'dispatched');
+  assert.equal(task.assignedAgent, 'xiaok-worker');
+  assert.ok(task.activeRunId);
+  assert.equal(task.replacementHistory.length, 1);
+  assert.equal(task.replacementHistory[0].fromAgentId, 'bad-worker');
+});
+
+test('output contract failure keeps same agent and uses repair intervention', () => {
+  const hub = createHub({ silent: true, getAgentProfiles: () => [
+    { id: 'xiaok-po', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+    { id: 'xiaok-worker', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+  ] });
+  hub.createProject({
+    id: 'proj-contract-failure',
+    name: 'Contract failure',
+    goal: 'goal',
+    poAgent: 'po',
+    members: ['xiaok-po', 'xiaok-worker'],
+    agentSelection: {
+      poAgent: { agentId: 'po', source: 'system_migration' },
+      members: [
+        { agentId: 'xiaok-po', source: 'default_seed' },
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+      ],
+    },
+  });
+  assert.equal(hub.handleCreateTasks('proj-contract-failure', [
+    { id: 'item-1', title: 'OpenAI search', brief: 'Write markdown', assignedAgent: 'xiaok-po', requiredOutputs: ['markdown'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-contract-failure').ok, true);
+
+  const failed = hub.handleTaskFail('proj-contract-failure', 'item-1', 'artifact_type_mismatch', 'missing markdown');
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.replaced, undefined);
+  const task = hub.getBoard('proj-contract-failure').getTask('item-1');
+  assert.equal(task.assignedAgent, 'xiaok-po');
+  const intervention = hub.getProjectIntervention('proj-contract-failure');
+  assert.equal(intervention.primaryAction.strategy, 'repair_output_contract');
+});
+
+test('explicit worker runtime failure blocks for replacement confirmation', () => {
+  const hub = createHub({ silent: true, getAgentProfiles: () => [
+    { id: 'cli-qoder', roles: ['worker'], runtimeHealth: { state: 'degraded', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+    { id: 'xiaok-worker', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+  ] });
+  hub.createProject({
+    id: 'proj-explicit-replace',
+    name: 'Explicit replace',
+    goal: 'goal',
+    poAgent: 'po',
+    members: ['cli-qoder', 'xiaok-worker'],
+    agentSelection: {
+      poAgent: { agentId: 'po', source: 'system_migration' },
+      members: [
+        { agentId: 'cli-qoder', source: 'explicit_user' },
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+      ],
+    },
+  });
+  assert.equal(hub.handleCreateTasks('proj-explicit-replace', [
+    { id: 'item-1', title: 'Research', brief: 'Do research', assignedAgent: 'cli-qoder', requiredOutputs: ['markdown'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-explicit-replace').ok, true);
+
+  const failed = hub.handleTaskFail('proj-explicit-replace', 'item-1', 'runtime_offline', 'offline');
+
+  assert.equal(failed.ok, true);
+  assert.equal(failed.replaced, false);
+  assert.equal(failed.replacement?.action, 'needs_user_confirmation');
+  const task = hub.getBoard('proj-explicit-replace').getTask('item-1');
+  assert.equal(task.status, 'blocked');
+  assert.equal(task.blockKind, 'agent_replacement_confirmation_required');
+});
+
 test('runtime instance worker failure creates retry run with a fresh runtime instance', () => {
   let reservation = 0;
   const runtimeInstanceAllocator = {
@@ -381,6 +507,46 @@ test('model empty output releases runtime instance for immediate retry instead o
   const retry = board.getTask(failed.retryTaskId);
   assert.equal(retry.status, 'dispatched');
   assert.equal(retry.assignedRuntimeInstance, 'xiaok-worker@inst-1');
+});
+
+test('repeated model empty output replaces the retry task agent without adding another retry child', () => {
+  const hub = createHub({ silent: true, getAgentProfiles: () => [
+    { id: 'bad-worker', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+    { id: 'xiaok-worker', roles: ['worker'], runtimeHealth: { state: 'healthy', outputCapabilities: ['markdown'], taskCapabilities: ['research'] } },
+  ] });
+  hub.createProject({
+    id: 'proj-empty-replace',
+    name: 'Repeated Empty',
+    goal: 'goal',
+    poAgent: 'po',
+    members: ['bad-worker', 'xiaok-worker'],
+    agentSelection: {
+      poAgent: { agentId: 'po', source: 'system_migration' },
+      members: [
+        { agentId: 'bad-worker', source: 'default_seed' },
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+      ],
+    },
+  });
+  assert.equal(hub.handleCreateTasks('proj-empty-replace', [
+    { id: 'item-1', title: 'Research', brief: 'Do research', assignedAgent: 'bad-worker', requiredOutputs: ['markdown'], requiredCapabilities: ['research'] },
+  ], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-empty-replace').ok, true);
+
+  const first = hub.handleTaskFail('proj-empty-replace', 'item-1', 'model_empty_output', 'empty');
+  assert.equal(first.ok, true);
+  assert.equal(first.retried, true);
+  const second = hub.handleTaskFail('proj-empty-replace', first.retryTaskId, 'model_empty_output', 'empty again');
+
+  assert.equal(second.ok, true);
+  assert.equal(second.replaced, true);
+  assert.equal(second.retryTaskId, undefined);
+  const tasks = hub.getBoard('proj-empty-replace').getAllTasks();
+  assert.equal(tasks.length, 2);
+  const retryTask = hub.getBoard('proj-empty-replace').getTask(first.retryTaskId);
+  assert.equal(retryTask.status, 'dispatched');
+  assert.equal(retryTask.assignedAgent, 'xiaok-worker');
+  assert.equal(retryTask.replacementHistory.at(-1).fromAgentId, 'bad-worker');
 });
 
 test('retry child preserves parent dependencies for final render tasks', () => {
