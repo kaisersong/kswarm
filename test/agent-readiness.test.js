@@ -3,6 +3,7 @@ import {
   classifyAgentReadiness,
   deriveProjectPreparation,
   normalizeReadinessProbeResult,
+  selectDefaultSeedWorkerReplacement,
 } from '../src/core/agent-readiness.js';
 
 const now = 1779550000000;
@@ -94,6 +95,18 @@ const desktopWorker = {
 {
   const readiness = classifyAgentReadiness(desktopWorker, {
     role: 'worker',
+    requiredOutputs: [{ type: 'html_report', enforcement: 'hard' }],
+    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
+    now,
+  });
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.reason, null);
+}
+
+{
+  const readiness = classifyAgentReadiness(desktopWorker, {
+    role: 'worker',
     participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: false, reason: 'model_config_missing', checkedAt: now } },
     now,
@@ -164,6 +177,92 @@ const desktopWorker = {
   assert.equal(probe.ok, false);
   assert.equal(probe.reason, 'model_config_missing');
   assert.equal(probe.checkedAt, now);
+}
+
+{
+  const project = {
+    id: 'proj-3',
+    poAgent: 'xiaok-po',
+    members: ['cli-xiaok', 'xiaok'],
+    agentSelection: {
+      poAgent: { agentId: 'xiaok-po', source: 'default_seed' },
+      members: [
+        { agentId: 'cli-xiaok', source: 'default_seed' },
+        { agentId: 'xiaok', source: 'default_seed' },
+      ],
+    },
+  };
+  const cooldownWorker = id => ({
+    id,
+    roles: ['worker'],
+    runtimeHealth: { state: 'cooldown', outputCapabilities: ['markdown'], taskCapabilities: ['research'] },
+  });
+  const prep = deriveProjectPreparation({
+    project,
+    agents: [desktopPo, cooldownWorker('cli-xiaok'), cooldownWorker('xiaok'), desktopWorker],
+    participants: [
+      { participantId: 'xiaok-po', lastSeenAt: now },
+      { participantId: 'xiaok-worker', lastSeenAt: now },
+    ],
+    probeResults: {
+      'xiaok-po': { ok: true, checkedAt: now },
+      'xiaok-worker': { ok: true, checkedAt: now },
+    },
+    now,
+  });
+
+  const replacement = selectDefaultSeedWorkerReplacement({
+    project,
+    preparation: prep,
+    agents: [desktopPo, cooldownWorker('cli-xiaok'), cooldownWorker('xiaok'), desktopWorker],
+    participants: [
+      { participantId: 'xiaok-po', lastSeenAt: now },
+      { participantId: 'xiaok-worker', lastSeenAt: now },
+    ],
+    probeResults: {
+      'xiaok-po': { ok: true, checkedAt: now },
+      'xiaok-worker': { ok: true, checkedAt: now },
+    },
+    now,
+  });
+
+  assert.equal(prep.state, 'blocked');
+  assert.equal(replacement.toAgentId, 'xiaok-worker');
+  assert.deepEqual(replacement.fromAgentIds, ['cli-xiaok', 'xiaok']);
+}
+
+{
+  const project = {
+    id: 'proj-4',
+    poAgent: 'xiaok-po',
+    members: ['cli-qoder'],
+    agentSelection: {
+      poAgent: { agentId: 'xiaok-po', source: 'default_seed' },
+      members: [{ agentId: 'cli-qoder', source: 'explicit_user' }],
+    },
+  };
+  const prep = deriveProjectPreparation({
+    project,
+    agents: [desktopPo, { id: 'cli-qoder', roles: ['worker'], runtimeHealth: { state: 'cooldown' } }, desktopWorker],
+    participants: [
+      { participantId: 'xiaok-po', lastSeenAt: now },
+      { participantId: 'xiaok-worker', lastSeenAt: now },
+    ],
+    probeResults: {
+      'xiaok-po': { ok: true, checkedAt: now },
+      'xiaok-worker': { ok: true, checkedAt: now },
+    },
+    now,
+  });
+
+  assert.equal(selectDefaultSeedWorkerReplacement({
+    project,
+    preparation: prep,
+    agents: [desktopPo, desktopWorker],
+    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
+    now,
+  }), null);
 }
 
 console.log('agent-readiness tests passed');

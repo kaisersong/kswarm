@@ -108,6 +108,16 @@ export function selectUserFacingDeliveryTask(tasks = []) {
     .filter(task => task?.status === 'done' && taskHasArtifacts(task));
   if (candidates.length === 0) return null;
 
+  const strongFinalOutputs = candidates
+    .map(task => ({ task, score: strongestFinalArtifactScore(task) }))
+    .filter(({ score }) => score >= 80);
+  if (strongFinalOutputs.length > 0) {
+    const bestScore = Math.max(...strongFinalOutputs.map(({ score }) => score));
+    return latestCompleted(strongFinalOutputs
+      .filter(({ score }) => score === bestScore)
+      .map(({ task }) => task));
+  }
+
   const explicitFinal = candidates.filter(task => isFinalDeliverableTitle(task.title) && !isSummaryTitle(task.title));
   if (explicitFinal.length > 0) return latestCompleted(explicitFinal);
 
@@ -233,15 +243,39 @@ function ensureDeliveryAlias({ deliveryDir = '', sourceFilename = '', targetFile
 }
 
 function taskHasArtifacts(task = {}) {
+  return getTaskArtifacts(task).length > 0;
+}
+
+function getTaskArtifacts(task = {}) {
   const result = task.result || {};
-  return (
-    (Array.isArray(result.artifactManifest) && result.artifactManifest.length > 0) ||
-    (Array.isArray(result.artifacts) && result.artifacts.length > 0)
-  );
+  return [
+    ...(Array.isArray(result.artifacts) ? result.artifacts : []),
+    ...(Array.isArray(result.artifactManifest) ? result.artifactManifest : []),
+  ].filter(artifact => artifact && artifact.filename);
+}
+
+function strongestFinalArtifactScore(task = {}) {
+  return getTaskArtifacts(task).reduce((best, artifact) => Math.max(best, finalArtifactScore(artifact)), 0);
+}
+
+function finalArtifactScore(artifact = {}) {
+  const text = [
+    artifact.filename,
+    artifact.path,
+    artifact.relativePath,
+    artifact.url,
+    artifact.type,
+    artifact.mimeType,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (/report_html|slide_html|text\/html|\.html?\b/.test(text)) return 100;
+  if (/pptx|presentation|\.(pptx|key)\b/.test(text)) return 90;
+  if (/application\/pdf|\.pdf\b/.test(text)) return 85;
+  return 0;
 }
 
 function isFinalDeliverableTitle(title = '') {
-  return /最终|交付|定稿|final|deliverable|markdown|pptx|报告|report/i.test(String(title || ''));
+  return /最终|交付|定稿|final|deliverable|markdown|html|pptx|报告|report/i.test(String(title || ''));
 }
 
 function isSummaryTitle(title = '') {

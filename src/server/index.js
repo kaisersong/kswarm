@@ -39,6 +39,7 @@ import { recordRuntimeFailure } from '../core/runtime-health.js';
 import {
   deriveProjectPreparation,
   normalizeReadinessProbeResult,
+  selectDefaultSeedWorkerReplacement,
 } from '../core/agent-readiness.js';
 import {
   XIAOK_PO_AGENT_ID,
@@ -61,6 +62,9 @@ import {
 import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
 import { canSpawnAutoWorkerForTask } from '../core/runtime-execution-boundary.js';
 import { createBrokerTaskRequest } from './broker-task-request.js';
+import { normalizeProjectAgentSelection } from '../core/agent-selection.js';
+import { getEffectiveAgentConcurrency } from '../core/effective-agent-concurrency.js';
+import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
@@ -85,22 +89,7 @@ const READINESS_PROBE_TTL_MS = 5 * 60_000;
 
 function listAgentProfilesForRouting() {
   const agents = agentStore?.list({ includeArchived: false }) || [];
-  if (!(brokerOnlineAgentIds instanceof Set)) return agents;
-  return agents.map(agent => ({
-    ...agent,
-    ...(brokerOnlineAgentIds.has(agent.id) && agent.runtimeSource === 'desktop-agent-runtime'
-      ? {
-          status: agent.status === 'offline' ? 'idle' : agent.status,
-          runtimeHealth: {
-            ...(agent.runtimeHealth || {}),
-            state: 'healthy',
-            taskCapabilities: agent.taskCapabilities || agent.capabilities || agent.runtimeHealth?.taskCapabilities || [],
-            outputCapabilities: agent.outputCapabilities || agent.runtimeHealth?.outputCapabilities || [],
-          },
-        }
-      : {}),
-    brokerOnline: brokerOnlineAgentIds.has(agent.id),
-  }));
+  return applyBrokerPresenceToAgentProfiles(agents, brokerOnlineAgentIds);
 }
 
 const hub = createHub({
@@ -110,7 +99,10 @@ const hub = createHub({
   getAgentProfiles: () => listAgentProfilesForRouting(),
   getQualityOverlays: () => qualityOverlayStore.listOverlays(),
   runtimeInstanceAllocator: {
-    getAgentConcurrency: () => runtimeInstancePool.getAgentConcurrency(),
+    getAgentConcurrency: () => getEffectiveAgentConcurrency({
+      baseConcurrency: runtimeInstancePool.getAgentConcurrency(),
+      agents: agentStore?.list({ includeArchived: false }) || [],
+    }),
     reserveWorkerInstance: reservation => reserveWorkerRuntimeInstance(reservation),
     markInstanceWorking: (instanceId, meta) => runtimeInstancePool.markInstanceWorking(instanceId, meta),
     markInstanceIdle: instanceId => runtimeInstancePool.markInstanceIdle(instanceId),
@@ -394,26 +386,6 @@ async function getOnlineAgentIds() {
   return await refreshBrokerOnlineAgentIds() || new Set();
 }
 
-function normalizeProjectAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
-  const poSource = agentSelection?.poAgent?.source || 'system_migration';
-  return {
-    ...(agentSelection && typeof agentSelection === 'object' ? agentSelection : {}),
-    poAgent: {
-      agentId: agentSelection?.poAgent?.agentId || poAgent,
-      source: poSource,
-    },
-    members: Array.isArray(agentSelection?.members)
-      ? agentSelection.members.map((member, index) => ({
-          agentId: member?.agentId || member?.id || member || members[index],
-          source: member?.source || 'system_migration',
-        })).filter(member => member.agentId)
-      : (Array.isArray(members) ? members : []).map(agentId => ({
-          agentId,
-          source: 'system_migration',
-        })),
-  };
-}
-
 function selectedAgentIdsForPreparation(project) {
   const ids = [];
   const po = project?.agentSelection?.poAgent?.agentId || project?.poAgent;
@@ -574,14 +546,64 @@ async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
     if (cached) probeResults[agentId] = cached;
   }
 
+  const capacityByAgentId = runtimeCapacityByAgentId();
   project.preparation = deriveProjectPreparation({
     project,
     agents,
     participants: brokerOnlineParticipants,
     probeResults,
-    capacityByAgentId: runtimeCapacityByAgentId(),
+    capacityByAgentId,
     now: Date.now(),
   });
+  if (project.preparation?.state === 'blocked') {
+    const workerAgent = agents.find(candidate => candidate.id === XIAOK_WORKER_AGENT_ID) || agentStore?.get(XIAOK_WORKER_AGENT_ID);
+    if (
+      isDesktopRuntimeAgent(workerAgent) &&
+      brokerOnlineAgentIds instanceof Set &&
+      brokerOnlineAgentIds.has(XIAOK_WORKER_AGENT_ID)
+    ) {
+      await requestReadinessProbe({
+        projectId: project.id,
+        agentId: XIAOK_WORKER_AGENT_ID,
+        role: 'worker',
+        forceProbe,
+      });
+      const cachedWorkerProbe = getCachedReadinessProbe(XIAOK_WORKER_AGENT_ID, Date.now());
+      if (cachedWorkerProbe) probeResults[XIAOK_WORKER_AGENT_ID] = cachedWorkerProbe;
+    }
+    const replacement = selectDefaultSeedWorkerReplacement({
+      project,
+      preparation: project.preparation,
+      agents,
+      participants: brokerOnlineParticipants,
+      probeResults,
+      capacityByAgentId,
+      now: Date.now(),
+    });
+    if (replacement?.toAgentId) {
+      project.members = [replacement.toAgentId];
+      project.agentSelection = project.agentSelection || {};
+      project.agentSelection.members = [{ agentId: replacement.toAgentId, source: replacement.source || 'default_seed' }];
+      project.agentSelection.replacements = Array.isArray(project.agentSelection.replacements)
+        ? project.agentSelection.replacements
+        : [];
+      project.agentSelection.replacements.push({
+        at: Date.now(),
+        role: replacement.role,
+        fromAgentIds: replacement.fromAgentIds,
+        toAgentId: replacement.toAgentId,
+        reason: replacement.reason,
+      });
+      project.preparation = deriveProjectPreparation({
+        project,
+        agents,
+        participants: brokerOnlineParticipants,
+        probeResults,
+        capacityByAgentId,
+        now: Date.now(),
+      });
+    }
+  }
   project.updatedAt = Date.now();
   hub.persistState();
   return project.preparation;
@@ -1211,6 +1233,7 @@ async function handleRequest(req, res) {
         poAgent: resolvedPoAgent,
         members: resolvedMembers,
         agentSelection,
+        defaultSource: 'default_seed',
       });
       const id = `proj-${Date.now()}`;
       const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection });
@@ -2113,7 +2136,15 @@ async function handleRequest(req, res) {
     const deliveryFileMatch = path.match(/^\/projects\/([^/]+)\/delivery\/(.+)$/);
     if (deliveryFileMatch && req.method === 'GET') {
       const ws = getProjectWorkspace(deliveryFileMatch[1]);
-      const filename = deliveryFileMatch[2];
+      let filename;
+      try {
+        filename = decodeURIComponent(deliveryFileMatch[2]);
+      } catch {
+        return json(res, { error: 'invalid_filename' }, 400);
+      }
+      if (!filename || filename.includes('\0') || filename.includes('/') || filename.includes('\\')) {
+        return json(res, { error: 'invalid_filename' }, 400);
+      }
       const filePath = join(ws.path, 'delivery', filename);
       if (!existsSync(filePath)) return json(res, { error: 'not_found' }, 404);
 

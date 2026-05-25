@@ -390,7 +390,7 @@ function findPendingRetryChild(board, task = {}) {
 }
 
 function selectHealthyAgent(task, agents) {
-  const list = listAgents(agents);
+  const list = listAgents(agents).filter(isWorkerRoleCandidate);
   const healthy = list.filter(isHealthyAgent);
   const previous = task.assignedAgent;
   if (healthy.length === 0) {
@@ -399,6 +399,14 @@ function selectHealthyAgent(task, agents) {
     return list.length === 0 ? (task.assignedAgent || null) : null;
   }
   return (healthy.find(agent => agent.id !== previous) || healthy[0]).id || null;
+}
+
+function isWorkerRoleCandidate(agent = {}) {
+  const roles = Array.isArray(agent.roles)
+    ? agent.roles.map(role => String(role || '').trim().toLowerCase()).filter(Boolean)
+    : [];
+  if (roles.length === 0) return true;
+  return roles.includes('worker');
 }
 
 function isHealthyAgent(agent = {}) {

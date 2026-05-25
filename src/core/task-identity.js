@@ -102,11 +102,19 @@ export function normalizeTasksForProject(projectId, taskList, existingTasks = []
   }
 
   addResolvableTitleAliases(projectId, aliases, allByGlobal.values());
+  const phaseAliases = buildPhaseAliases(allByGlobal.values());
 
   for (const task of prepared) {
     const normalizedDeps = [];
     const unresolved = [];
     for (const ref of task.dependencyRefs) {
+      const phaseDeps = resolvePhaseRef(projectId, ref, phaseAliases, task);
+      if (phaseDeps.length > 0) {
+        for (const dep of phaseDeps) {
+          if (!normalizedDeps.includes(dep)) normalizedDeps.push(dep);
+        }
+        continue;
+      }
       const resolved = resolveTaskRefFromAliases(projectId, ref, aliases)
         || resolveNearTitleRef(projectId, ref, allByGlobal.values());
       if (resolved?.taskId) normalizedDeps.push(resolved.taskId);
@@ -210,6 +218,34 @@ function addResolvableTitleAliases(projectId, aliases, tasks) {
   for (const { title, target } of buildResolvableTitleCandidates(projectId, tasks)) {
     addAlias(aliases, title, target.id);
   }
+}
+
+function buildPhaseAliases(tasks) {
+  const phaseAliases = new Map();
+  for (const task of tasks) {
+    if (!task?.phaseId) continue;
+    addPhaseAlias(phaseAliases, task.phaseId, task);
+    addPhaseAlias(phaseAliases, normalizeLocalTaskId(task.phaseId), task);
+  }
+  return phaseAliases;
+}
+
+function addPhaseAlias(phaseAliases, rawPhaseId, task) {
+  const phaseId = String(rawPhaseId || '').trim();
+  if (!phaseId) return;
+  const tasks = phaseAliases.get(phaseId) || [];
+  if (!tasks.some(existing => existing.id === task.id)) tasks.push(task);
+  phaseAliases.set(phaseId, tasks);
+}
+
+function resolvePhaseRef(projectId, taskRef, phaseAliases, currentTask) {
+  const ref = String(taskRef || '').trim();
+  if (!ref) return [];
+  const candidates = phaseAliases.get(ref) || phaseAliases.get(normalizeLocalTaskId(ref)) || [];
+  return candidates
+    .filter(task => task.id !== currentTask.id)
+    .filter(task => !isRetryChild(projectId, task))
+    .map(task => task.id);
 }
 
 function buildResolvableTitleCandidates(projectId, tasks) {

@@ -45,6 +45,15 @@ test('natural-language report finalization routes to report renderer html', () =
   assert.ok(requirements.requiredCapabilities.includes('report_generation'));
 });
 
+test('legacy html_report required output is canonicalized to report_html', () => {
+  const requirements = inferTaskRequirements({
+    title: '生成最终 HTML 对比分析报告',
+    requiredOutputs: [{ type: 'html_report', enforcement: 'hard', source: 'task' }],
+  });
+
+  assert.deepEqual(outputTypes(requirements), ['report_html:hard']);
+});
+
 test('report renderer finalization treats markdown as input and routes final output to report_html', () => {
   const requirements = inferTaskRequirements({
     title: '使用 report renderer 生成HTML报告',
@@ -75,6 +84,18 @@ test('stale markdown plus html requirements are normalized for explicit report r
       { type: 'markdown', enforcement: 'hard', source: 'explicit' },
       { type: 'html', enforcement: 'hard', source: 'explicit' },
     ],
+  });
+
+  assert.deepEqual(outputTypes(requirements), ['report_html:hard']);
+  assert.ok(requirements.requiredCapabilities.includes('report_generation'));
+});
+
+test('hyphenated report-renderer smoke task treats .report.md as input and requires report_html', () => {
+  const requirements = inferTaskRequirements({
+    title: '渲染 .report.md IR 为 HTML 并校验',
+    brief: '使用 report-renderer 将 phase-1 产出的 .report.md IR 渲染为 HTML 文件，校验产物：HTML 可正常打开、章节完整、无过程痕迹暴露。',
+    acceptanceCriteria: 'HTML 文件渲染成功，内容与 IR 一致，包含执行摘要、已验证链路、风险与下一步三部分，排版正常，无草稿/审阅/修订痕迹。',
+    requiredOutputs: ['html', 'markdown'],
   });
 
   assert.deepEqual(outputTypes(requirements), ['report_html:hard']);

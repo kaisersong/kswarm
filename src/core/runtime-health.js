@@ -1,3 +1,5 @@
+import { canonicalizeOutputType, normalizeOutputTypes } from './output-types.js';
+
 const DEFAULT_COOLDOWNS = [0, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 const ROUTABLE_STATES = new Set(['healthy']);
 const TASK_LEVEL_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
@@ -164,7 +166,7 @@ export function isRoutable(agent = {}, requiredCapabilities = [], requiredOutput
     }
   }
 
-  const outputCapabilities = new Set(normalizeCapabilities(health.outputCapabilities));
+  const outputCapabilities = new Set(normalizeOutputTypes(health.outputCapabilities));
   for (const output of normalizeOutputs(requiredOutputs)) {
     if (!outputCapabilities.has(output)) {
       return { ok: false, reason: `output_missing:${output}` };
@@ -201,6 +203,6 @@ function normalizeOutputs(outputs = []) {
       if (typeof output === 'string') return output;
       return output?.type || output?.format || output?.kind || '';
     })
-    .map(value => String(value || '').trim().toLowerCase())
+    .map(value => canonicalizeOutputType(value))
     .filter(Boolean);
 }

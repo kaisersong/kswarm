@@ -20,6 +20,7 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 test('detects required output types from execution requirements', () => {
   assert.equal(hasRequiredOutputType([{ type: 'report_html', enforcement: 'hard' }], 'report_html'), true);
+  assert.equal(hasRequiredOutputType([{ type: 'html_report', enforcement: 'hard' }], 'report_html'), true);
   assert.equal(hasRequiredOutputType([{ type: 'markdown', enforcement: 'hard' }], 'report_html'), false);
 });
 

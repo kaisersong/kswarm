@@ -53,7 +53,7 @@ function superviseQualityFailure(task, failure, options) {
   };
 }
 
-function isTemporalAcceptanceImpossible(feedback, nowMs) {
+export function isTemporalAcceptanceImpossible(feedback, nowMs) {
   const text = String(feedback || '');
   if (!/(缺少|补齐|补充|覆盖|完整|未满足|无法验证|missing|complete|cover)/iu.test(text)) return false;
   const now = new Date(nowMs);
@@ -92,7 +92,15 @@ function hasFutureMonthCompletionReference(text, now) {
     const month = Number(match[1]);
     if (!Number.isInteger(month) || month < 1 || month > 12) continue;
     const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), month, 0, 23, 59, 59, 999));
-    if (monthEnd > now && /(整个月|整个|完整|31\s*天|30\s*天|全月)/u.test(text)) return true;
+    if (monthEnd <= now) continue;
+    const index = match.index || 0;
+    const nearby = text.slice(Math.max(0, index - 8), index + match[0].length + 12);
+    const monthNumber = String(month);
+    const completionNearMonth = new RegExp(
+      `(?:整个月|整个|完整|全月|整月|31\\s*天|30\\s*天).{0,6}${monthNumber}\\s*月份?|${monthNumber}\\s*月份?.{0,8}(?:整个月|整个|完整|全月|整月|31\\s*天|30\\s*天)`,
+      'u',
+    );
+    if (completionNearMonth.test(nearby)) return true;
   }
   return false;
 }

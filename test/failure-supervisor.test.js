@@ -70,6 +70,21 @@ test('quality review requesting past month completion still follows normal rewor
   assert.equal(decision.failureClass, 'quality_content_failed');
 });
 
+test('quality review mentioning current month and complete evidence does not imply future month completion', () => {
+  const decision = superviseTaskFailure(
+    { id: 'research', qualityFailureCount: 0, maxQualityReworks: 2 },
+    {
+      source: 'quality_review',
+      failureClass: 'quality_content_failed',
+      feedback: '证据文件残缺：缺少完整抓取记录、URL、日期、命中标题。3条动态日期落在5月窗口之前，8条动态仅有月份缺具体日期，需补齐证据文件。',
+    },
+    { now: Date.UTC(2026, 4, 25, 4, 0, 0) }
+  );
+
+  assert.equal(decision.action, 'rework');
+  assert.equal(decision.failureClass, 'quality_content_failed');
+});
+
 test('runtime failures retry within attempt budget and block after exhaustion', () => {
   const retry = superviseTaskFailure(
     { id: 'draft', attempt: 1, maxAttempts: 2 },

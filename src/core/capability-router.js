@@ -1,5 +1,6 @@
 import { isRoutable } from './runtime-health.js';
 import { inferTaskRequirements } from './task-requirements.js';
+import { canonicalizeOutputType, normalizeOutputTypes } from './output-types.js';
 
 export function evaluateTaskRoute(task = {}, agent = null, now = Date.now()) {
   if (!agent) return { ok: false, reason: 'agent_missing' };
@@ -108,7 +109,7 @@ function limitedAssignedRuntimeMatches({ agent, task, requirements, route }) {
     if (!taskCaps.has(capability)) return false;
   }
 
-  const outputCaps = new Set(normalizeList(health.outputCapabilities));
+  const outputCaps = new Set(normalizeOutputTypes(health.outputCapabilities));
   for (const output of requiredOutputs) {
     if (!outputCaps.has(output)) return false;
   }
@@ -141,6 +142,6 @@ function normalizeHardOutputs(outputs = []) {
   return outputs
     .filter(output => !(output && typeof output === 'object' && output.enforcement === 'soft'))
     .map(output => (typeof output === 'string' ? output : output?.type))
-    .map(value => String(value || '').trim().toLowerCase())
+    .map(value => canonicalizeOutputType(value))
     .filter(Boolean);
 }

@@ -1,3 +1,5 @@
+import { canonicalizeOutputType } from './output-types.js';
+
 const EXPLICIT_OUTPUT_PATTERNS = [
   { type: 'pptx', pattern: /(\.pptx\b|\bpptx\b|\bpowerpoint\b|\bppt\s*(文件|file|deck)?\b)/i },
   { type: 'markdown', pattern: /(\.md\b|\.markdown\b|\bmarkdown\b)/i },
@@ -6,9 +8,9 @@ const EXPLICIT_OUTPUT_PATTERNS = [
 
 const SLIDE_OUTPUT_PATTERN = /(幻灯片|演示文稿|slide deck|slides|presentation)/i;
 const REPORT_OUTPUT_PATTERN = /(报告|\breport\b)/i;
-const REPORT_RENDERER_PATTERN = /(report\s+renderer|kai-report-creator|报告\s*renderer)/i;
+const REPORT_RENDERER_PATTERN = /(report[\s-]*renderer|kai-report-creator|报告\s*renderer)/i;
 const SLIDE_RENDERER_PATTERN = /(slide\s+renderer|kai-slide-creator|幻灯片\s*renderer)/i;
-const FINAL_OUTPUT_PATTERN = /(最终|定稿|交付|输出|生成|制作|创建|撰写|成稿|render|final|deliver|delivery|generate|create|produce|write)/i;
+const FINAL_OUTPUT_PATTERN = /(最终|定稿|交付|输出|生成|制作|创建|撰写|成稿|渲染|render|final|deliver|delivery|generate|create|produce|write)/i;
 const INTERMEDIATE_CONTENT_PATTERN = /(背景|素材|资料|收集|采集|调研|初稿|草稿|大纲|提纲|source|sources|background|material|collect|draft|outline)/i;
 const INTERMEDIATE_STRUCTURE_PATTERN = /(框架设计|报告框架|结构规划|章节规划|大纲|提纲|outline|framework|structure plan)/i;
 const REVIEW_TASK_PATTERN = /(评审|审核|验收|质检|review|audit|qa|quality)/i;
@@ -214,7 +216,7 @@ function normalizeOutputs(outputs = []) {
 }
 
 function addOutput(outputs, output) {
-  const type = String(output.type || '').trim().toLowerCase();
+  const type = canonicalizeOutputType(output.type);
   if (!type) return;
   if (outputs.some(existing => existing.type === type)) return;
   outputs.push({

@@ -216,6 +216,38 @@ test('continue retry stays inside project members instead of selecting a healthy
   assert.notEqual(task.assignedAgent, 'cli-xiaok');
 });
 
+test('continue retry does not route worker tasks to a PO-only agent', () => {
+  const hub = createTestHub([
+    { id: 'xiaok-po', status: 'idle', brokerOnline: true, roles: ['project_owner'], runtimeHealth: { state: 'healthy' } },
+    { id: 'xiaok-worker', status: 'idle', brokerOnline: true, roles: ['worker'], runtimeHealth: { state: 'cooldown', cooldownUntil: Date.now() + 60_000 } },
+  ]);
+  const project = hub.createProject({
+    id: 'proj-continue',
+    name: 'P',
+    goal: 'goal',
+    poAgent: 'xiaok-po',
+    members: ['xiaok-worker'],
+  });
+  hub.handleCreateTasks(project.id, [
+    { id: 'item-1', title: 'T', assignedAgent: 'xiaok-worker', maxAttempts: 1 },
+  ], 'xiaok-po');
+  hub.handleApprove(project.id);
+  const failed = failRootTask(hub);
+
+  const result = hub.handleContinueProject('proj-continue', {
+    expectedPrimaryTaskId: failed.id,
+    expectedTaskUpdatedAt: failed.updatedAt,
+    idempotencyKey: 'continue-no-po-only-worker-route',
+  });
+
+  const task = getTask(hub);
+  assert.equal(result.ok, false);
+  assert.equal(result.strategy, 'needs_conversation');
+  assert.equal(task.status, 'failed');
+  assert.equal(task.assignedAgent, 'xiaok-worker');
+  assert.notEqual(task.assignedAgent, 'xiaok-po');
+});
+
 test('stale expected task state returns task_state_changed without mutation', () => {
   const hub = createTestHub();
   setupProject(hub);

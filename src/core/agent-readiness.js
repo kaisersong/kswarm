@@ -1,3 +1,5 @@
+import { canonicalizeOutputType, normalizeOutputTypes } from './output-types.js';
+
 const DEFAULT_PRESENCE_MAX_AGE_MS = 120_000;
 const DESKTOP_RUNTIME_SOURCE = 'desktop-agent-runtime';
 const DESKTOP_SEED_AGENT_IDS = new Set(['xiaok-po', 'xiaok-worker']);
@@ -56,7 +58,7 @@ export function classifyAgentReadiness(agent, options = {}) {
     if (!taskCapabilities.has(capability)) return fail(base, `capability_missing:${capability}`, 'limited');
   }
 
-  const outputCapabilities = capabilitySource(runtimeHealth.outputCapabilities, agent.outputCapabilities);
+  const outputCapabilities = outputCapabilitySource(runtimeHealth.outputCapabilities, agent.outputCapabilities);
   for (const output of normalizeRequiredOutputs(options.requiredOutputs)) {
     if (!outputCapabilities.has(output)) return fail(base, `output_missing:${output}`, 'limited');
   }
@@ -157,6 +159,51 @@ export function deriveProjectPreparation({
   };
 }
 
+export function selectDefaultSeedWorkerReplacement({
+  project,
+  preparation,
+  agents = [],
+  participants = [],
+  probeResults = {},
+  capacityByAgentId = {},
+  requiredWorkerOutputs = [],
+  now = Date.now(),
+  candidateAgentId = 'xiaok-worker',
+} = {}) {
+  if (!project || !preparation || preparation.state !== 'blocked') return null;
+  const selectedMembers = normalizeSelectedMembers(project);
+  if (selectedMembers.length === 0) return null;
+  if (selectedMembers.some(member => member.source === 'explicit_user')) return null;
+  if (selectedMembers.some(member => member.agentId === candidateAgentId)) return null;
+
+  const workerBlockers = (Array.isArray(preparation.blockers) ? preparation.blockers : [])
+    .filter(blocker => blocker.role === 'worker');
+  if (workerBlockers.length === 0) return null;
+  if (workerBlockers.some(blocker => blocker.selectedBy === 'explicit_user')) return null;
+
+  const agentMap = new Map((Array.isArray(agents) ? agents : []).map(agent => [normalizeId(agent?.id), agent]));
+  const readiness = classifyAgentReadiness(agentMap.get(candidateAgentId), {
+    agentId: candidateAgentId,
+    role: 'worker',
+    selectedBy: 'default_seed',
+    participants,
+    probeResults,
+    capacity: capacityByAgentId[candidateAgentId],
+    requiredOutputs: requiredWorkerOutputs,
+    now,
+  });
+  if (!readiness.ready) return null;
+
+  return {
+    role: 'worker',
+    fromAgentIds: selectedMembers.map(member => member.agentId),
+    toAgentId: candidateAgentId,
+    source: 'default_seed',
+    reason: 'default_seed_worker_unavailable',
+    readiness,
+  };
+}
+
 function normalizeSelectedMembers(project) {
   const fromSelection = Array.isArray(project?.agentSelection?.members)
     ? project.agentSelection.members
@@ -210,7 +257,7 @@ function normalizeRequiredCapabilities(values = []) {
 }
 
 function normalizeRequiredOutputs(values = []) {
-  return normalizeList(values.map(value => {
+  return normalizeOutputTypes(values.map(value => {
     if (typeof value === 'string') return value;
     if (value?.enforcement && value.enforcement !== 'hard') return '';
     return value?.type || value?.format || value?.kind || '';
@@ -222,6 +269,12 @@ function normalizeList(values = []) {
   return values
     .map(value => String(value || '').trim().toLowerCase())
     .filter(Boolean);
+}
+
+function outputCapabilitySource(primary = [], fallback = []) {
+  const primaryList = normalizeOutputTypes(primary);
+  const source = primaryList.length > 0 ? primaryList : normalizeOutputTypes(fallback);
+  return new Set(source);
 }
 
 function normalizeId(value) {

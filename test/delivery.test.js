@@ -271,6 +271,36 @@ scenario('最终产物选择 — renderer HTML 优先于短 wrapper Markdown', (
   assert(finalTask?.id === 'proj-1__p4-item1', `renderer 最终产物任务: ${finalTask?.id}`);
 });
 
+scenario('最终产物选择 — 下游 HTML artifact 优先于上游报告 IR', () => {
+  const finalTask = selectUserFacingDeliveryTask([
+    {
+      id: 'proj-1__item-2-1',
+      title: '编写 Claude 与 ChatGPT 对比分析报告 IR',
+      status: 'done',
+      completedAt: 2000,
+      result: {
+        artifacts: [
+          { filename: 'claude-vs-chatgpt-may-2026.report.md', mimeType: 'text/markdown', type: 'markdown', size: 4378 },
+        ],
+      },
+    },
+    {
+      id: 'proj-1__item-3-1',
+      title: '渲染 IR 为 HTML 并校验',
+      status: 'done',
+      completedAt: 3000,
+      dependencies: ['proj-1__item-2-1'],
+      result: {
+        artifacts: [
+          { filename: 'claude-vs-chatgpt-may-2026.html', mimeType: 'text/html', type: 'report_html', size: 47904 },
+        ],
+      },
+    },
+  ]);
+
+  assert(finalTask?.id === 'proj-1__item-3-1', `HTML 最终产物任务: ${finalTask?.id}`);
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Cleanup

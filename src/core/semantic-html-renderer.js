@@ -1,7 +1,9 @@
+import { canonicalizeOutputType } from './output-types.js';
+
 const REPORT_TEMPLATE_MARKER = 'data-template="kai-report-creator"';
 
 export function hasRequiredOutputType(requiredOutputs = [], type) {
-  const expected = String(type || '').trim().toLowerCase();
+  const expected = canonicalizeOutputType(type);
   if (!expected) return false;
   return normalizeRequiredOutputs(requiredOutputs).some(output => output.type === expected && output.enforcement !== 'soft');
 }
@@ -137,7 +139,7 @@ function normalizeRequiredOutputs(outputs = []) {
       };
     })
     .map(output => ({
-      type: String(output.type || '').trim().toLowerCase(),
+      type: canonicalizeOutputType(output.type),
       enforcement: String(output.enforcement || 'hard').trim().toLowerCase(),
     }))
     .filter(output => output.type);

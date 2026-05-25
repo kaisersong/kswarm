@@ -346,6 +346,35 @@ test('plan revision required temporal block requires Xiaok conversation', () => 
   assert.match(result.message, /需要让小K帮忙/);
 });
 
+test('misclassified temporal quality block retries when feedback has no future date', () => {
+  const feedback = '证据文件残缺：缺少完整抓取记录、URL、日期、命中标题。3条动态日期落在5月窗口之前，8条动态仅有月份缺具体日期，需补齐证据文件。';
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-current-month', name: '2026年5月产品动态分析', status: 'active' },
+    now: Date.UTC(2026, 4, 25, 4, 0, 0),
+    tasks: [
+      {
+        id: 'item-1',
+        title: '研究 Claude 2026年5月动态',
+        status: 'blocked',
+        updatedAt: Date.UTC(2026, 4, 25, 4, 0, 0),
+        assignedAgent: 'xiaok-worker',
+        blockKind: 'plan_revision_required',
+        blockedReason: feedback,
+        failureReason: feedback,
+        lastFailureClass: 'quality_temporal_impossible',
+        qualityFailureCount: 1,
+        reviewResult: { passed: false, feedback, reviewedAt: Date.UTC(2026, 4, 25, 4, 0, 0) },
+        qualityReviewHistory: [{ passed: false, feedback, reviewedAt: Date.UTC(2026, 4, 25, 4, 0, 0) }],
+      },
+    ],
+    agents: [{ id: 'xiaok-worker', status: 'offline', brokerOnline: true, runtimeHealth: { source: 'desktop-agent-runtime' } }],
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryTaskId, 'item-1');
+  assert.equal(result.primaryAction.strategy, 'retry_with_repair_instruction');
+});
+
 test('repeated quality failures require Xiaok repair instead of another automatic retry', () => {
   const result = deriveProjectIntervention({
     project: { id: 'proj-quality-loop', name: 'OpenAI本月分析', status: 'active' },

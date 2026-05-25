@@ -201,6 +201,22 @@ test('successful task records capabilities and routability checks task and outpu
   );
 });
 
+test('legacy html_report output requirement routes to report_html capability', () => {
+  const health = recordRuntimeSuccess(createUnknownRuntimeHealth(), {
+    outputCapabilities: ['markdown', 'report_html'],
+    taskCapabilities: ['report_generation'],
+  }, now);
+
+  const route = isRoutable(
+    { runtimeHealth: health },
+    ['report_generation'],
+    [{ type: 'html_report', enforcement: 'hard' }],
+    now,
+  );
+
+  assert.equal(route.ok, true);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

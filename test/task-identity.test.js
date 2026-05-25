@@ -86,6 +86,21 @@ test('dependencies resolve by unique title and local ID', () => {
   assert.deepEqual(result.tasks[2].dependencies, ['proj-a__item-2']);
 });
 
+test('phase dependencies expand to all concrete tasks in that phase', () => {
+  const result = normalizeTasksForProject('proj-a', [
+    { id: 'item-1', title: 'Anthropic research', phaseId: 'phase-1', dependencies: [] },
+    { id: 'item-2', title: 'OpenAI research', phaseId: 'phase-1', dependencies: [] },
+    { id: 'item-3', title: 'Compare research', phaseId: 'phase-2', dependencies: ['phase-1'] },
+    { id: 'item-4', title: 'Final report', phaseId: 'phase-3', dependencies: ['phase-2'] },
+  ]);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.tasks[2].dependencies, ['proj-a__item-1', 'proj-a__item-2']);
+  assert.deepEqual(result.tasks[2].unresolvedDependencies, []);
+  assert.deepEqual(result.tasks[3].dependencies, ['proj-a__item-3']);
+  assert.deepEqual(result.tasks[3].unresolvedDependencies, []);
+});
+
 test('near-title dependency resolves when there is one high-confidence title match', () => {
   const result = normalizeTasksForProject('proj-a', [
     { id: 'p1-item1', title: '建立官方信息监控渠道', dependencies: [] },
@@ -177,6 +192,18 @@ test('restoreTaskBoard preserves description-only persisted tasks', () => {
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].id, 'proj-a__item-1');
   assert.equal(tasks[0].description, 'Description-only task that can still be executed');
+});
+
+test('restoreTaskBoard expands persisted phase dependency refs', () => {
+  const board = restoreTaskBoard([
+    { id: 'item-1', title: 'Research A', status: 'done', phaseId: 'phase-1', dependencies: [] },
+    { id: 'item-2', title: 'Research B', status: 'done', phaseId: 'phase-1', dependencies: [] },
+    { id: 'item-3', title: 'Synthesis', status: 'pending', phaseId: 'phase-2', dependencyRefs: ['phase-1'], dependencies: [], unresolvedDependencies: ['phase-1'] },
+  ], 'proj-a');
+
+  const task = board.getTask('item-3');
+  assert.deepEqual(task.dependencies, ['proj-a__item-1', 'proj-a__item-2']);
+  assert.deepEqual(task.unresolvedDependencies, []);
 });
 
 let passed = 0;

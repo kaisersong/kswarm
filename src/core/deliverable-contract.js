@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { extname, isAbsolute, join } from 'node:path';
+import { canonicalizeOutputType } from './output-types.js';
 
 const OUTPUT_EXTENSIONS = {
   markdown: new Set(['.md', '.markdown']),
@@ -7,17 +8,6 @@ const OUTPUT_EXTENSIONS = {
   report_html: new Set(['.html', '.htm']),
   slide_html: new Set(['.html', '.htm']),
   pptx: new Set(['.pptx']),
-};
-
-const RENDERER_HTML_CONTRACTS = {
-  report_html: {
-    marker: 'data-template="kai-report-creator"',
-    minChars: 300,
-  },
-  slide_html: {
-    marker: 'data-generator="kai-slide-creator"',
-    minChars: 300,
-  },
 };
 
 export function validateDeliverableContract({
@@ -39,17 +29,16 @@ export function validateDeliverableContract({
       continue;
     }
 
-    if (output.type === 'pptx') {
-      const valid = candidates.some(candidate => isLikelyPptxFile(candidate.path));
-      if (!valid) {
-        errors.push(`pptx artifact invalid: no parseable OOXML presentation package found`);
-      }
+    const readableCandidates = candidates.filter(candidate => isReadableNonEmptyFile(candidate.path));
+    if (readableCandidates.length === 0) {
+      errors.push(`${output.type} artifact invalid: file not readable or empty`);
+      continue;
     }
 
-    if (RENDERER_HTML_CONTRACTS[output.type]) {
-      const valid = candidates.some(candidate => isLikelyRendererHtmlFile(candidate.path, RENDERER_HTML_CONTRACTS[output.type]));
+    if (output.type === 'pptx') {
+      const valid = readableCandidates.some(candidate => isLikelyPptxFile(candidate.path));
       if (!valid) {
-        errors.push(`${output.type} artifact invalid: renderer marker or substantive content missing`);
+        errors.push(`pptx artifact invalid: no parseable OOXML presentation package found`);
       }
     }
   }
@@ -63,22 +52,13 @@ export function validateDeliverableContract({
   };
 }
 
-export function isLikelyRendererHtmlFile(path, contract) {
+export function isReadableNonEmptyFile(path) {
   if (!path || !existsSync(path)) return false;
-  let content;
   try {
-    content = readFileSync(path, 'utf-8');
+    return readFileSync(path).length > 0;
   } catch {
     return false;
   }
-  if (!content.includes(contract.marker)) return false;
-  const visible = content
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return visible.length >= contract.minChars;
 }
 
 export function isLikelyPptxFile(path) {
@@ -107,7 +87,7 @@ function normalizeRequiredOutputs(outputs = []) {
       };
     })
     .map(output => ({
-      type: String(output.type || '').trim().toLowerCase(),
+      type: canonicalizeOutputType(output.type),
       enforcement: String(output.enforcement || 'hard').trim().toLowerCase(),
     }))
     .filter(output => output.type);

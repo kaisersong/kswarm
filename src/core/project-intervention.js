@@ -1,3 +1,5 @@
+import { isTemporalAcceptanceImpossible } from './failure-supervisor.js';
+
 const ACTIVE_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 const ATTENTION_STATUSES = new Set(['failed', 'blocked']);
 const DONE_STATUSES = new Set(['done', 'cancelled']);
@@ -123,13 +125,13 @@ function selectPrimaryCandidate({ project, tasks, taskMap, agents, dispatchPlan,
 
     if (!ATTENTION_STATUSES.has(task.status)) continue;
 
-    const strategy = chooseAttentionStrategy(task, agents);
+    const strategy = chooseAttentionStrategy(task, agents, now);
     const downstreamBlockedCount = countDownstreamBlocked(task, tasks);
     candidates.push({
       task,
       strategy,
       downstreamBlockedCount,
-      rank: rankTask(task, strategy, downstreamBlockedCount),
+      rank: rankTask(task, strategy, downstreamBlockedCount, now),
     });
   }
 
@@ -168,8 +170,8 @@ function isRetryChildMaskingQualityDeadloop(task, taskMap) {
   return parentHasQualityFeedback && shouldEscalateQualityRepair(parent);
 }
 
-function chooseAttentionStrategy(task, agents) {
-  if (requiresPlanRevision(task)) return 'needs_conversation';
+function chooseAttentionStrategy(task, agents, now = Date.now()) {
+  if (requiresPlanRevision(task, now)) return 'needs_conversation';
   if (task.blockKind === 'agent_replacement_confirmation_required') return 'replace_agent_confirm';
   if (hasOutputContractFailure(task)) return 'repair_output_contract';
   const hasCurrentQuality = hasCurrentQualityRejection(task);
@@ -186,8 +188,8 @@ function chooseRetryStrategy(task, agents, preferredStrategy) {
   return preferredStrategy;
 }
 
-function rankTask(task, strategy, downstreamBlockedCount = 0) {
-  const baseRank = baseTaskRank(task, strategy);
+function rankTask(task, strategy, downstreamBlockedCount = 0, now = Date.now()) {
+  const baseRank = baseTaskRank(task, strategy, now);
   const isDownstreamBlocker = Number(downstreamBlockedCount || 0) > 0;
   if (isDownstreamBlocker) {
     return strategy === 'needs_conversation' && baseRank >= 90 ? 45 : baseRank;
@@ -198,12 +200,12 @@ function rankTask(task, strategy, downstreamBlockedCount = 0) {
   return baseRank;
 }
 
-function baseTaskRank(task, strategy) {
+function baseTaskRank(task, strategy, now = Date.now()) {
   if (strategy === 'recover_submission') return 10;
   if (strategy === 'repair_output_contract') return 11;
   if (strategy === 'replace_agent_confirm') return 13;
   if (strategy === 'notify_po_review') return 12;
-  if (strategy === 'needs_conversation' && requiresPlanRevision(task)) return 14;
+  if (strategy === 'needs_conversation' && requiresPlanRevision(task, now)) return 14;
   if (strategy === 'needs_conversation' && hasQualityFeedback(task) && shouldEscalateQualityRepair(task)) return 15;
   if (strategy === 'retry_with_repair_instruction') return 20;
   if (strategy === 'restart_then_retry') return 30;
@@ -257,9 +259,13 @@ function hasOutputContractFailure(task = {}) {
   return rejected.some(submission => OUTPUT_CONTRACT_FAILURES.has(String(submission?.failureClass || '')));
 }
 
-function requiresPlanRevision(task = {}) {
-  return task.blockKind === 'plan_revision_required' ||
+function requiresPlanRevision(task = {}, now = Date.now()) {
+  const hasPlanRevisionMarker = task.blockKind === 'plan_revision_required' ||
     task.lastFailureClass === 'quality_temporal_impossible';
+  if (!hasPlanRevisionMarker) return false;
+  const feedback = latestFailureText(task);
+  if (!feedback) return true;
+  return isTemporalAcceptanceImpossible(feedback, now);
 }
 
 function hasCurrentQualityRejection(task = {}) {
@@ -276,6 +282,19 @@ function shouldEscalateQualityRepair(task = {}) {
 function hasStartedRecovery(task = {}, strategy) {
   const history = Array.isArray(task.continueRecoveryHistory) ? task.continueRecoveryHistory : [];
   return history.some(entry => entry?.strategy === strategy && entry?.result === 'started');
+}
+
+function latestFailureText(task = {}) {
+  const reviews = Array.isArray(task.qualityReviewHistory) ? task.qualityReviewHistory : [];
+  const latestReview = [...reviews].reverse().find(review => review?.passed === false);
+  return String(
+    task.blockedReason ||
+    task.failureReason ||
+    task.reviewResult?.feedback ||
+    latestReview?.feedback ||
+    task.lastError ||
+    '',
+  ).trim();
 }
 
 function latestFailedReview(task = {}) {
@@ -304,11 +323,18 @@ function hasHealthyAgentForTask(task, agents) {
   if (agents.length === 0) return Boolean(task?.assignedAgent);
   return agents.some(agent => {
     if (!agent || agent.archived) return false;
+    if (isBrokerOnlineDesktopAgent(agent)) return true;
     if (['offline', 'error', 'failed', 'stopped', 'archived'].includes(String(agent.status || '').toLowerCase())) return false;
     const state = String(agent.runtimeHealth?.state || 'healthy').toLowerCase();
     if (['unhealthy', 'error', 'failed', 'offline', 'cooldown'].includes(state)) return false;
     return true;
   });
+}
+
+function isBrokerOnlineDesktopAgent(agent = {}) {
+  if (agent.brokerOnline !== true) return false;
+  return agent.runtimeSource === 'desktop-agent-runtime' ||
+    agent.runtimeHealth?.source === 'desktop-agent-runtime';
 }
 
 function countDownstreamBlocked(rootTask, tasks) {

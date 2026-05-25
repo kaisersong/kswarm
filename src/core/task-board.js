@@ -20,6 +20,7 @@ import {
   buildTaskAliases,
   isExecutableTaskInput,
   makeRunId,
+  normalizeLocalTaskId,
   normalizeExistingTask,
   normalizeTasksForProject,
   resolveTaskRef,
@@ -522,6 +523,13 @@ export function createTaskBoard(projectId = 'legacy-project') {
       const deps = [];
       const unresolved = [];
       for (const ref of refs) {
+        const phaseDeps = resolvePhaseDependencyIds(ref, task);
+        if (phaseDeps.length > 0) {
+          for (const depId of phaseDeps) {
+            if (!deps.includes(depId)) deps.push(depId);
+          }
+          continue;
+        }
         const depId = resolveTaskId(ref);
         if (depId) deps.push(depId);
         else unresolved.push(ref);
@@ -529,6 +537,20 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.dependencies = deps;
       task.unresolvedDependencies = unresolved;
     }
+  }
+
+  function resolvePhaseDependencyIds(ref, currentTask) {
+    const raw = String(ref || '').trim();
+    if (!raw) return [];
+    const normalizedRef = normalizeLocalTaskId(raw);
+    return [...tasks.values()]
+      .filter(task => task.id !== currentTask.id)
+      .filter(task => !task.parentTaskId)
+      .filter(task => {
+        if (!task.phaseId) return false;
+        return task.phaseId === raw || normalizeLocalTaskId(task.phaseId) === normalizedRef;
+      })
+      .map(task => task.id);
   }
 
   function clearStaleReview(task) {
