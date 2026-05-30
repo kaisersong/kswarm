@@ -142,7 +142,22 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     throw error;
   }
 
-  if (event.type === 'node_started') {
+  if (event.type === 'node_dispatched') {
+    node.status = 'running';
+    node.startedAt = node.startedAt || now;
+    node.assignedAgent = event.assignedAgent || node.assignedAgent || null;
+    node.attempt = Number.isFinite(Number(event.attempt)) ? Number(event.attempt) : ((node.attempt || 0) + 1);
+    node.input = clonePlainValue(event.input || node.input || null);
+    node.runtime = {
+      ...(node.runtime || {}),
+      handoffId: event.handoffId || node.runtime?.handoffId || null,
+      runId: next.id,
+      participantId: event.assignedAgent || node.runtime?.participantId || null,
+      lastProgressAt: now,
+    };
+    next.status = 'running';
+    next.startedAt = next.startedAt || now;
+  } else if (event.type === 'node_started') {
     node.status = 'running';
     node.startedAt = node.startedAt || now;
     next.status = 'running';
@@ -151,6 +166,7 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.status = 'completed';
     node.completedAt = now;
     node.output = event.output || null;
+    node.producerAgent = event.fromAgent || node.assignedAgent || null;
   } else if (event.type === 'node_failed') {
     node.status = 'failed';
     node.completedAt = now;
@@ -162,6 +178,19 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.completedAt = now;
     node.error = event.reason || 'node_blocked';
     next.status = 'blocked';
+  } else if (event.type === 'node_reviewed') {
+    node.status = 'completed';
+    node.completedAt = now;
+    node.output = event.output || null;
+    node.reviewDecision = clonePlainValue(event.reviewDecision);
+    node.producerAgent = event.fromAgent || node.assignedAgent || null;
+  } else if (event.type === 'gate_completed') {
+    node.status = 'completed';
+    node.completedAt = now;
+    node.output = { decision: clonePlainValue(event.decision) };
+    next.gateDecision = clonePlainValue(event.decision);
+    next.status = event.decision?.status === 'passed' ? 'completed' : 'blocked';
+    next.completedAt = now;
   } else {
     const error = new Error('unknown_workflow_event');
     error.eventType = event.type;
@@ -184,7 +213,7 @@ export function summarizeWorkflowRun(run = {}) {
   return {
     ...counts,
     progress: counts.total === 0 ? 0 : counts.completed / counts.total,
-    primaryMessage: run.diagnosis?.recommendedActions?.[0]?.label || null,
+    primaryMessage: formatGateDecisionMessage(run.gateDecision) || run.diagnosis?.recommendedActions?.[0]?.label || null,
   };
 }
 
@@ -198,7 +227,12 @@ function normalizeNode(node) {
     kind: node.kind || 'control',
     dependsOn,
     assignedAgent: node.assignedAgent || null,
+    attempt: Number.isFinite(Number(node.attempt)) ? Number(node.attempt) : 0,
+    input: clonePlainValue(node.input || null),
     output: node.output || null,
+    reviewDecision: clonePlainValue(node.reviewDecision || null),
+    runtime: clonePlainValue(node.runtime || null),
+    producerAgent: node.producerAgent || null,
     error: node.error || null,
     startedAt: node.startedAt || null,
     completedAt: node.completedAt || null,
@@ -243,7 +277,8 @@ function refreshSummary(run) {
   const summary = summarizeWorkflowRun(run);
   let status = run.status;
   if (!TERMINAL_RUN_STATUSES.has(status) && status !== 'awaiting_approval') {
-    if (summary.failed > 0) status = 'failed';
+    if (run.gateDecision?.status && run.gateDecision.status !== 'passed') status = 'blocked';
+    else if (summary.failed > 0) status = 'failed';
     else if (summary.blocked > 0) status = 'blocked';
     else if (summary.total > 0 && summary.completed === summary.total) status = 'completed';
     else status = 'running';
@@ -268,10 +303,19 @@ function cloneRun(run) {
     })),
     summary: run.summary ? { ...run.summary } : null,
     diagnosis: clonePlainValue(run.diagnosis),
+    gateDecision: clonePlainValue(run.gateDecision),
   };
 }
 
 function clonePlainValue(value) {
   if (value === null || value === undefined) return value;
   return JSON.parse(JSON.stringify(value));
+}
+
+function formatGateDecisionMessage(decision) {
+  if (!decision?.status) return null;
+  if (decision.status === 'passed') return 'Review gate passed';
+  if (decision.status === 'needs_rework') return 'Review gate needs rework';
+  if (decision.status === 'blocked') return 'Review gate blocked';
+  return null;
 }

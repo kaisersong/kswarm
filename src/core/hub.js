@@ -32,7 +32,8 @@ import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
-import { createProjectDiagnoseWorkflowRun } from './workflow-builtins.js';
+import { applyWorkflowEvent } from './workflow-run.js';
+import { createAgentReviewSmokeWorkflowRun, createProjectDiagnoseWorkflowRun } from './workflow-builtins.js';
 import {
   appendQualityPlanningGuidance,
   buildQualityPromptExcerpt,
@@ -1440,6 +1441,158 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     });
     return { ok: true, workflowRun };
   }
+  function startAgentReviewSmokeWorkflow(projectId, { requestedBy = 'human', now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+
+    const workerAgent = (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
+    const reviewerAgent = project.poAgent || 'xiaok-po';
+    let workflowRun = createAgentReviewSmokeWorkflowRun({
+      project,
+      tasks: board.getAllTasks(),
+      workerAgent,
+      reviewerAgent,
+      requestedBy,
+      now,
+    });
+
+    const dispatched = dispatchWorkflowNode(workflowRun, 'worker-diagnose-project', {
+      assignedAgent: workerAgent,
+      now,
+    });
+    workflowRun = dispatched.workflowRun;
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.run.started', {
+      projectId,
+      workflowRunId: workflowRun.id,
+      workflowId: workflowRun.workflowId,
+      requestedBy,
+    });
+    emitWorkflowDispatchEvents(projectId, dispatched.dispatches);
+    return { ok: true, workflowRun, dispatches: dispatched.dispatches };
+  }
+  function handleWorkflowNodeResult({ workflowRunId, nodeId, attempt, handoffId, fromAgent, output, now = Date.now() } = {}) {
+    const checked = validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId });
+    if (!checked.ok) return checked;
+
+    let workflowRun = applyWorkflowEvent(checked.workflowRun, {
+      type: 'node_completed',
+      nodeId,
+      output: {
+        ...(output && typeof output === 'object' ? output : { value: output }),
+        producerAgent: fromAgent || checked.node.assignedAgent || null,
+        producedAt: now,
+      },
+      fromAgent,
+    }, { now });
+
+    const reviewer = workflowRun.nodes.find(node => node.id === 'reviewer-adversarial-check');
+    let dispatches = [];
+    if (reviewer?.status === 'ready') {
+      const dispatched = dispatchWorkflowNode(workflowRun, reviewer.id, {
+        assignedAgent: reviewer.assignedAgent || 'xiaok-po',
+        input: {
+          workerOutput: workflowRun.nodes.find(node => node.id === 'worker-diagnose-project')?.output || null,
+        },
+        now,
+      });
+      workflowRun = dispatched.workflowRun;
+      dispatches = dispatched.dispatches;
+    }
+
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.node.output_received', {
+      projectId: workflowRun.projectId,
+      workflowRunId,
+      nodeId,
+      fromAgent: fromAgent || null,
+    });
+    emitWorkflowDispatchEvents(workflowRun.projectId, dispatches);
+    return { ok: true, workflowRun, dispatches };
+  }
+  function handleWorkflowNodeReview({ workflowRunId, nodeId, attempt, handoffId, fromAgent, reviewDecision, output = null, now = Date.now() } = {}) {
+    const checked = validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId });
+    if (!checked.ok) return checked;
+
+    const decisionValidation = validateWorkflowReviewDecision(reviewDecision);
+    if (!decisionValidation.ok) {
+      let blocked = applyWorkflowEvent(checked.workflowRun, {
+        type: 'node_blocked',
+        nodeId,
+        reason: 'malformed_review_decision',
+      }, { now });
+      blocked = {
+        ...blocked,
+        gateDecision: {
+          status: 'blocked',
+          reason: decisionValidation.error,
+          evidenceRefs: [],
+        },
+      };
+      blocked.summary = { ...blocked.summary, primaryMessage: 'Review gate blocked' };
+      workflowRuns.set(blocked.id, blocked);
+      eventLog.emit('workflow.node.reviewed', {
+        projectId: blocked.projectId,
+        workflowRunId,
+        nodeId,
+        fromAgent: fromAgent || null,
+        decision: 'blocked',
+        error: decisionValidation.error,
+      });
+      return { ok: true, workflowRun: blocked, dispatches: [] };
+    }
+
+    let workflowRun = applyWorkflowEvent(checked.workflowRun, {
+      type: 'node_reviewed',
+      nodeId,
+      reviewDecision,
+      output,
+      fromAgent,
+    }, { now });
+    workflowRun = applyWorkflowEvent(workflowRun, {
+      type: 'gate_completed',
+      nodeId: 'reduce-review-gate',
+      decision: reviewDecision,
+    }, { now });
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.run.gate_completed', {
+      projectId: workflowRun.projectId,
+      workflowRunId,
+      status: workflowRun.status,
+      decision: reviewDecision.status,
+    });
+    return { ok: true, workflowRun, dispatches: [] };
+  }
+  function handleWorkflowRuntimeUnavailable({ workflowRunId, nodeId, attempt, handoffId, reason = 'runtime_unavailable', now = Date.now() } = {}) {
+    const checked = validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId, allowRunningOnly: false });
+    if (!checked.ok) return checked;
+    const workflowRun = applyWorkflowEvent(checked.workflowRun, {
+      type: 'node_blocked',
+      nodeId,
+      reason,
+    }, { now });
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.node.blocked', {
+      projectId: workflowRun.projectId,
+      workflowRunId,
+      nodeId,
+      reason,
+    });
+    return { ok: true, workflowRun, dispatches: [] };
+  }
+  function cancelWorkflowRun(workflowRunId, { reason = 'human_cancelled', now = Date.now() } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
+    workflowRuns.set(cancelled.id, cancelled);
+    eventLog.emit('workflow.run.cancelled', {
+      projectId: cancelled.projectId,
+      workflowRunId,
+      reason,
+    });
+    return { ok: true, workflowRun: cancelled };
+  }
   function listProjectWorkflowRuns(projectId) {
     return [...workflowRuns.values()]
       .filter(run => run.projectId === projectId)
@@ -1447,6 +1600,67 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   }
   function getWorkflowRun(workflowRunId) {
     return workflowRuns.get(workflowRunId) || null;
+  }
+  function dispatchWorkflowNode(workflowRun, nodeId, { assignedAgent, input = null, now = Date.now() } = {}) {
+    const node = workflowRun.nodes.find(item => item.id === nodeId);
+    if (!node || !['ready', 'pending'].includes(node.status)) return { workflowRun, dispatches: [] };
+    const attempt = (node.attempt || 0) + 1;
+    const handoffId = `wfhd-${workflowRun.id}-${nodeId}-${attempt}`;
+    const next = applyWorkflowEvent(workflowRun, {
+      type: 'node_dispatched',
+      nodeId,
+      assignedAgent: assignedAgent || node.assignedAgent || null,
+      attempt,
+      handoffId,
+      input: input || node.input || null,
+    }, { now });
+    const updatedNode = next.nodes.find(item => item.id === nodeId);
+    return {
+      workflowRun: next,
+      dispatches: [{
+        workflowRunId: next.id,
+        workflowId: next.workflowId,
+        projectId: next.projectId,
+        nodeId,
+        nodeTitle: updatedNode?.title || nodeId,
+        nodeKind: updatedNode?.kind || node.kind,
+        targetParticipantId: updatedNode?.assignedAgent || assignedAgent || null,
+        attempt,
+        handoffId,
+        input: updatedNode?.input || null,
+      }],
+    };
+  }
+  function validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId, allowRunningOnly = true } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
+    const node = workflowRun.nodes.find(item => item.id === nodeId);
+    if (!node) return { ok: false, error: 'workflow_node_not_found' };
+    if (allowRunningOnly && node.status !== 'running') return { ok: false, error: 'workflow_node_not_running' };
+    if (Number(node.attempt || 0) !== Number(attempt || 0)) return { ok: false, error: 'workflow_attempt_mismatch' };
+    if ((node.runtime?.handoffId || null) !== (handoffId || null)) return { ok: false, error: 'workflow_handoff_mismatch' };
+    return { ok: true, workflowRun, node };
+  }
+  function validateWorkflowReviewDecision(decision) {
+    if (!decision || typeof decision !== 'object') return { ok: false, error: 'review_decision_required' };
+    if (!['passed', 'needs_rework', 'blocked'].includes(decision.status)) return { ok: false, error: 'review_decision_status_invalid' };
+    if (typeof decision.reason !== 'string' || !decision.reason.trim()) return { ok: false, error: 'review_decision_reason_required' };
+    if (decision.evidenceRefs !== undefined && !Array.isArray(decision.evidenceRefs)) return { ok: false, error: 'review_decision_evidence_refs_invalid' };
+    return { ok: true };
+  }
+  function emitWorkflowDispatchEvents(projectId, dispatches = []) {
+    for (const dispatch of dispatches) {
+      eventLog.emit('workflow.node.dispatched', {
+        projectId,
+        workflowRunId: dispatch.workflowRunId,
+        workflowId: dispatch.workflowId,
+        nodeId: dispatch.nodeId,
+        targetParticipantId: dispatch.targetParticipantId,
+        attempt: dispatch.attempt,
+        handoffId: dispatch.handoffId,
+      });
+    }
   }
   function getHumanActions(projectId) {
     if (projectId) return humanActions.filter(a => a.projectId === projectId);
@@ -1481,6 +1695,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleContinueProject,
     handleResolveProjectIntervention,
     startProjectDiagnoseWorkflow,
+    startAgentReviewSmokeWorkflow,
+    handleWorkflowNodeResult,
+    handleWorkflowNodeReview,
+    handleWorkflowRuntimeUnavailable,
+    cancelWorkflowRun,
   };
 
   const persisted = {};
@@ -1502,6 +1721,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getProjectHealth,
     getProjectIntervention,
     startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,
+    startAgentReviewSmokeWorkflow: persisted.startAgentReviewSmokeWorkflow,
+    handleWorkflowNodeResult: persisted.handleWorkflowNodeResult,
+    handleWorkflowNodeReview: persisted.handleWorkflowNodeReview,
+    handleWorkflowRuntimeUnavailable: persisted.handleWorkflowRuntimeUnavailable,
+    cancelWorkflowRun: persisted.cancelWorkflowRun,
     listProjectWorkflowRuns,
     getWorkflowRun,
     getHumanActions,

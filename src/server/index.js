@@ -321,6 +321,60 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   }
 }
 
+async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
+  if (!Array.isArray(dispatches) || dispatches.length === 0) return [];
+
+  const project = hub.getProject(projectId);
+  const ws = getProjectWorkspace(projectId);
+  const results = [];
+
+  for (const dispatch of dispatches) {
+    const target = dispatch.targetParticipantId;
+    if (!target || !brokerClient || !brokerClient.isConnected()) {
+      const blocked = hub.handleWorkflowRuntimeUnavailable({
+        workflowRunId: dispatch.workflowRunId,
+        nodeId: dispatch.nodeId,
+        attempt: dispatch.attempt,
+        handoffId: dispatch.handoffId,
+        reason: target ? 'broker_unavailable' : 'runtime_unavailable',
+      });
+      results.push(blocked);
+      broadcast({ type: 'workflow_run_updated', projectId, workflowRun: blocked.workflowRun });
+      continue;
+    }
+
+    try {
+      const delivery = await brokerClient.sendTo(target, 'workflow_node_handoff', {
+        taskId: dispatch.workflowRunId,
+        payload: {
+          ...dispatch,
+          project: project ? {
+            id: project.id,
+            name: project.name,
+            goal: project.goal || '',
+            status: project.status,
+            workFolder: ws.path,
+          } : { id: projectId, workFolder: ws.path },
+        },
+      });
+      results.push({ ok: true, delivery, dispatch });
+      broadcast({ type: 'workflow_node_dispatched', projectId, dispatch });
+    } catch (err) {
+      const blocked = hub.handleWorkflowRuntimeUnavailable({
+        workflowRunId: dispatch.workflowRunId,
+        nodeId: dispatch.nodeId,
+        attempt: dispatch.attempt,
+        handoffId: dispatch.handoffId,
+        reason: err?.message || 'workflow_handoff_failed',
+      });
+      results.push(blocked);
+      broadcast({ type: 'workflow_run_updated', projectId, workflowRun: blocked.workflowRun });
+    }
+  }
+
+  return results;
+}
+
 function connectBroker() {
   try {
     brokerClient = createBrokerClient({
@@ -794,6 +848,55 @@ function handleBrokerIntent(intent) {
           payload: { projectId: resolved.projectId, taskId: resolved.taskId, fromWorker: fromParticipantId, result: payload },
         }).catch(() => {});
       }
+      break;
+    }
+    case 'workflow_node_progress': {
+      const projectId = payload?.projectId;
+      if (!projectId || !payload?.workflowRunId || !payload?.nodeId) {
+        return emitTaskIntentError(kind, taskId, fromParticipantId, { error: 'workflow_progress_missing_identity', projectId });
+      }
+      log('info', `Workflow node progress: ${payload.nodeId}`, { projectId, workflowRunId: payload.workflowRunId, fromParticipantId, stage: payload.stage });
+      broadcast({ type: 'workflow_node_progress', projectId, workflowRunId: payload.workflowRunId, nodeId: payload.nodeId, stage: payload.stage, agent: fromParticipantId });
+      break;
+    }
+    case 'workflow_node_result': {
+      const projectId = payload?.projectId;
+      if (!projectId || !payload?.workflowRunId || !payload?.nodeId) {
+        return emitTaskIntentError(kind, taskId, fromParticipantId, { error: 'workflow_result_missing_identity', projectId });
+      }
+      const common = {
+        workflowRunId: payload.workflowRunId,
+        nodeId: payload.nodeId,
+        attempt: payload.attempt,
+        handoffId: payload.handoffId,
+        fromAgent: fromParticipantId,
+        output: payload.output || payload.result || null,
+      };
+      const result = payload.reviewDecision
+        ? hub.handleWorkflowNodeReview({ ...common, reviewDecision: payload.reviewDecision })
+        : hub.handleWorkflowNodeResult(common);
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId });
+      log('info', `Workflow node result accepted: ${payload.nodeId}`, { projectId, workflowRunId: payload.workflowRunId, fromParticipantId });
+      broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+      if (result.dispatches?.length > 0) {
+        sendWorkflowNodeHandoffs(projectId, result.dispatches).catch(() => {});
+      }
+      break;
+    }
+    case 'workflow_node_failed': {
+      const projectId = payload?.projectId;
+      if (!projectId || !payload?.workflowRunId || !payload?.nodeId) {
+        return emitTaskIntentError(kind, taskId, fromParticipantId, { error: 'workflow_failure_missing_identity', projectId });
+      }
+      const result = hub.handleWorkflowRuntimeUnavailable({
+        workflowRunId: payload.workflowRunId,
+        nodeId: payload.nodeId,
+        attempt: payload.attempt,
+        handoffId: payload.handoffId,
+        reason: payload.failureReason || payload.errorMessage || 'workflow_node_failed',
+      });
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId });
+      broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
       break;
     }
   }
@@ -1304,6 +1407,15 @@ async function handleRequest(req, res) {
       return json(res, { workflowRuns: hub.listProjectWorkflowRuns(project.id) });
     }
 
+    const projectWorkflowRunMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)$/);
+    if (projectWorkflowRunMatch && req.method === 'GET') {
+      const project = hub.getProject(projectWorkflowRunMatch[1]);
+      if (!project) return json(res, { error: 'not_found' }, 404);
+      const workflowRun = hub.getWorkflowRun(projectWorkflowRunMatch[2]);
+      if (!workflowRun || workflowRun.projectId !== project.id) return json(res, { error: 'not_found' }, 404);
+      return json(res, { workflowRun });
+    }
+
     const diagnoseWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/project-diagnose$/);
     if (diagnoseWorkflowMatch && req.method === 'POST') {
       const projectId = diagnoseWorkflowMatch[1];
@@ -1320,6 +1432,27 @@ async function handleRequest(req, res) {
         broadcast({ type: 'workflow_run_completed', projectId, workflowRun: result.workflowRun });
       }
       return json(res, result, result.ok ? 201 : 404);
+    }
+
+    const agentSmokeWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/agent-review-smoke$/);
+    if (agentSmokeWorkflowMatch && req.method === 'POST') {
+      const projectId = agentSmokeWorkflowMatch[1];
+      const body = await parseBody(req);
+      const result = hub.startAgentReviewSmokeWorkflow(projectId, {
+        requestedBy: body?.requestedBy || 'human',
+      });
+      if (result.ok) {
+        log('info', `Agent review smoke workflow started`, {
+          projectId,
+          workflowRunId: result.workflowRun.id,
+          dispatches: result.dispatches?.length || 0,
+        });
+        broadcast({ type: 'workflow_run_started', projectId, workflowRun: result.workflowRun });
+        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
+        return json(res, { ...result, workflowRun }, 201);
+      }
+      return json(res, result, 404);
     }
 
     // ── Project preparation gate ──

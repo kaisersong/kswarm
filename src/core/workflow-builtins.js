@@ -9,6 +9,7 @@
 import { applyWorkflowEvent, createWorkflowRun } from './workflow-run.js';
 
 export const PROJECT_DIAGNOSE_WORKFLOW_ID = 'project-diagnose';
+export const AGENT_REVIEW_SMOKE_WORKFLOW_ID = 'agent-review-smoke';
 
 export function createProjectDiagnoseWorkflowRun({
   project,
@@ -68,6 +69,62 @@ export function createProjectDiagnoseWorkflowRun({
   return run;
 }
 
+export function createAgentReviewSmokeWorkflowRun({
+  project,
+  tasks = [],
+  workerAgent = 'xiaok-worker',
+  reviewerAgent = 'xiaok-po',
+  requestedBy = 'human',
+  now = Date.now(),
+} = {}) {
+  if (!project?.id) {
+    const error = new Error('project_required');
+    error.code = 'project_required';
+    throw error;
+  }
+
+  return createWorkflowRun({
+    id: `wf-${project.id}-${AGENT_REVIEW_SMOKE_WORKFLOW_ID}-${now}`,
+    projectId: project.id,
+    workflowId: AGENT_REVIEW_SMOKE_WORKFLOW_ID,
+    title: 'Agent 工作流 smoke',
+    requestedBy,
+    source: 'builtin-smoke',
+    phases: [
+      { id: 'inspect', title: 'Agent 诊断' },
+      { id: 'review', title: '对抗性复核' },
+      { id: 'reduce', title: '门禁归约' },
+    ],
+    nodes: [
+      {
+        id: 'worker-diagnose-project',
+        phaseId: 'inspect',
+        title: 'Worker 项目诊断',
+        kind: 'agent_task',
+        assignedAgent: workerAgent,
+        input: buildWorkerSmokeInput({ project, tasks }),
+      },
+      {
+        id: 'reviewer-adversarial-check',
+        phaseId: 'review',
+        title: 'Reviewer 对抗性检查',
+        kind: 'review',
+        dependsOn: ['worker-diagnose-project'],
+        assignedAgent: reviewerAgent,
+        input: { reviewFocus: ['事实完整性', '阻塞判断', '下一步建议是否可执行'] },
+      },
+      {
+        id: 'reduce-review-gate',
+        phaseId: 'reduce',
+        title: '归约 review gate',
+        kind: 'control',
+        dependsOn: ['reviewer-adversarial-check'],
+      },
+    ],
+    now,
+  });
+}
+
 export function buildProjectDiagnosis({ project = {}, tasks = [], projectHealth = null, dispatchPlan = null } = {}) {
   const healthState = projectHealth?.state || projectHealth?.status || null;
   const blockedTasks = collectBlockedTasks({ tasks, projectHealth, dispatchPlan });
@@ -122,4 +179,22 @@ function recommendActions({ healthState, blockedTasks, dispatchableCount, waitin
     return [{ id: 'wait_for_agents', label: '等待 Agent 空闲', reason: '当前主要瓶颈是 Agent 忙碌或容量不足' }];
   }
   return [{ id: 'observe', label: '继续观察项目状态', reason: '未发现需要立即干预的问题' }];
+}
+
+function buildWorkerSmokeInput({ project = {}, tasks = [] }) {
+  return {
+    project: {
+      id: project.id,
+      name: project.name,
+      goal: project.goal || '',
+      status: project.status || '',
+    },
+    taskSnapshot: tasks.map(task => ({
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      assignedAgent: task.assignedAgent || null,
+    })),
+    instruction: '检查项目当前任务状态，输出结构化诊断摘要、证据引用和下一步建议。',
+  };
 }
