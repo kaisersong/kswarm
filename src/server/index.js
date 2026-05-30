@@ -1217,6 +1217,7 @@ async function handleRequest(req, res) {
           stoppedCount: stopped,
           updatedAt: p.updatedAt || p.createdAt || 0,
           projectIntervention: hub.getProjectIntervention(p.id),
+          latestWorkflowRun: hub.listProjectWorkflowRuns(p.id)[0] || null,
         };
       }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
       return json(res, { projects });
@@ -1279,6 +1280,7 @@ async function handleRequest(req, res) {
       const dispatchPlan = hub.getDispatchPlan(project.id);
       const projectHealth = hub.getProjectHealth(project.id);
       const projectIntervention = hub.getProjectIntervention(project.id);
+      const workflowRuns = hub.listProjectWorkflowRuns(project.id);
       return json(res, {
         project: { ...project, workFolder: ws.path },
         tasks,
@@ -1290,7 +1292,34 @@ async function handleRequest(req, res) {
         dispatchPlan,
         projectHealth,
         projectIntervention,
+        workflowRuns,
       });
+    }
+
+    // ── Project workflow runs ──
+    const projectWorkflowsMatch = path.match(/^\/projects\/([^/]+)\/workflows$/);
+    if (projectWorkflowsMatch && req.method === 'GET') {
+      const project = hub.getProject(projectWorkflowsMatch[1]);
+      if (!project) return json(res, { error: 'not_found' }, 404);
+      return json(res, { workflowRuns: hub.listProjectWorkflowRuns(project.id) });
+    }
+
+    const diagnoseWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/project-diagnose$/);
+    if (diagnoseWorkflowMatch && req.method === 'POST') {
+      const projectId = diagnoseWorkflowMatch[1];
+      const body = await parseBody(req);
+      const result = hub.startProjectDiagnoseWorkflow(projectId, {
+        requestedBy: body?.requestedBy || 'human',
+      });
+      if (result.ok) {
+        log('info', `Project diagnose workflow completed`, {
+          projectId,
+          workflowRunId: result.workflowRun.id,
+          recommendedAction: result.workflowRun.diagnosis?.recommendedActions?.[0]?.id || null,
+        });
+        broadcast({ type: 'workflow_run_completed', projectId, workflowRun: result.workflowRun });
+      }
+      return json(res, result, result.ok ? 201 : 404);
     }
 
     // ── Project preparation gate ──

@@ -32,6 +32,7 @@ import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
+import { createProjectDiagnoseWorkflowRun } from './workflow-builtins.js';
 import {
   appendQualityPlanningGuidance,
   buildQualityPromptExcerpt,
@@ -43,6 +44,7 @@ const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'qualit
 export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
   const projects = new Map();
   const boards = new Map();
+  const workflowRuns = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const persistence = typeof dataDir === 'string' ? createPersistence(dataDir) : null;
 
@@ -56,6 +58,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       for (const { projectId, tasks } of (saved.boards || [])) {
         boards.set(projectId, restoreTaskBoard(tasks, projectId));
       }
+      for (const run of (saved.workflowRuns || [])) {
+        if (run?.id) workflowRuns.set(run.id, run);
+      }
       if (!silent) console.log(`[hub] Restored ${saved.projects.length} projects from disk`);
     }
   }
@@ -68,6 +73,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         projectId,
         tasks: board.getAllTasks(),
       })),
+      workflowRuns: [...workflowRuns.values()],
       humanActions,
     }));
   }
@@ -1405,6 +1411,43 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       dispatchPlan,
     });
   }
+  function startProjectDiagnoseWorkflow(projectId, { requestedBy = 'human', now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+
+    const dispatchPlan = buildDispatchPlan(projectId);
+    const workflowRun = createProjectDiagnoseWorkflowRun({
+      project,
+      tasks: board.getAllTasks(),
+      projectHealth: deriveProjectHealth({
+        project,
+        tasks: board.getAllTasks(),
+        dispatchPlan,
+      }),
+      dispatchPlan,
+      requestedBy,
+      now,
+    });
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.run.completed', {
+      projectId,
+      workflowRunId: workflowRun.id,
+      workflowId: workflowRun.workflowId,
+      status: workflowRun.status,
+      requestedBy,
+      recommendedAction: workflowRun.diagnosis?.recommendedActions?.[0]?.id || null,
+    });
+    return { ok: true, workflowRun };
+  }
+  function listProjectWorkflowRuns(projectId) {
+    return [...workflowRuns.values()]
+      .filter(run => run.projectId === projectId)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  }
+  function getWorkflowRun(workflowRunId) {
+    return workflowRuns.get(workflowRunId) || null;
+  }
   function getHumanActions(projectId) {
     if (projectId) return humanActions.filter(a => a.projectId === projectId);
     return [...humanActions];
@@ -1437,6 +1480,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleTaskFail,
     handleContinueProject,
     handleResolveProjectIntervention,
+    startProjectDiagnoseWorkflow,
   };
 
   const persisted = {};
@@ -1457,6 +1501,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getDispatchPlan,
     getProjectHealth,
     getProjectIntervention,
+    startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,
+    listProjectWorkflowRuns,
+    getWorkflowRun,
     getHumanActions,
     persistState,
   };
