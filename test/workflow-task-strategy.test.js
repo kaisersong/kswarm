@@ -5,6 +5,9 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { createHub } from '../src/core/hub.js';
 
 const tests = [];
@@ -19,7 +22,7 @@ function createActiveProject(hub, id = 'proj-task-workflow') {
     members: ['xiaok-worker'],
   });
   const added = hub.handleHumanAddTasks(id, [
-    { title: '生成客户分析报告', description: '需要有事实依据和复核结论', assignedAgent: 'xiaok-worker' },
+    { title: '生成客户分析报告', description: '需要有事实依据和复核结论', assignedAgent: 'xiaok-worker', acceptanceCriteria: '需要有事实依据和复核结论', requiredOutputs: ['markdown'] },
     { title: '整理引用材料', assignedAgent: 'xiaok-worker' },
   ]);
   assert.equal(added.ok, true);
@@ -72,8 +75,8 @@ test('creates a controlled PO-generated task workflow proposal as validated IR',
   assert.equal(proposal.workflowProposal.workflowId, 'po-generated-task-workflow');
   assert.equal(proposal.workflowProposal.source, 'po_generated');
   assert.equal(proposal.workflowProposal.scope.taskId, taskId);
-  assert.equal(proposal.workflowProposal.title, 'PO 生成任务工作流');
-  assert.equal(proposal.workflowProposal.permissions.allowWrite, false);
+  assert.equal(proposal.workflowProposal.title, '任务交付物工作流');
+  assert.equal(proposal.workflowProposal.permissions.allowWrite, true);
   assert.equal(proposal.workflowProposal.permissions.allowShell, false);
   assert.equal(proposal.workflowProposal.permissions.allowNetwork, false);
   assert.equal(proposal.workflowProposal.acceptanceRubric.judgmentChecks[0].evidenceRequired, true);
@@ -124,7 +127,12 @@ test('approved task workflow must match task identity and re-check hard budget l
   assert.equal(started.workflowRun.sourceTask.id, firstTask.id);
   assert.equal(started.workflowRun.budgetGate.status, 'passed');
   assert.equal(started.dispatches.length, 1);
-  assert.equal(started.dispatches[0].nodeId, 'po-draft-task-plan');
+  assert.equal(started.dispatches[0].nodeId, 'worker-produce-deliverable');
+  assert.equal(started.dispatches[0].targetParticipantId, 'xiaok-worker');
+  assert.equal(started.dispatches[0].input.workflowRunId, started.workflowRun.id);
+  assert.equal(started.dispatches[0].input.workflowRun.id, started.workflowRun.id);
+  assert.equal(started.dispatches[0].input.sourceTask.acceptanceCriteria, '需要有事实依据和复核结论');
+  assert.deepEqual(started.dispatches[0].input.sourceTask.requiredOutputs, [{ type: 'markdown', enforcement: 'hard', source: 'task' }]);
 });
 
 test('completed workflow nodes store run-internal cache metadata and recovery summary', () => {
@@ -146,22 +154,83 @@ test('completed workflow nodes store run-internal cache metadata and recovery su
 
   const workerDone = hub.handleWorkflowNodeResult({
     workflowRunId: started.workflowRun.id,
-    nodeId: 'po-draft-task-plan',
+    nodeId: 'worker-produce-deliverable',
     attempt: started.dispatches[0].attempt,
     handoffId: started.dispatches[0].handoffId,
-    fromAgent: 'xiaok-po',
+    fromAgent: 'xiaok-worker',
     output: { summary: '已拆解任务工作流', evidenceRefs: [`task:${taskId}`] },
     now: 1770000002000,
   });
 
   assert.equal(workerDone.ok, true);
-  const node = workerDone.workflowRun.nodes.find(item => item.id === 'po-draft-task-plan');
+  const node = workerDone.workflowRun.nodes.find(item => item.id === 'worker-produce-deliverable');
   assert.equal(node.cache.status, 'stored');
   assert.ok(node.cache.key.includes(started.workflowRun.id));
   assert.equal(workerDone.workflowRun.summary.cache.storedNodeCount, 1);
   assert.equal(workerDone.workflowRun.recovery.mode, 'resume_completed_nodes');
   assert.equal(workerDone.workflowRun.recovery.reusableNodeCount, 1);
   assert.equal(workerDone.workflowRun.recovery.nextAction, 'resume_workflow');
+});
+
+test('passed task workflow submits the reviewed deliverable to the source task', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-task-workflow-submit');
+  const task = hub.getBoard('proj-task-workflow-submit').getAllTasks()[0];
+  task.executionStrategyOverride = 'workflow';
+  task.requiredOutputs = [{ type: 'markdown', enforcement: 'hard' }];
+
+  const dispatched = hub.handleRequestDispatch('proj-task-workflow-submit', 'xiaok-po');
+  assert.equal(dispatched.ok, true);
+  assert.deepEqual(dispatched.workflowDispatched, [task.id]);
+  assert.equal(dispatched.workflowRuns.length, 1);
+  assert.equal(dispatched.workflowNodeDispatches.length, 1);
+  assert.equal(dispatched.workflowNodeDispatches[0].nodeId, 'worker-produce-deliverable');
+
+  const workflowRun = dispatched.workflowRuns[0];
+  const deliverablePath = join(mkdtempSync(join(tmpdir(), 'kswarm-workflow-deliverable-')), 'final.md');
+  writeFileSync(deliverablePath, '# 客户分析报告\n\n这是 workflow worker 产出的最终交付物。\n');
+
+  const firstDispatch = dispatched.workflowRuns[0].nodes.find(node => node.status === 'running');
+  const workerDone = hub.handleWorkflowNodeResult({
+    workflowRunId: workflowRun.id,
+    nodeId: firstDispatch.id,
+    attempt: firstDispatch.attempt,
+    handoffId: firstDispatch.runtime.handoffId,
+    fromAgent: firstDispatch.assignedAgent,
+    output: {
+      summary: '已生成客户分析报告最终交付物。',
+      artifacts: [{ path: deliverablePath, kind: 'markdown', label: 'final.md' }],
+      workFolder: deliverablePath.replace(/\/final\.md$/, ''),
+      evidenceRefs: [`artifact:${deliverablePath}`],
+    },
+    now: 1770000002000,
+  });
+  assert.equal(workerDone.ok, true);
+
+  const reviewerDispatch = workerDone.dispatches[0];
+  const reviewed = hub.handleWorkflowNodeReview({
+    workflowRunId: workflowRun.id,
+    nodeId: reviewerDispatch.nodeId,
+    attempt: reviewerDispatch.attempt,
+    handoffId: reviewerDispatch.handoffId,
+    fromAgent: reviewerDispatch.targetParticipantId,
+    reviewDecision: {
+      status: 'passed',
+      reason: '交付物文件存在，且 summary 与任务目标一致。',
+      evidenceRefs: [`artifact:${deliverablePath}`],
+    },
+    output: { summary: '复核通过。' },
+    now: 1770000003000,
+  });
+
+  assert.equal(reviewed.ok, true);
+  assert.equal(reviewed.workflowRun.status, 'completed');
+  const submittedTask = hub.getBoard('proj-task-workflow-submit').getTask(task.id);
+  assert.equal(submittedTask.status, 'submitted');
+  assert.equal(submittedTask.activeRunId, null);
+  assert.equal(submittedTask.result.artifacts[0].path, deliverablePath);
+  assert.equal(submittedTask.result.provenance.workflowRunId, workflowRun.id);
+  assert.equal(submittedTask.result.provenance.runtimeSource, 'kswarm-workflow');
 });
 
 let passed = 0;

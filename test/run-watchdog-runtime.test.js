@@ -142,6 +142,26 @@ test('recent artifact activity suppresses no-output warning', () => {
   assert.deepEqual(actions, []);
 });
 
+test('workflow-owned task is not marked stalled by runtime watchdog', () => {
+  const actions = planStalledRunActions({
+    projectId: 'proj',
+    tasks: [{
+      id: 'item-1',
+      status: 'dispatched',
+      assignedAgent: 'xiaok-worker',
+      assignedExecutor: 'workflow',
+      activeRunId: 'workflow-wf-proj-po-generated-task-workflow-1',
+      runLease: null,
+      updatedAt: now - 180_000,
+      createdAt: now - 240_000,
+    }],
+    now,
+    heartbeatTimeoutMs: 60_000,
+  });
+
+  assert.deepEqual(actions, []);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

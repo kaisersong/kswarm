@@ -9,6 +9,7 @@ import {
   buildTaskAliases,
   isGlobalTaskId,
   makeTaskId,
+  normalizeExistingTask,
   normalizeLocalTaskId,
   normalizeTasksForProject,
   parseTaskId,
@@ -49,6 +50,15 @@ test('normalizeTasksForProject globalizes local IDs', () => {
   assert.equal(result.tasks[0].id, 'proj-a__item-1');
   assert.equal(result.tasks[0].localTaskId, 'item-1');
   assert.equal(result.tasks[0].legacyTaskId, 'item-1');
+});
+
+test('normalizeTasksForProject treats legacy assignee as assignedAgent', () => {
+  const result = normalizeTasksForProject('proj-a', [
+    { id: 'item-1', title: 'Task 1', assignee: 'xiaok-worker' },
+  ]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.tasks[0].assignedAgent, 'xiaok-worker');
 });
 
 test('normalizeTasksForProject ignores metadata-only plan rows', () => {
@@ -192,6 +202,17 @@ test('restoreTaskBoard preserves description-only persisted tasks', () => {
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].id, 'proj-a__item-1');
   assert.equal(tasks[0].description, 'Description-only task that can still be executed');
+});
+
+test('normalizeExistingTask backfills assignedAgent from persisted assignee', () => {
+  const task = normalizeExistingTask('proj-a', {
+    id: 'item-1',
+    title: 'Persisted legacy task',
+    assignee: 'xiaok-worker',
+    status: 'pending',
+  });
+
+  assert.equal(task.assignedAgent, 'xiaok-worker');
 });
 
 test('restoreTaskBoard expands persisted phase dependency refs', () => {

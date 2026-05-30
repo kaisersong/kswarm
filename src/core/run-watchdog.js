@@ -12,6 +12,7 @@ export function planStalledRunActions({
 
   for (const task of tasks) {
     if (!ACTIVE_STATUSES.has(task.status)) continue;
+    if (isWorkflowOwnedTask(task)) continue;
     const runId = task.activeRunId || task.runLease?.runId;
     if (!runId) continue;
 
@@ -57,4 +58,12 @@ export function planStalledRunActions({
 function latestTimestamp(...values) {
   const timestamps = values.filter(value => typeof value === 'number' && Number.isFinite(value));
   return timestamps.length > 0 ? Math.max(...timestamps) : null;
+}
+
+function isWorkflowOwnedTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (task.assignedExecutor === 'workflow') return true;
+  if (task.execution?.strategy === 'workflow') return true;
+  const runId = task.activeRunId || task.runLease?.runId || '';
+  return typeof runId === 'string' && runId.startsWith('workflow-');
 }

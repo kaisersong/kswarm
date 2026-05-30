@@ -109,6 +109,19 @@ test('resets expired active runs with no durable artifact to pending', () => {
   assert.equal(result.actions[0].reason, 'lease_expired');
 });
 
+test('does not recover workflow-owned source tasks through normal task recovery', () => {
+  const task = makeTask({
+    status: 'dispatched',
+    assignedExecutor: 'workflow',
+    activeRunId: 'workflow-wf-proj-recovery-po-generated-task-workflow-1',
+    runLease: null,
+    updatedAt: 1_000,
+  });
+  const result = plan({ tasks: [task], journals: [], onlineAgents: ['worker'], now: 30_000 });
+
+  assert.deepEqual(result.actions, []);
+});
+
 test('notifies PO when a submitted task has not been reviewed', () => {
   const task = makeTask({
     status: 'submitted',

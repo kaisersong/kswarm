@@ -62,7 +62,7 @@ import {
 import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
 import { canSpawnAutoWorkerForTask } from '../core/runtime-execution-boundary.js';
 import { createBrokerTaskRequest } from './broker-task-request.js';
-import { normalizeProjectAgentSelection } from '../core/agent-selection.js';
+import { normalizeProjectAgentSelection, reconcileProjectAgentSelectionWithEffectiveAgents } from '../core/agent-selection.js';
 import { getEffectiveAgentConcurrency } from '../core/effective-agent-concurrency.js';
 import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
 
@@ -167,6 +167,7 @@ function normalizePersistedProjectPoAgents() {
         reason: resolution.reason,
       });
     }
+    if (reconcileProjectAgentSelectionWithEffectiveAgents(project)) changed++;
   }
   if (changed > 0) hub.persistState();
 }
@@ -586,6 +587,7 @@ function runtimeCapacityByAgentId() {
 
 async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
   if (!project) return null;
+  reconcileProjectAgentSelectionWithEffectiveAgents(project);
   await refreshBrokerOnlineAgentIds();
   const selected = selectedAgentIdsForPreparation(project);
   const agents = listAgentProfilesForRouting();
@@ -1935,10 +1937,11 @@ async function handleRequest(req, res) {
         if (effectivePassed) {
           await refreshBrokerOnlineAgentIds();
           const dispatchResult = hub.handleRequestDispatch(projectId, fromAgent);
-          if (dispatchResult.ok && dispatchResult.dispatched.length > 0) {
-            log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched });
-            broadcast({ type: 'tasks_dispatched', projectId, dispatched: dispatchResult.dispatched });
+          if (dispatchResult.ok && (dispatchResult.dispatched.length > 0 || dispatchResult.workflowNodeDispatches?.length > 0)) {
+            log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
+            broadcast({ type: 'tasks_dispatched', projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
             await sendBrokerRequestTasks(projectId, dispatchResult.dispatched);
+            await sendWorkflowNodeHandoffs(projectId, dispatchResult.workflowNodeDispatches || []);
           }
         }
 
@@ -1946,6 +1949,7 @@ async function handleRequest(req, res) {
         if (result.rework && result.dispatch?.ok && (result.dispatched || []).length > 0) {
           broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
           await sendBrokerRequestTasks(projectId, result.dispatched || []);
+          await sendWorkflowNodeHandoffs(projectId, result.dispatch.workflowNodeDispatches || []);
         } else if (result.rework && brokerClient && brokerClient.isConnected()) {
           const board = hub.getBoard(projectId);
           const task = board?.getTask(taskId);
@@ -2191,10 +2195,11 @@ async function handleRequest(req, res) {
       await refreshBrokerOnlineAgentIds();
       const result = hub.handleRequestDispatch(projectId, body.fromAgent);
       if (result.ok) {
-        log('info', `Dispatched tasks for project ${projectId}`, { dispatched: result.dispatched });
-        broadcast({ type: 'tasks_dispatched', projectId, dispatched: result.dispatched });
+        log('info', `Dispatched tasks for project ${projectId}`, { dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
+        broadcast({ type: 'tasks_dispatched', projectId, dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
 
         await sendBrokerRequestTasks(projectId, result.dispatched || []);
+        await sendWorkflowNodeHandoffs(projectId, result.workflowNodeDispatches || []);
       }
       return json(res, result);
     }

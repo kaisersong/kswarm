@@ -38,6 +38,7 @@ import {
   AGENT_REVIEW_SMOKE_WORKFLOW_ID,
   PO_GENERATED_TASK_WORKFLOW_ID,
   PROJECT_DIAGNOSE_WORKFLOW_ID,
+  TASK_WORKFLOW_DELIVERABLE_NODE_ID,
   createAgentReviewSmokeWorkflowRun,
   createAgentReviewSmokeWorkflowSpec,
   createPoGeneratedTaskWorkflowRun,
@@ -65,6 +66,7 @@ import {
 } from './quality-rules.js';
 
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
+const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
 
 export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
   const projects = new Map();
@@ -596,6 +598,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       : dispatchPlan.dispatchedTasks;
     const dispatched = [];
     const workflowDispatched = [];
+    const workflowNodeDispatches = [];
     const workflowRunsStarted = [];
     const skipped = [...(dispatchPlan.skipped || [])];
 
@@ -635,6 +638,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         }
         workflowDispatched.push(task.id);
         workflowRunsStarted.push(workflowResult.workflowRun);
+        workflowNodeDispatches.push(...(workflowResult.dispatches || []));
         continue;
       }
       let assignedRuntimeInstance = task.assignedRuntimeInstance || null;
@@ -700,6 +704,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       ok: true,
       dispatched,
       workflowDispatched,
+      workflowNodeDispatches,
       workflowRuns: workflowRunsStarted,
       skipped,
       blocked: dispatchPlan.blocked,
@@ -1576,7 +1581,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       source = 'builtin-smoke';
     } else if (workflowId === PO_GENERATED_TASK_WORKFLOW_ID) {
       if (!sourceTask.task) return { ok: false, error: 'workflow_task_required' };
-      spec = createPoGeneratedTaskWorkflowSpec({ project, task: sourceTask.task, poAgent: reviewerAgent, reviewerAgent });
+      spec = createPoGeneratedTaskWorkflowSpec({
+        project,
+        task: sourceTask.task,
+        workerAgent: sourceTask.task.assignedAgent || workerAgent,
+        reviewerAgent,
+      });
       source = 'po_generated';
     } else {
       return { ok: false, error: 'workflow_template_not_found' };
@@ -1584,7 +1594,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
     const validation = validateWorkflowSpec(spec, {
       policy: policy || defaultWorkflowPolicyFor(spec),
-      capabilities: ['project_diagnosis', 'review_gate'],
+      capabilities: WORKFLOW_AGENT_CAPABILITIES,
     });
     if (!validation.ok) return validation;
     const budgetGate = buildWorkflowBudgetGate(spec, policy || defaultWorkflowPolicyFor(spec));
@@ -1688,7 +1698,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
     const hardBudget = validateWorkflowSpec(proposal.spec, {
       policy: policy || proposal.budgetGate?.hardLimits || defaultWorkflowPolicyFor(proposal.spec),
-      capabilities: ['project_diagnosis', 'review_gate'],
+      capabilities: WORKFLOW_AGENT_CAPABILITIES,
     });
     if (!hardBudget.ok) return hardBudget;
 
@@ -1744,18 +1754,19 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
     if (proposal.workflowId === PO_GENERATED_TASK_WORKFLOW_ID) {
       if (!sourceTask.task) return { ok: false, error: 'workflow_task_required' };
+      const workerAgent = sourceTask.task.assignedAgent || (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
       let workflowRun = createPoGeneratedTaskWorkflowRun({
         project,
         task: sourceTask.task,
         tasks: board.getAllTasks(),
-        poAgent: project.poAgent || 'xiaok-po',
+        workerAgent,
         reviewerAgent: project.poAgent || 'xiaok-po',
         requestedBy: approvedBy,
         now,
       });
       workflowRun = applyProposalMetadataToRun(workflowRun, approvedProposal, { now });
-      const dispatched = dispatchWorkflowNode(workflowRun, 'po-draft-task-plan', {
-        assignedAgent: project.poAgent || 'xiaok-po',
+      const dispatched = dispatchWorkflowNode(workflowRun, TASK_WORKFLOW_DELIVERABLE_NODE_ID, {
+        assignedAgent: workerAgent,
         now,
       });
       workflowRun = dispatched.workflowRun;
@@ -1921,12 +1932,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       nodeId: 'reduce-review-gate',
       decision: sanitizedDecision,
     }, { now });
+    const finalization = maybeSubmitTaskWorkflowDeliverable(workflowRun, { now });
+    workflowRun = finalization.workflowRun;
     workflowRuns.set(workflowRun.id, workflowRun);
     eventLog.emit('workflow.run.gate_completed', {
       projectId: workflowRun.projectId,
       workflowRunId,
       status: workflowRun.status,
       decision: sanitizedDecision.status,
+      taskSubmissionStatus: finalization.submission?.ok ? 'submitted' : (finalization.submission?.error || null),
     });
     return { ok: true, workflowRun, dispatches: [] };
   }
@@ -2006,13 +2020,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (!node || !['ready', 'pending'].includes(node.status)) return { workflowRun, dispatches: [] };
     const attempt = (node.attempt || 0) + 1;
     const handoffId = `wfhd-${workflowRun.id}-${nodeId}-${attempt}`;
+    const nodeInput = enrichWorkflowNodeInput(workflowRun, input || node.input || null);
     const next = applyWorkflowEvent(workflowRun, {
       type: 'node_dispatched',
       nodeId,
       assignedAgent: assignedAgent || node.assignedAgent || null,
       attempt,
       handoffId,
-      input: input || node.input || null,
+      input: nodeInput,
     }, { now });
     const updatedNode = next.nodes.find(item => item.id === nodeId);
     return {
@@ -2029,6 +2044,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         handoffId,
         input: updatedNode?.input || null,
       }],
+    };
+  }
+  function enrichWorkflowNodeInput(workflowRun, input = null) {
+    const base = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : { value: input };
+    return {
+      ...base,
+      workflowRunId: workflowRun.id,
+      workflowRun: {
+        id: workflowRun.id,
+        workflowId: workflowRun.workflowId,
+        projectId: workflowRun.projectId,
+        taskId: workflowRun.scope?.taskId || null,
+      },
+      sourceTask: base.sourceTask || workflowRun.sourceTask || null,
     };
   }
   function validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId, allowRunningOnly = true } = {}) {
@@ -2130,6 +2159,155 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const dependencyId = Array.isArray(node.dependsOn) ? node.dependsOn[0] : null;
     if (!dependencyId) return null;
     return workflowRun.nodes.find(item => item.id === dependencyId)?.output || null;
+  }
+  function maybeSubmitTaskWorkflowDeliverable(workflowRun, { now = Date.now() } = {}) {
+    if (
+      workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID ||
+      workflowRun.status !== 'completed' ||
+      workflowRun.gateDecision?.status !== 'passed' ||
+      !workflowRun.scope?.taskId
+    ) {
+      return { workflowRun, submission: null };
+    }
+
+    const board = boards.get(workflowRun.projectId);
+    const task = board?.getTask(workflowRun.scope.taskId);
+    if (!board || !task) {
+      return {
+        workflowRun: markWorkflowTaskSubmissionBlocked(workflowRun, 'task_not_found', { now }),
+        submission: { ok: false, error: 'task_not_found' },
+      };
+    }
+    if (task.status === 'submitted' || task.status === 'done') {
+      return {
+        workflowRun: {
+          ...workflowRun,
+          taskSubmission: {
+            status: 'already_submitted',
+            taskId: task.id,
+            submittedAt: task.updatedAt || now,
+            runId: `workflow-${workflowRun.id}`,
+          },
+        },
+        submission: { ok: true, alreadySubmitted: true },
+      };
+    }
+
+    const producerNode = workflowRun.nodes.find(item => item.id === TASK_WORKFLOW_DELIVERABLE_NODE_ID)
+      || workflowRun.nodes.find(item => item.kind === 'agent_task' && item.status === 'completed');
+    if (!producerNode?.output) {
+      return {
+        workflowRun: markWorkflowTaskSubmissionBlocked(workflowRun, 'worker_deliverable_missing', { now }),
+        submission: { ok: false, error: 'worker_deliverable_missing' },
+      };
+    }
+
+    const workerAgent = task.assignedAgent || producerNode.producerAgent || producerNode.assignedAgent || null;
+    const runId = `workflow-${workflowRun.id}`;
+    const result = buildWorkflowTaskSubmissionResult({ workflowRun, task, producerNode });
+    const readyForSubmission = ensureWorkflowTaskSubmissionState(workflowRun.projectId, task, workerAgent, runId);
+    if (!readyForSubmission.ok) {
+      return {
+        workflowRun: markWorkflowTaskSubmissionBlocked(workflowRun, readyForSubmission.error || 'task_submission_state_failed', { now }),
+        submission: readyForSubmission,
+      };
+    }
+    const submission = handleSubmitResult(workflowRun.projectId, task.id, result, workerAgent, runId);
+    if (!submission.ok) {
+      eventLog.emit('task.workflow_submission_failed', {
+        projectId: workflowRun.projectId,
+        taskId: task.id,
+        workflowRunId: workflowRun.id,
+        error: submission.error || 'task_submission_failed',
+        failureClass: submission.failureClass || null,
+      });
+      return {
+        workflowRun: markWorkflowTaskSubmissionBlocked(workflowRun, submission.error || 'task_submission_failed', { now }),
+        submission,
+      };
+    }
+
+    return {
+      workflowRun: {
+        ...workflowRun,
+        taskSubmission: {
+          status: 'submitted',
+          taskId: task.id,
+          submittedAt: now,
+          runId,
+        },
+      },
+      submission,
+    };
+  }
+  function buildWorkflowTaskSubmissionResult({ workflowRun, task, producerNode }) {
+    const output = producerNode.output && typeof producerNode.output === 'object' ? producerNode.output : {};
+    const summary = readWorkflowString(output.summary)
+      || readWorkflowString(output.text)
+      || `工作流完成任务：${task.title || task.id}`;
+    const workFolder = readWorkflowString(output.workFolder) || readWorkflowString(output.workspacePath);
+    const artifactManifest = Array.isArray(output.artifactManifest) ? output.artifactManifest : [];
+    return {
+      summary,
+      artifacts: Array.isArray(output.artifacts) ? output.artifacts : [],
+      ...(artifactManifest.length > 0 ? { artifactManifest } : {}),
+      ...(workFolder ? { workFolder, workspacePath: workFolder } : {}),
+      evidenceRefs: readWorkflowStringArray(output.evidenceRefs),
+      provenance: {
+        runtimeSource: 'kswarm-workflow',
+        workflowRunId: workflowRun.id,
+        workflowId: workflowRun.workflowId,
+        producerNodeId: producerNode.id,
+        producingAgent: producerNode.producerAgent || producerNode.assignedAgent || task.assignedAgent || null,
+      },
+    };
+  }
+  function ensureWorkflowTaskSubmissionState(projectId, task, workerAgent, runId) {
+    let current = boards.get(projectId)?.getTask(task.id);
+    if (!current) return { ok: false, error: 'task_not_found' };
+    if (current.status === 'submitted' || current.status === 'done') return { ok: true };
+    if (current.status === 'dispatched') {
+      const accepted = handleAcceptTask(projectId, current.id, workerAgent, runId);
+      if (!accepted.ok && !accepted.alreadyAccepted) return accepted;
+      current = boards.get(projectId)?.getTask(task.id);
+    }
+    if (current?.status === 'accepted') {
+      const progressed = handleProgress(projectId, current.id, 'started', workerAgent, runId);
+      if (!progressed.ok && !progressed.alreadyInProgress) return progressed;
+      current = boards.get(projectId)?.getTask(task.id);
+    }
+    if (current?.status !== 'in_progress' && current?.status !== 'submitted') {
+      return { ok: false, error: `cannot_submit_workflow_task_from_status:${current?.status || 'missing'}` };
+    }
+    return { ok: true };
+  }
+  function markWorkflowTaskSubmissionBlocked(workflowRun, reason, { now = Date.now() } = {}) {
+    return {
+      ...workflowRun,
+      status: 'blocked',
+      completedAt: now,
+      gateDecision: {
+        status: 'blocked',
+        reason: `task_submission_failed:${reason}`,
+        evidenceRefs: workflowRun.gateDecision?.evidenceRefs || [],
+      },
+      taskSubmission: {
+        status: 'failed',
+        taskId: workflowRun.scope?.taskId || null,
+        failedAt: now,
+        reason,
+      },
+      summary: {
+        ...(workflowRun.summary || {}),
+        primaryMessage: 'Task workflow submission blocked',
+      },
+    };
+  }
+  function readWorkflowString(value) {
+    return typeof value === 'string' ? value.trim() : '';
+  }
+  function readWorkflowStringArray(value) {
+    return Array.isArray(value) ? value.map(item => readWorkflowString(item)).filter(Boolean) : [];
   }
   function emitWorkflowDispatchEvents(projectId, dispatches = []) {
     for (const dispatch of dispatches) {

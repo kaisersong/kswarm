@@ -53,6 +53,7 @@ export function planProjectRecovery({
   for (const task of tasks) {
     if (!task) continue;
     if (task.status === 'done' || task.status === 'cancelled') continue;
+    if (isWorkflowOwnedTask(task)) continue;
 
     const runId = task.activeRunId || task.runLease?.runId || null;
     const journal = runId ? journalByRun.get(journalKey(task.id, runId)) : null;
@@ -120,4 +121,12 @@ function hasCurrentReviewResult(task = {}) {
     if (submittedAt && (!reviewedAt || reviewedAt < submittedAt)) return false;
   }
   return true;
+}
+
+function isWorkflowOwnedTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (task.assignedExecutor === 'workflow') return true;
+  if (task.execution?.strategy === 'workflow') return true;
+  const runId = task.activeRunId || task.runLease?.runId || '';
+  return typeof runId === 'string' && runId.startsWith('workflow-');
 }

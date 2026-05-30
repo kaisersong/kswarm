@@ -26,3 +26,23 @@ export function normalizeProjectAgentSelection({ poAgent, members = [], agentSel
         })),
   };
 }
+
+export function reconcileProjectAgentSelectionWithEffectiveAgents(project, { defaultSource = 'system_migration' } = {}) {
+  if (!project || typeof project !== 'object') return false;
+
+  const selection = normalizeProjectAgentSelection({
+    poAgent: project.poAgent,
+    members: project.members || [],
+    agentSelection: project.agentSelection || null,
+    defaultSource,
+  });
+
+  let changed = JSON.stringify(selection) !== JSON.stringify(project.agentSelection || null);
+  if (project.poAgent && selection.poAgent?.agentId !== project.poAgent) {
+    selection.poAgent = { agentId: project.poAgent, source: normalizeSelectionSource(defaultSource, 'system_migration') };
+    changed = true;
+  }
+
+  project.agentSelection = selection;
+  return changed;
+}
