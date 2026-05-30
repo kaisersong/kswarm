@@ -13,6 +13,7 @@
  */
 
 import { createTaskBoard, restoreTaskBoard } from './task-board.js';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
@@ -33,7 +34,24 @@ import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
 import { applyWorkflowEvent } from './workflow-run.js';
-import { createAgentReviewSmokeWorkflowRun, createProjectDiagnoseWorkflowRun } from './workflow-builtins.js';
+import {
+  AGENT_REVIEW_SMOKE_WORKFLOW_ID,
+  PO_GENERATED_TASK_WORKFLOW_ID,
+  PROJECT_DIAGNOSE_WORKFLOW_ID,
+  createAgentReviewSmokeWorkflowRun,
+  createAgentReviewSmokeWorkflowSpec,
+  createPoGeneratedTaskWorkflowRun,
+  createPoGeneratedTaskWorkflowSpec,
+  createProjectDiagnoseWorkflowRun,
+  createProjectDiagnoseWorkflowSpec,
+} from './workflow-builtins.js';
+import {
+  sanitizeWorkflowGateDecision,
+  sanitizeWorkflowNodeOutput,
+  validateWorkflowSpec,
+  validateWorkflowGateDecision,
+} from './workflow-spec.js';
+import { applyWorkflowProgressBatch } from './workflow-progress.js';
 import {
   appendQualityPlanningGuidance,
   buildQualityPromptExcerpt,
@@ -46,6 +64,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   const projects = new Map();
   const boards = new Map();
   const workflowRuns = new Map();
+  const workflowProposals = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const persistence = typeof dataDir === 'string' ? createPersistence(dataDir) : null;
 
@@ -62,6 +81,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       for (const run of (saved.workflowRuns || [])) {
         if (run?.id) workflowRuns.set(run.id, run);
       }
+      for (const proposal of (saved.workflowProposals || [])) {
+        if (proposal?.id) workflowProposals.set(proposal.id, proposal);
+      }
       if (!silent) console.log(`[hub] Restored ${saved.projects.length} projects from disk`);
     }
   }
@@ -75,6 +97,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         tasks: board.getAllTasks(),
       })),
       workflowRuns: [...workflowRuns.values()],
+      workflowProposals: [...workflowProposals.values()],
       humanActions,
     }));
   }
@@ -1412,6 +1435,223 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       dispatchPlan,
     });
   }
+  function createWorkflowProposal(projectId, workflowId, { requestedBy = 'human', policy = null, taskId = null, now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+    const sourceTask = resolveWorkflowSourceTask(board, taskId);
+    if (!sourceTask.ok) return sourceTask;
+
+    const workerAgent = (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
+    const reviewerAgent = project.poAgent || 'xiaok-po';
+    let spec;
+    let source = 'builtin';
+    if (workflowId === PROJECT_DIAGNOSE_WORKFLOW_ID) {
+      spec = createProjectDiagnoseWorkflowSpec({ project });
+    } else if (workflowId === AGENT_REVIEW_SMOKE_WORKFLOW_ID) {
+      spec = createAgentReviewSmokeWorkflowSpec({ project, task: sourceTask.task, workerAgent, reviewerAgent });
+      source = 'builtin-smoke';
+    } else if (workflowId === PO_GENERATED_TASK_WORKFLOW_ID) {
+      if (!sourceTask.task) return { ok: false, error: 'workflow_task_required' };
+      spec = createPoGeneratedTaskWorkflowSpec({ project, task: sourceTask.task, poAgent: reviewerAgent, reviewerAgent });
+      source = 'po_generated';
+    } else {
+      return { ok: false, error: 'workflow_template_not_found' };
+    }
+
+    const validation = validateWorkflowSpec(spec, {
+      policy: policy || defaultWorkflowPolicyFor(spec),
+      capabilities: ['project_diagnosis', 'review_gate'],
+    });
+    if (!validation.ok) return validation;
+    const budgetGate = buildWorkflowBudgetGate(spec, policy || defaultWorkflowPolicyFor(spec));
+
+    const workflowProposal = {
+      id: `wfp-${projectId}-${workflowId}-${now}`,
+      projectId,
+      workflowId,
+      strategy: 'workflow',
+      source,
+      scope: spec.scope,
+      sourceTask: sourceTask.task ? formatWorkflowSourceTask(sourceTask.task) : null,
+      title: spec.name,
+      description: spec.description,
+      goal: spec.description,
+      status: 'pending',
+      requestedBy,
+      createdAt: now,
+      updatedAt: now,
+      specHash: hashWorkflowSpec(spec),
+      spec,
+      phases: spec.phases.map(phase => ({
+        id: phase.id,
+        title: phase.title,
+        nodes: phase.nodes.map(node => ({ id: node.id, title: node.title, kind: node.kind, required: node.required, dependsOn: node.dependsOn || [] })),
+      })),
+      budgets: spec.budgets,
+      budgetGate,
+      permissions: spec.permissions,
+      outputContract: spec.outputContract,
+      acceptanceRubric: spec.acceptanceRubric,
+      assumptions: spec.assumptions || [],
+      approval: {
+        required: true,
+        status: 'pending',
+        budget: spec.budgets,
+        approvedBy: null,
+        decidedAt: null,
+      },
+    };
+    workflowProposals.set(workflowProposal.id, workflowProposal);
+    eventLog.emit('workflow.proposal.created', {
+      projectId,
+      workflowProposalId: workflowProposal.id,
+      workflowId,
+      requestedBy,
+    });
+    return { ok: true, workflowProposal, dispatches: [] };
+  }
+
+  function cancelWorkflowProposal(workflowProposalId, { reason = 'human_cancelled', now = Date.now() } = {}) {
+    const proposal = workflowProposals.get(workflowProposalId);
+    if (!proposal) return { ok: false, error: 'workflow_proposal_not_found' };
+    if (proposal.approval?.status !== 'pending') return { ok: false, error: 'workflow_proposal_not_pending' };
+    const cancelled = {
+      ...proposal,
+      status: 'cancelled',
+      updatedAt: now,
+      approval: {
+        ...proposal.approval,
+        status: 'rejected',
+        decidedAt: now,
+        rejectionReason: reason,
+      },
+    };
+    workflowProposals.set(cancelled.id, cancelled);
+    eventLog.emit('workflow.proposal.cancelled', {
+      projectId: cancelled.projectId,
+      workflowProposalId,
+      workflowId: cancelled.workflowId,
+      reason,
+    });
+    return { ok: true, workflowProposal: cancelled };
+  }
+
+  function startWorkflowRunFromProposal(workflowProposalId, {
+    approvedBy = 'human',
+    now = Date.now(),
+    projectId = null,
+    workflowId = null,
+    taskId = null,
+    policy = null,
+  } = {}) {
+    const proposal = workflowProposals.get(workflowProposalId);
+    if (!proposal) return { ok: false, error: 'workflow_proposal_not_found' };
+    if (proposal.approval?.status !== 'pending') return { ok: false, error: 'workflow_proposal_not_pending' };
+    if (projectId && proposal.projectId !== projectId) {
+      return { ok: false, error: 'workflow_proposal_project_mismatch' };
+    }
+    if (workflowId && proposal.workflowId !== workflowId) {
+      return { ok: false, error: 'workflow_proposal_workflow_mismatch' };
+    }
+    if (taskId && proposal.scope?.taskId && proposal.scope.taskId !== taskId) {
+      return { ok: false, error: 'workflow_proposal_task_mismatch' };
+    }
+    const project = projects.get(proposal.projectId);
+    const board = boards.get(proposal.projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+    const sourceTask = resolveWorkflowSourceTask(board, proposal.scope?.taskId || taskId || null);
+    if (!sourceTask.ok) return sourceTask;
+
+    const hardBudget = validateWorkflowSpec(proposal.spec, {
+      policy: policy || proposal.budgetGate?.hardLimits || defaultWorkflowPolicyFor(proposal.spec),
+      capabilities: ['project_diagnosis', 'review_gate'],
+    });
+    if (!hardBudget.ok) return hardBudget;
+
+    const approvedProposal = {
+      ...proposal,
+      status: 'approved',
+      updatedAt: now,
+      approval: {
+        ...proposal.approval,
+        status: 'approved',
+        approvedBy,
+        decidedAt: now,
+      },
+    };
+    workflowProposals.set(approvedProposal.id, approvedProposal);
+
+    if (proposal.workflowId === PROJECT_DIAGNOSE_WORKFLOW_ID) {
+      const result = startProjectDiagnoseWorkflow(proposal.projectId, { requestedBy: approvedBy, now });
+      if (!result.ok) return result;
+      const workflowRun = applyProposalMetadataToRun(result.workflowRun, approvedProposal, { now });
+      workflowRuns.set(workflowRun.id, workflowRun);
+      return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: [] };
+    }
+
+    if (proposal.workflowId === AGENT_REVIEW_SMOKE_WORKFLOW_ID) {
+      const workerAgent = (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
+      let workflowRun = createAgentReviewSmokeWorkflowRun({
+        project,
+        tasks: board.getAllTasks(),
+        task: sourceTask.task,
+        workerAgent,
+        reviewerAgent: project.poAgent || 'xiaok-po',
+        requestedBy: approvedBy,
+        now,
+      });
+      workflowRun = applyProposalMetadataToRun(workflowRun, approvedProposal, { now });
+      const dispatched = dispatchWorkflowNode(workflowRun, 'worker-diagnose-project', {
+        assignedAgent: workerAgent,
+        now,
+      });
+      workflowRun = dispatched.workflowRun;
+      workflowRuns.set(workflowRun.id, workflowRun);
+      eventLog.emit('workflow.run.started', {
+        projectId: proposal.projectId,
+        workflowRunId: workflowRun.id,
+        workflowId: workflowRun.workflowId,
+        requestedBy: approvedBy,
+        workflowProposalId,
+      });
+      emitWorkflowDispatchEvents(proposal.projectId, dispatched.dispatches);
+      return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: dispatched.dispatches };
+    }
+
+    if (proposal.workflowId === PO_GENERATED_TASK_WORKFLOW_ID) {
+      if (!sourceTask.task) return { ok: false, error: 'workflow_task_required' };
+      let workflowRun = createPoGeneratedTaskWorkflowRun({
+        project,
+        task: sourceTask.task,
+        tasks: board.getAllTasks(),
+        poAgent: project.poAgent || 'xiaok-po',
+        reviewerAgent: project.poAgent || 'xiaok-po',
+        requestedBy: approvedBy,
+        now,
+      });
+      workflowRun = applyProposalMetadataToRun(workflowRun, approvedProposal, { now });
+      const dispatched = dispatchWorkflowNode(workflowRun, 'po-draft-task-plan', {
+        assignedAgent: project.poAgent || 'xiaok-po',
+        now,
+      });
+      workflowRun = dispatched.workflowRun;
+      workflowRuns.set(workflowRun.id, workflowRun);
+      eventLog.emit('workflow.run.started', {
+        projectId: proposal.projectId,
+        taskId: sourceTask.task.id,
+        workflowRunId: workflowRun.id,
+        workflowId: workflowRun.workflowId,
+        requestedBy: approvedBy,
+        workflowProposalId,
+      });
+      emitWorkflowDispatchEvents(proposal.projectId, dispatched.dispatches);
+      return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: dispatched.dispatches };
+    }
+
+    return { ok: false, error: 'workflow_template_not_found' };
+  }
+
   function startProjectDiagnoseWorkflow(projectId, { requestedBy = 'human', now = Date.now() } = {}) {
     const project = projects.get(projectId);
     const board = boards.get(projectId);
@@ -1475,12 +1715,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   function handleWorkflowNodeResult({ workflowRunId, nodeId, attempt, handoffId, fromAgent, output, now = Date.now() } = {}) {
     const checked = validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId });
     if (!checked.ok) return checked;
+    const sanitizedOutput = sanitizeWorkflowNodeOutput(output && typeof output === 'object' ? output : { value: output });
 
     let workflowRun = applyWorkflowEvent(checked.workflowRun, {
       type: 'node_completed',
       nodeId,
       output: {
-        ...(output && typeof output === 'object' ? output : { value: output }),
+        ...sanitizedOutput,
         producerAgent: fromAgent || checked.node.assignedAgent || null,
         producedAt: now,
       },
@@ -1490,10 +1731,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const reviewer = workflowRun.nodes.find(node => node.id === 'reviewer-adversarial-check');
     let dispatches = [];
     if (reviewer?.status === 'ready') {
+      const dependencyOutput = getFirstDependencyOutput(workflowRun, reviewer);
       const dispatched = dispatchWorkflowNode(workflowRun, reviewer.id, {
         assignedAgent: reviewer.assignedAgent || 'xiaok-po',
         input: {
-          workerOutput: workflowRun.nodes.find(node => node.id === 'worker-diagnose-project')?.output || null,
+          workerOutput: dependencyOutput,
         },
         now,
       });
@@ -1542,25 +1784,26 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       });
       return { ok: true, workflowRun: blocked, dispatches: [] };
     }
+    const sanitizedDecision = decisionValidation.decision;
 
     let workflowRun = applyWorkflowEvent(checked.workflowRun, {
       type: 'node_reviewed',
       nodeId,
-      reviewDecision,
-      output,
+      reviewDecision: sanitizedDecision,
+      output: sanitizeWorkflowNodeOutput(output),
       fromAgent,
     }, { now });
     workflowRun = applyWorkflowEvent(workflowRun, {
       type: 'gate_completed',
       nodeId: 'reduce-review-gate',
-      decision: reviewDecision,
+      decision: sanitizedDecision,
     }, { now });
     workflowRuns.set(workflowRun.id, workflowRun);
     eventLog.emit('workflow.run.gate_completed', {
       projectId: workflowRun.projectId,
       workflowRunId,
       status: workflowRun.status,
-      decision: reviewDecision.status,
+      decision: sanitizedDecision.status,
     });
     return { ok: true, workflowRun, dispatches: [] };
   }
@@ -1593,6 +1836,40 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     });
     return { ok: true, workflowRun: cancelled };
   }
+
+  function handleWorkflowProgressBatch(workflowRunId, batch, { now = Date.now() } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (!batch || typeof batch !== 'object') return { ok: false, error: 'workflow_progress_batch_required' };
+    if (batch.workflowRunId !== workflowRunId) return { ok: false, error: 'workflow_progress_run_mismatch' };
+    if (batch.projectId !== workflowRun.projectId) return { ok: false, error: 'workflow_progress_project_mismatch' };
+
+    const applied = applyWorkflowProgressBatch({
+      workflowRunId: workflowRun.id,
+      nodes: workflowRun.nodes,
+      progressState: workflowRun.progressState || null,
+    }, batch);
+    if (!applied.ok) return applied;
+    if (applied.duplicate) return { ok: true, duplicate: true, workflowRun };
+
+    const updated = {
+      ...workflowRun,
+      nodes: applied.snapshot.nodes,
+      progressState: applied.snapshot.progressState,
+      updatedAt: now,
+    };
+    workflowRuns.set(updated.id, updated);
+    eventLog.emit('workflow.progress.batch', {
+      projectId: updated.projectId,
+      workflowRunId: updated.id,
+      fromParticipantId: batch.fromParticipantId,
+      sequence: batch.sequence,
+      eventCount: Array.isArray(batch.events) ? batch.events.length : 0,
+      lastMaterialProgress: updated.progressState?.lastMaterialProgress || null,
+    });
+    return { ok: true, workflowRun: updated };
+  }
+
   function listProjectWorkflowRuns(projectId) {
     return [...workflowRuns.values()]
       .filter(run => run.projectId === projectId)
@@ -1643,11 +1920,93 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowRun, node };
   }
   function validateWorkflowReviewDecision(decision) {
-    if (!decision || typeof decision !== 'object') return { ok: false, error: 'review_decision_required' };
-    if (!['passed', 'needs_rework', 'blocked'].includes(decision.status)) return { ok: false, error: 'review_decision_status_invalid' };
-    if (typeof decision.reason !== 'string' || !decision.reason.trim()) return { ok: false, error: 'review_decision_reason_required' };
-    if (decision.evidenceRefs !== undefined && !Array.isArray(decision.evidenceRefs)) return { ok: false, error: 'review_decision_evidence_refs_invalid' };
-    return { ok: true };
+    const result = validateWorkflowGateDecision(decision);
+    if (!result.ok) {
+      const error = result.error.replace(/^gate_/, 'review_');
+      return { ...result, error };
+    }
+    return { ok: true, decision: sanitizeWorkflowGateDecision(decision) };
+  }
+  function applyProposalMetadataToRun(workflowRun, proposal, { now = Date.now() } = {}) {
+    return {
+      ...workflowRun,
+      workflowProposalId: proposal.id,
+      specHash: proposal.specHash,
+      spec: proposal.spec,
+      scope: proposal.scope,
+      sourceTask: proposal.sourceTask,
+      budgets: proposal.budgets,
+      budgetGate: proposal.budgetGate,
+      permissions: proposal.permissions,
+      outputContract: proposal.outputContract,
+      acceptanceRubric: proposal.acceptanceRubric,
+      assumptions: proposal.assumptions || [],
+      approval: {
+        required: true,
+        status: 'approved',
+        budget: proposal.budgets,
+        approvedBy: proposal.approval?.approvedBy || null,
+        decidedAt: proposal.approval?.decidedAt || now,
+      },
+      updatedAt: now,
+    };
+  }
+  function defaultWorkflowPolicyFor(spec) {
+    return {
+      maxNodes: Math.max(1, flattenSpecNodeCount(spec)),
+      maxParallelism: Math.max(1, Number(spec.budgets?.maxParallelism || 1)),
+      maxAgents: Math.max(0, Number(spec.budgets?.maxAgents || 0)),
+      maxMinutes: Math.max(1, Number(spec.budgets?.maxMinutes || 1)),
+      maxTokens: Math.max(0, Number(spec.budgets?.maxTokens || 0)),
+    };
+  }
+  function flattenSpecNodeCount(spec) {
+    return (spec.phases || []).reduce((count, phase) => count + (Array.isArray(phase.nodes) ? phase.nodes.length : 0), 0);
+  }
+  function hashWorkflowSpec(spec) {
+    return createHash('sha256').update(JSON.stringify(spec)).digest('hex');
+  }
+  function buildWorkflowBudgetGate(spec, policy) {
+    return {
+      status: 'passed',
+      hardLimits: {
+        maxNodes: Number(policy?.maxNodes || flattenSpecNodeCount(spec)),
+        maxParallelism: Number(policy?.maxParallelism || spec.budgets?.maxParallelism || 1),
+        maxAgents: Number(policy?.maxAgents || spec.budgets?.maxAgents || 0),
+        maxMinutes: Number(policy?.maxMinutes || spec.budgets?.maxMinutes || 0),
+        maxTokens: Number(policy?.maxTokens || spec.budgets?.maxTokens || 0),
+      },
+      estimate: {
+        riskLevel: inferWorkflowBudgetRisk(spec),
+        reason: '估算只用于风险提示；KSwarm 在启动和 dispatch 前执行 hard limits。',
+      },
+    };
+  }
+  function inferWorkflowBudgetRisk(spec) {
+    const agents = Number(spec.budgets?.maxAgents || 0);
+    const tokens = Number(spec.budgets?.maxTokens || 0);
+    if (agents >= 8 || tokens >= 50_000) return 'high';
+    if (agents >= 2 || tokens >= 10_000) return 'medium';
+    return 'low';
+  }
+  function resolveWorkflowSourceTask(board, taskId) {
+    if (!taskId) return { ok: true, task: null };
+    const task = board.getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found', taskId };
+    return { ok: true, task };
+  }
+  function formatWorkflowSourceTask(task = {}) {
+    return {
+      id: task.id,
+      title: task.title || '',
+      status: task.status || '',
+      assignedAgent: task.assignedAgent || null,
+    };
+  }
+  function getFirstDependencyOutput(workflowRun, node) {
+    const dependencyId = Array.isArray(node.dependsOn) ? node.dependsOn[0] : null;
+    if (!dependencyId) return null;
+    return workflowRun.nodes.find(item => item.id === dependencyId)?.output || null;
   }
   function emitWorkflowDispatchEvents(projectId, dispatches = []) {
     for (const dispatch of dispatches) {
@@ -1694,11 +2053,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleTaskFail,
     handleContinueProject,
     handleResolveProjectIntervention,
+    createWorkflowProposal,
+    cancelWorkflowProposal,
+    startWorkflowRunFromProposal,
     startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow,
     handleWorkflowNodeResult,
     handleWorkflowNodeReview,
     handleWorkflowRuntimeUnavailable,
+    handleWorkflowProgressBatch,
     cancelWorkflowRun,
   };
 
@@ -1720,11 +2083,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getDispatchPlan,
     getProjectHealth,
     getProjectIntervention,
+    createWorkflowProposal: persisted.createWorkflowProposal,
+    cancelWorkflowProposal: persisted.cancelWorkflowProposal,
+    startWorkflowRunFromProposal: persisted.startWorkflowRunFromProposal,
     startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow: persisted.startAgentReviewSmokeWorkflow,
     handleWorkflowNodeResult: persisted.handleWorkflowNodeResult,
     handleWorkflowNodeReview: persisted.handleWorkflowNodeReview,
     handleWorkflowRuntimeUnavailable: persisted.handleWorkflowRuntimeUnavailable,
+    handleWorkflowProgressBatch: persisted.handleWorkflowProgressBatch,
     cancelWorkflowRun: persisted.cancelWorkflowRun,
     listProjectWorkflowRuns,
     getWorkflowRun,

@@ -68,6 +68,14 @@ import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
+const SERVICE_FEATURES = [
+  'dynamic_workflows',
+  'workflow_proposals',
+  'workflow_progress_batch',
+  'workflow_task_strategy',
+  'po_generated_workflow_proposals',
+  'workflow_budget_cache_recovery',
+];
 const runtimeInstancePool = createRuntimeInstancePool();
 
 // Project workspace base — each project gets its own folder
@@ -859,6 +867,27 @@ function handleBrokerIntent(intent) {
       broadcast({ type: 'workflow_node_progress', projectId, workflowRunId: payload.workflowRunId, nodeId: payload.nodeId, stage: payload.stage, agent: fromParticipantId });
       break;
     }
+    case 'workflow_progress_batch': {
+      const batch = {
+        ...payload,
+        fromParticipantId: payload?.fromParticipantId || fromParticipantId,
+      };
+      const projectId = batch.projectId;
+      if (!projectId || !batch.workflowRunId) {
+        return emitTaskIntentError(kind, taskId, fromParticipantId, { error: 'workflow_progress_missing_identity', projectId });
+      }
+      const result = hub.handleWorkflowProgressBatch(batch.workflowRunId, batch);
+      if (!result.ok) return emitTaskIntentError(kind, taskId, fromParticipantId, { ...result, projectId });
+      log('info', `Workflow progress batch accepted`, {
+        projectId,
+        workflowRunId: batch.workflowRunId,
+        fromParticipantId,
+        sequence: batch.sequence,
+        duplicate: Boolean(result.duplicate),
+      });
+      broadcast({ type: 'workflow_progress_batch', projectId, workflowRun: result.workflowRun, duplicate: Boolean(result.duplicate) });
+      break;
+    }
     case 'workflow_node_result': {
       const projectId = payload?.projectId;
       if (!projectId || !payload?.workflowRunId || !payload?.nodeId) {
@@ -1290,7 +1319,7 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length });
+      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES });
     }
 
     if (path.startsWith('/quality/')) {
@@ -1414,6 +1443,65 @@ async function handleRequest(req, res) {
       const workflowRun = hub.getWorkflowRun(projectWorkflowRunMatch[2]);
       if (!workflowRun || workflowRun.projectId !== project.id) return json(res, { error: 'not_found' }, 404);
       return json(res, { workflowRun });
+    }
+
+    const workflowProposalMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/proposal$/);
+    if (workflowProposalMatch && req.method === 'POST') {
+      const [, projectId, workflowId] = workflowProposalMatch;
+      const body = await parseBody(req);
+      const result = hub.createWorkflowProposal(projectId, workflowId, {
+        requestedBy: body?.requestedBy || 'human',
+        policy: body?.policy || null,
+        taskId: body?.taskId || null,
+      });
+      return json(res, result, result.ok ? 201 : 400);
+    }
+
+    const workflowRunStartMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/runs$/);
+    if (workflowRunStartMatch && req.method === 'POST') {
+      const [, projectId, workflowId] = workflowRunStartMatch;
+      const body = await parseBody(req);
+      const result = hub.startWorkflowRunFromProposal(body?.proposalId, {
+        approvedBy: body?.approvedBy || body?.requestedBy || 'human',
+        projectId,
+        workflowId,
+        taskId: body?.taskId || null,
+        policy: body?.policy || null,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_started', projectId, workflowRun: result.workflowRun });
+        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
+        return json(res, { ...result, workflowRun }, 201);
+      }
+      return json(res, result, result.error === 'workflow_proposal_not_found' ? 404 : 400);
+    }
+
+    const workflowRunProgressMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/progress$/);
+    if (workflowRunProgressMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId] = workflowRunProgressMatch;
+      const body = await parseBody(req);
+      const batch = body?.batch || body;
+      const existingRun = hub.getWorkflowRun(workflowRunId);
+      if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
+      if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_progress_project_mismatch' }, 400);
+      const result = hub.handleWorkflowProgressBatch(workflowRunId, batch);
+      if (result.ok) {
+        broadcast({ type: 'workflow_progress_batch', projectId, workflowRun: result.workflowRun, duplicate: Boolean(result.duplicate) });
+        return json(res, result, result.duplicate ? 200 : 202);
+      }
+      return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
+    }
+
+    const workflowRunCancelMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/cancel$/);
+    if (workflowRunCancelMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId] = workflowRunCancelMatch;
+      const body = await parseBody(req);
+      const result = hub.cancelWorkflowRun(workflowRunId, {
+        reason: body?.reason || 'human_cancelled',
+      });
+      if (result.ok) broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+      return json(res, result, result.ok ? 200 : 404);
     }
 
     const diagnoseWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/project-diagnose$/);

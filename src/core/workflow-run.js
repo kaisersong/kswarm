@@ -5,6 +5,8 @@
  * workflow shape, advances node/run state, and derives summaries for UI/API.
  */
 
+import { createHash } from 'node:crypto';
+
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_NODE_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled']);
 
@@ -92,6 +94,15 @@ export function createWorkflowRun(input = {}) {
     completedAt: null,
     cancelledAt: null,
     requestedBy: input.requestedBy || null,
+    scope: clonePlainValue(input.scope || input.spec?.scope || { projectId: String(input.projectId) }),
+    sourceTask: clonePlainValue(input.sourceTask || null),
+    spec: clonePlainValue(input.spec || null),
+    budgets: clonePlainValue(input.budgets || input.approval?.budget || null),
+    budgetGate: clonePlainValue(input.budgetGate || null),
+    permissions: clonePlainValue(input.permissions || null),
+    outputContract: clonePlainValue(input.outputContract || null),
+    acceptanceRubric: clonePlainValue(input.acceptanceRubric || input.spec?.acceptanceRubric || null),
+    assumptions: Array.isArray(input.assumptions) ? input.assumptions.map(String) : [],
     approval: {
       required: approvalRequired,
       status: approvalRequired ? 'pending' : 'not_required',
@@ -103,6 +114,7 @@ export function createWorkflowRun(input = {}) {
     nodes,
     summary: null,
     diagnosis: input.diagnosis || null,
+    recovery: null,
   };
   run = refreshReadiness(run);
   return refreshSummary(run);
@@ -167,6 +179,7 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.completedAt = now;
     node.output = event.output || null;
     node.producerAgent = event.fromAgent || node.assignedAgent || null;
+    node.cache = buildNodeCache(next, node, { now });
   } else if (event.type === 'node_failed') {
     node.status = 'failed';
     node.completedAt = now;
@@ -184,13 +197,23 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.output = event.output || null;
     node.reviewDecision = clonePlainValue(event.reviewDecision);
     node.producerAgent = event.fromAgent || node.assignedAgent || null;
+    node.cache = buildNodeCache(next, node, { now });
   } else if (event.type === 'gate_completed') {
     node.status = 'completed';
     node.completedAt = now;
     node.output = { decision: clonePlainValue(event.decision) };
+    node.cache = buildNodeCache(next, node, { now });
     next.gateDecision = clonePlainValue(event.decision);
     next.status = event.decision?.status === 'passed' ? 'completed' : 'blocked';
     next.completedAt = now;
+    if (event.decision?.status === 'needs_replanning') {
+      next.revisedProposalRequest = {
+        status: 'pending_user_confirmation',
+        reason: event.decision.reason || 'needs_replanning',
+        evidenceRefs: clonePlainValue(event.decision.evidenceRefs || []),
+        invalidationScope: clonePlainValue(event.decision.invalidationScope || null),
+      };
+    }
   } else {
     const error = new Error('unknown_workflow_event');
     error.eventType = event.type;
@@ -210,10 +233,19 @@ export function summarizeWorkflowRun(run = {}) {
     running: nodes.filter(node => node.status === 'running').length,
     pending: nodes.filter(node => ['pending', 'ready'].includes(node.status)).length,
   };
+  const storedNodes = nodes.filter(node => node.cache?.status === 'stored');
+  const reusableNodes = storedNodes.filter(node => node.status === 'completed');
   return {
     ...counts,
     progress: counts.total === 0 ? 0 : counts.completed / counts.total,
     primaryMessage: formatGateDecisionMessage(run.gateDecision) || run.diagnosis?.recommendedActions?.[0]?.label || null,
+    cache: {
+      storedNodeCount: storedNodes.length,
+      reusableNodeCount: reusableNodes.length,
+    },
+    blockingFailures: nodes
+      .filter(node => ['failed', 'blocked'].includes(node.status))
+      .map(node => ({ nodeId: node.id, title: node.title, status: node.status, reason: node.error || null })),
   };
 }
 
@@ -232,6 +264,7 @@ function normalizeNode(node) {
     output: node.output || null,
     reviewDecision: clonePlainValue(node.reviewDecision || null),
     runtime: clonePlainValue(node.runtime || null),
+    cache: clonePlainValue(node.cache || null),
     producerAgent: node.producerAgent || null,
     error: node.error || null,
     startedAt: node.startedAt || null,
@@ -288,6 +321,7 @@ function refreshSummary(run) {
     status,
     completedAt: status === 'completed' ? (run.completedAt || run.updatedAt) : run.completedAt,
     summary,
+    recovery: summarizeRecovery({ ...run, status, summary }),
   };
 }
 
@@ -300,11 +334,56 @@ function cloneRun(run) {
       ...node,
       dependsOn: [...(node.dependsOn || [])],
       output: clonePlainValue(node.output),
+      cache: clonePlainValue(node.cache),
     })),
     summary: run.summary ? { ...run.summary } : null,
     diagnosis: clonePlainValue(run.diagnosis),
     gateDecision: clonePlainValue(run.gateDecision),
+    revisedProposalRequest: clonePlainValue(run.revisedProposalRequest),
+    spec: clonePlainValue(run.spec),
+    scope: clonePlainValue(run.scope),
+    sourceTask: clonePlainValue(run.sourceTask),
+    budgets: clonePlainValue(run.budgets),
+    budgetGate: clonePlainValue(run.budgetGate),
+    permissions: clonePlainValue(run.permissions),
+    outputContract: clonePlainValue(run.outputContract),
+    acceptanceRubric: clonePlainValue(run.acceptanceRubric),
+    assumptions: Array.isArray(run.assumptions) ? [...run.assumptions] : [],
   };
+}
+
+function summarizeRecovery(run) {
+  const reusableNodeCount = run.summary?.cache?.reusableNodeCount || 0;
+  if (run.status === 'completed') {
+    return { mode: 'not_needed', reusableNodeCount, nextAction: 'none' };
+  }
+  if (run.status === 'blocked') {
+    const runtimeBlocked = (run.summary?.blockingFailures || []).some(item => String(item.reason || '').includes('runtime'));
+    if (runtimeBlocked) return { mode: 'blocked_waiting_runtime', reusableNodeCount, nextAction: 'wait_for_runtime' };
+  }
+  if (reusableNodeCount > 0 && !TERMINAL_RUN_STATUSES.has(run.status)) {
+    return { mode: 'resume_completed_nodes', reusableNodeCount, nextAction: 'resume_workflow' };
+  }
+  if (run.status === 'failed' || run.status === 'cancelled') {
+    return { mode: 'rerun_from_start', reusableNodeCount, nextAction: 'rerun_workflow' };
+  }
+  return { mode: 'not_needed', reusableNodeCount, nextAction: 'none' };
+}
+
+function buildNodeCache(run, node, { now }) {
+  const inputHash = hashPlainValue(node.input || null);
+  const outputHash = hashPlainValue(node.output || node.reviewDecision || null);
+  return {
+    key: `${run.id}:${node.id}:${node.attempt || 0}:${inputHash}:${outputHash}`,
+    status: 'stored',
+    storedAt: now,
+    inputHash,
+    outputHash,
+  };
+}
+
+function hashPlainValue(value) {
+  return createHash('sha256').update(JSON.stringify(value ?? null)).digest('hex');
 }
 
 function clonePlainValue(value) {
@@ -316,6 +395,8 @@ function formatGateDecisionMessage(decision) {
   if (!decision?.status) return null;
   if (decision.status === 'passed') return 'Review gate passed';
   if (decision.status === 'needs_rework') return 'Review gate needs rework';
+  if (decision.status === 'needs_replanning') return 'Review gate needs replanning';
+  if (decision.status === 'needs_rubric_clarification') return 'Review gate needs rubric clarification';
   if (decision.status === 'blocked') return 'Review gate blocked';
   return null;
 }
