@@ -1358,7 +1358,7 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection } = body;
+      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
       const resolvedPoAgent = poAgent;
       const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== resolvedPoAgent) : [];
@@ -1369,7 +1369,7 @@ async function handleRequest(req, res) {
         defaultSource: 'default_seed',
       });
       const id = `proj-${Date.now()}`;
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection });
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection, executionMode });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
@@ -1395,6 +1395,19 @@ async function handleRequest(req, res) {
       broadcast({ type: 'project_created', project });
 
       return json(res, { ok: true, project }, 201);
+    }
+
+    const executionModeMatch = path.match(/^\/projects\/([^/]+)\/execution-mode$/);
+    if (executionModeMatch && req.method === 'PATCH') {
+      const projectId = executionModeMatch[1];
+      const body = await parseBody(req);
+      const result = hub.updateProjectExecutionMode(projectId, body?.executionMode, {
+        updatedBy: body?.updatedBy || 'human',
+      });
+      if (result.ok) {
+        broadcast({ type: 'project_execution_mode_updated', projectId, project: result.project });
+      }
+      return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 400);
     }
 
     // ── Project detail ──

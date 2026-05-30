@@ -53,6 +53,12 @@ import {
 } from './workflow-spec.js';
 import { applyWorkflowProgressBatch } from './workflow-progress.js';
 import {
+  buildTaskExecutionMetadata,
+  isValidProjectExecutionMode,
+  normalizeProjectExecutionMode,
+  selectTaskExecutionStrategy,
+} from './execution-mode.js';
+import {
   appendQualityPlanningGuidance,
   buildQualityPromptExcerpt,
   compileEffectiveQualityRuleSet,
@@ -73,7 +79,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const saved = persistence.load();
     if (saved && saved.projects) {
       for (const p of saved.projects) {
-        projects.set(p.id, p);
+        projects.set(p.id, { ...p, executionMode: normalizeProjectExecutionMode(p.executionMode) });
       }
       for (const { projectId, tasks } of (saved.boards || [])) {
         boards.set(projectId, restoreTaskBoard(tasks, projectId));
@@ -226,7 +232,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
   // ─── Project lifecycle ─────────────────────────────────────────────
 
-  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null }) {
+  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct' }) {
     const createdAt = Date.now();
     const qualityRuleSet = compileEffectiveQualityRuleSet({
       goal: goal || '',
@@ -250,6 +256,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       preparation: null,
       poAgent,
       members,
+      executionMode: normalizeProjectExecutionMode(executionMode),
+      executionModeUpdatedAt: createdAt,
+      executionModeUpdatedBy: 'system_default',
       status: 'created',  // created → planning → active → closed
       createdAt,
       closedAt: null,
@@ -300,8 +309,26 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         : (Array.isArray(members) ? members : []).map(agentId => ({
             agentId,
             source: 'system_migration',
-          })),
+      })),
     };
+  }
+
+  function updateProjectExecutionMode(projectId, executionMode, { updatedBy = 'human', now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    if (!isValidProjectExecutionMode(executionMode)) return { ok: false, error: 'invalid_execution_mode' };
+    const normalized = normalizeProjectExecutionMode(executionMode);
+    project.executionMode = normalized;
+    project.executionModeUpdatedAt = now;
+    project.executionModeUpdatedBy = updatedBy;
+    project.updatedAt = now;
+    eventLog.emit('project.execution_mode.updated', {
+      projectId,
+      executionMode: normalized,
+      updatedBy,
+    });
+    recordHumanAction('update_project_execution_mode', { projectId, executionMode: normalized, updatedBy });
+    return { ok: true, project };
   }
 
   function selectionForTask(project, task) {
@@ -568,6 +595,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       ? dispatchPlan.dispatchedTasks.filter(task => onlyTaskIds.has(task.id))
       : dispatchPlan.dispatchedTasks;
     const dispatched = [];
+    const workflowDispatched = [];
+    const workflowRunsStarted = [];
     const skipped = [...(dispatchPlan.skipped || [])];
 
     for (const task of plannedTasks) {
@@ -579,6 +608,34 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
           qualityFailureCount: currentTask.qualityFailureCount,
         });
         if (!reset.ok) continue;
+      }
+      const latestTask = {
+        ...(board.getTask(task.id) || task),
+        selectedRoute: task.selectedRoute || null,
+        preferredAssignedAgent: task.preferredAssignedAgent || null,
+        assignedAgent: task.assignedAgent,
+      };
+      const executionSelection = selectTaskExecutionStrategy({ project, task: latestTask });
+      if (executionSelection.strategy === 'workflow') {
+        const workflowResult = startTaskWorkflowFromDispatch({
+          project,
+          board,
+          task: latestTask,
+          selection: executionSelection,
+          requestedBy: fromAgent,
+          now: Date.now() + workflowRunsStarted.length * 2,
+        });
+        if (!workflowResult.ok) {
+          skipped.push({
+            taskId: task.id,
+            reason: workflowResult.error || 'workflow_dispatch_failed',
+            agent: task.assignedAgent,
+          });
+          continue;
+        }
+        workflowDispatched.push(task.id);
+        workflowRunsStarted.push(workflowResult.workflowRun);
+        continue;
       }
       let assignedRuntimeInstance = task.assignedRuntimeInstance || null;
       if (typeof runtimeInstanceAllocator?.reserveWorkerInstance === 'function') {
@@ -601,6 +658,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         selectedRoute: task.selectedRoute || null,
       });
       if (!result.ok) continue;
+      const storedTask = board.getTask(task.id);
+      if (storedTask) {
+        storedTask.execution = buildTaskExecutionMetadata(executionSelection, {
+          workflowRunId: null,
+          selectedAt: Date.now(),
+        });
+      }
 
       if (bridge) {
         const targetParticipantId = assignedRuntimeInstance || task.assignedAgent;
@@ -627,7 +691,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       }
 
       eventLog.emit('task.dispatched', {
-        projectId, taskId: task.id, taskTitle: task.title, agent: task.assignedAgent, target: assignedRuntimeInstance || task.assignedAgent, runtimeInstance: assignedRuntimeInstance,
+        projectId, taskId: task.id, taskTitle: task.title, agent: task.assignedAgent, target: assignedRuntimeInstance || task.assignedAgent, runtimeInstance: assignedRuntimeInstance, executionStrategy: 'direct', executionReasonCode: executionSelection.reasonCode,
       });
       dispatched.push(task.id);
     }
@@ -635,10 +699,69 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return {
       ok: true,
       dispatched,
+      workflowDispatched,
+      workflowRuns: workflowRunsStarted,
       skipped,
       blocked: dispatchPlan.blocked,
       projectGate: dispatchPlan.projectGate,
     };
+  }
+
+  function startTaskWorkflowFromDispatch({ project, board, task, selection, requestedBy = 'xiaok-po', now = Date.now() } = {}) {
+    if (!project || !board || !task?.id) return { ok: false, error: 'task_required' };
+    const proposal = createWorkflowProposal(project.id, PO_GENERATED_TASK_WORKFLOW_ID, {
+      requestedBy: requestedBy || project.poAgent || 'kswarm',
+      taskId: task.id,
+      now,
+    });
+    if (!proposal.ok) return proposal;
+
+    const started = startWorkflowRunFromProposal(proposal.workflowProposal.id, {
+      projectId: project.id,
+      workflowId: PO_GENERATED_TASK_WORKFLOW_ID,
+      taskId: task.id,
+      approvedBy: requestedBy || project.poAgent || 'kswarm',
+      now: now + 1,
+    });
+    if (!started.ok) return started;
+
+    const transition = board.transition(task.id, 'dispatched', {
+      assignedAgent: task.assignedAgent,
+      assignedExecutor: null,
+      selectedRoute: task.selectedRoute || null,
+      preferredAssignedAgent: task.preferredAssignedAgent || null,
+      runId: `workflow-${started.workflowRun.id}`,
+      leaseTimeoutMs: 24 * 60 * 60 * 1000,
+    });
+    if (!transition.ok) {
+      cancelWorkflowRun(started.workflowRun.id, { reason: 'task_transition_failed', now: now + 2 });
+      return { ok: false, error: transition.error || 'task_transition_failed' };
+    }
+
+    const storedTask = board.getTask(task.id);
+    if (storedTask) {
+      storedTask.execution = buildTaskExecutionMetadata(selection, {
+        workflowRunId: started.workflowRun.id,
+        selectedAt: now + 1,
+      });
+      storedTask.assignedExecutor = 'workflow';
+      storedTask.activeRunId = `workflow-${started.workflowRun.id}`;
+      storedTask.runLease = null;
+      storedTask.updatedAt = now + 1;
+    }
+
+    eventLog.emit('task.workflow_dispatched', {
+      projectId: project.id,
+      taskId: task.id,
+      taskTitle: task.title,
+      workflowRunId: started.workflowRun.id,
+      workflowId: started.workflowRun.workflowId,
+      executionStrategy: 'workflow',
+      executionReasonCode: selection.reasonCode,
+      modeSource: selection.modeSource,
+    });
+
+    return { ok: true, workflowRun: started.workflowRun, workflowProposal: started.workflowProposal, dispatches: started.dispatches || [] };
   }
 
   /**
@@ -2029,6 +2152,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   // Wrap mutation methods to auto-persist state
   const mutations = {
     createProject,
+    updateProjectExecutionMode,
     handleApprove,
     handleRetryPlan,
     handleHumanAddTasks,

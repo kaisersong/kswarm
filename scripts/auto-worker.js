@@ -2004,7 +2004,7 @@ async function checkSelfAssignedTasks(projectId) {
     const onlineAgents = await getOnlineAgents();
 
     for (const task of tasks) {
-      if (task.status !== 'dispatched') continue;
+      if (task.status !== 'dispatched' || task.execution?.strategy === 'workflow') continue;
 
       const targetAgent = task.assignedRuntimeInstance || task.assignedAgent;
       const isSelf = isTaskAssignedToRuntime(task);
@@ -3162,7 +3162,7 @@ async function pollDispatchedTasks() {
       const detail = await detailRes.json();
 
       for (const task of (detail.tasks || [])) {
-        if (isTaskAssignedToRuntime(task) && task.status === 'dispatched') {
+        if (isTaskAssignedToRuntime(task) && task.status === 'dispatched' && task.execution?.strategy !== 'workflow') {
           console.log(`[${ALIAS}] Found pending dispatched task: ${task.title}`);
           await doTask(task.id, {
             title: task.title,
@@ -3214,7 +3214,7 @@ async function poHealthCheck() {
 
       for (const task of tasks) {
         // Only check dispatched/accepted/in_progress tasks
-        if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) continue;
+        if (!['dispatched', 'accepted', 'in_progress'].includes(task.status) || task.execution?.strategy === 'workflow') continue;
         hasStuckOrActive = true;
 
         const elapsed = now - (task.updatedAt || task.createdAt);
