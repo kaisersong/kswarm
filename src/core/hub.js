@@ -14,7 +14,8 @@
 
 import { createTaskBoard, restoreTaskBoard } from './task-board.js';
 import { createHash } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
 import { createPersistence } from './persistence.js';
@@ -606,7 +607,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const workflowRunsStarted = [];
     const skipped = [...(dispatchPlan.skipped || [])];
 
-    if (normalizeProjectExecutionMode(project.executionMode) === 'workflow_preferred') {
+    const projectExecutionMode = normalizeProjectExecutionMode(project.executionMode);
+    const explicitTaskWorkflowDispatch = onlyTaskIds.size > 0 && plannedTasks.some(task => {
+      const currentTask = board.getTask(task.id) || task;
+      const selection = selectTaskExecutionStrategy({ project, task: currentTask });
+      return selection.strategy === 'workflow' && selection.modeSource === 'manual_override';
+    });
+
+    if (projectExecutionMode === 'workflow_preferred' && !explicitTaskWorkflowDispatch) {
       const activeProjectWorkflow = findActiveProjectExecutionWorkflow(project.id);
       if (activeProjectWorkflow) {
         return {
@@ -2465,6 +2473,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
+    const artifactValidation = validateWorkflowProjectArtifacts({ project, deliverable });
+    if (!artifactValidation.ok) {
+      return {
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, artifactValidation.error || 'worker_artifact_invalid', { now }),
+        delivery: artifactValidation,
+      };
+    }
+
     const taskCompletion = markProjectTasksDoneByWorkflow({ project, board, workflowRun, deliverable, producerNode, now });
     if (!taskCompletion.ok) {
       return {
@@ -2503,12 +2519,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const workFolder = readWorkflowString(output.workFolder) || readWorkflowString(output.workspacePath);
     const artifactManifest = Array.isArray(output.artifactManifest) ? output.artifactManifest : [];
     const artifacts = Array.isArray(output.artifacts) ? output.artifacts : [];
+    const evidenceRefs = mergeWorkflowArtifactEvidenceRefs(output.evidenceRefs, artifacts);
     return {
       summary,
       artifacts,
       ...(artifactManifest.length > 0 ? { artifactManifest } : {}),
       ...(workFolder ? { workFolder, workspacePath: workFolder } : {}),
-      evidenceRefs: readWorkflowStringArray(output.evidenceRefs),
+      evidenceRefs,
       provenance: {
         runtimeSource: 'kswarm-project-workflow',
         workflowRunId: workflowRun.id,
@@ -2517,6 +2534,78 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         producingAgent: producerNode.producerAgent || producerNode.assignedAgent || null,
       },
     };
+  }
+  function validateWorkflowProjectArtifacts({ project, deliverable } = {}) {
+    const artifacts = Array.isArray(deliverable?.artifacts) ? deliverable.artifacts : [];
+    if (artifacts.length === 0) return { ok: false, error: 'worker_deliverable_missing' };
+
+    const workspacePath = readWorkflowString(deliverable?.workFolder)
+      || readWorkflowString(deliverable?.workspacePath)
+      || readWorkflowString(project?.workFolder)
+      || readWorkflowString(project?.workspacePath);
+    const workspaceRealPath = safeWorkflowRealPath(workspacePath);
+    if (!workspaceRealPath) return { ok: false, error: 'worker_artifact_invalid' };
+
+    for (const artifact of artifacts) {
+      const checked = validateWorkflowProjectArtifactPath(artifact, { workspaceRealPath });
+      if (!checked.ok) return checked;
+    }
+    return { ok: true };
+  }
+  function validateWorkflowProjectArtifactPath(artifact, { workspaceRealPath = null } = {}) {
+    if (!workspaceRealPath) return { ok: false, error: 'worker_artifact_invalid' };
+    const artifactPath = readWorkflowArtifactPath(artifact);
+    if (!artifactPath || artifactPath.includes('\0')) return { ok: false, error: 'worker_artifact_invalid' };
+    const normalized = artifactPath.replace(/^artifact:/, '').replace(/\\/g, '/');
+    let candidate;
+    if (isAbsolute(normalized)) {
+      candidate = resolve(normalized);
+    } else {
+      candidate = resolve(workspaceRealPath, normalized);
+    }
+
+    const realPath = safeWorkflowRealPath(candidate);
+    if (!realPath) return { ok: false, error: 'worker_artifact_invalid' };
+    if (!isWorkflowPathInside(workspaceRealPath, realPath)) return { ok: false, error: 'worker_artifact_invalid' };
+    if (!isReadableWorkflowArtifact(realPath)) return { ok: false, error: 'worker_artifact_invalid' };
+    return { ok: true, path: realPath };
+  }
+  function readWorkflowArtifactPath(artifact) {
+    if (typeof artifact === 'string') return artifact.trim();
+    if (!artifact || typeof artifact !== 'object') return '';
+    return readWorkflowString(artifact.path)
+      || readWorkflowString(artifact.relativePath)
+      || readWorkflowString(artifact.artifactPath)
+      || readWorkflowString(artifact.filename)
+      || readWorkflowString(artifact.name);
+  }
+  function mergeWorkflowArtifactEvidenceRefs(rawEvidenceRefs, artifacts = []) {
+    const refs = new Set(readWorkflowStringArray(rawEvidenceRefs));
+    for (const artifact of artifacts) {
+      const artifactPath = readWorkflowArtifactPath(artifact);
+      if (artifactPath) refs.add(`artifact:${artifactPath}`);
+    }
+    return [...refs];
+  }
+  function safeWorkflowRealPath(value) {
+    if (!value || typeof value !== 'string') return null;
+    try {
+      return realpathSync(value);
+    } catch {
+      return null;
+    }
+  }
+  function isWorkflowPathInside(root, target) {
+    const rel = relative(root, target);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  }
+  function isReadableWorkflowArtifact(path) {
+    if (!path || !existsSync(path)) return false;
+    try {
+      return readFileSync(path).length > 0;
+    } catch {
+      return false;
+    }
   }
   function markProjectTasksDoneByWorkflow({ project, board, workflowRun, deliverable, producerNode, now = Date.now() } = {}) {
     const completedTaskIds = [];

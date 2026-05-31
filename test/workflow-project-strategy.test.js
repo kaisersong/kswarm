@@ -90,7 +90,6 @@ test('passed project workflow delivers the whole project with artifact provenanc
       summary: '已生成项目最终报告。',
       artifacts: [{ path: deliverablePath, kind: 'markdown', label: 'final-project-report.md' }],
       workFolder,
-      evidenceRefs: [`artifact:${deliverablePath}`],
     },
     now: 1770000002000,
   });
@@ -121,6 +120,7 @@ test('passed project workflow delivers the whole project with artifact provenanc
   assert.equal(project.status, 'delivered');
   assert.equal(project.deliverable.summary, '已生成项目最终报告。');
   assert.equal(project.deliverable.artifacts[0].path, deliverablePath);
+  assert.deepEqual(project.deliverable.evidenceRefs, [`artifact:${deliverablePath}`]);
   assert.equal(project.deliverable.provenance.workflowId, 'po-generated-project-workflow');
   assert.equal(project.deliverable.provenance.workflowRunId, workflowRun.id);
 
@@ -130,6 +130,33 @@ test('passed project workflow delivers the whole project with artifact provenanc
     assert.equal(task.result.provenance.workflowId, 'po-generated-project-workflow');
     assert.equal(task.result.provenance.workflowRunId, workflowRun.id);
   }
+});
+
+test('workflow preferred single-task override still dispatches task workflow through onlyTaskIds', () => {
+  const hub = createHub({ silent: true });
+  createHighQualityProject(hub, 'proj-project-workflow-task-override');
+  const task = hub.getBoard('proj-project-workflow-task-override').getAllTasks()[0];
+  task.executionStrategyOverride = 'workflow';
+
+  const dispatched = hub.handleRequestDispatch('proj-project-workflow-task-override', 'xiaok-po', {
+    onlyTaskIds: [task.id],
+  });
+
+  assert.equal(dispatched.ok, true);
+  assert.deepEqual(dispatched.dispatched, []);
+  assert.deepEqual(dispatched.workflowDispatched, [task.id]);
+  assert.equal(dispatched.workflowRuns.length, 1);
+  assert.equal(dispatched.workflowRuns[0].workflowId, 'po-generated-task-workflow');
+  assert.deepEqual(dispatched.workflowRuns[0].scope, {
+    projectId: 'proj-project-workflow-task-override',
+    taskId: task.id,
+  });
+  assert.equal(dispatched.workflowNodeDispatches[0].nodeId, 'worker-produce-deliverable');
+  assert.equal(
+    hub.listProjectWorkflowRuns('proj-project-workflow-task-override')
+      .filter(run => run.workflowId === 'po-generated-project-workflow').length,
+    0,
+  );
 });
 
 test('project workflow blocks delivery when the worker returns no artifact evidence', () => {
@@ -173,6 +200,58 @@ test('project workflow blocks delivery when the worker returns no artifact evide
   assert.equal(hub.getProject('proj-project-workflow-missing-artifact').status, 'active');
   assert.deepEqual(
     hub.getBoard('proj-project-workflow-missing-artifact').getAllTasks().map(task => task.status),
+    ['pending', 'pending', 'pending'],
+  );
+});
+
+test('project workflow blocks delivery when artifact paths are not readable project files', () => {
+  const hub = createHub({ silent: true });
+  createHighQualityProject(hub, 'proj-project-workflow-fake-artifact');
+  const dispatched = startProjectWorkflow(hub, 'proj-project-workflow-fake-artifact');
+  const workflowRun = dispatched.workflowRuns[0];
+  const workerDispatch = dispatched.workflowNodeDispatches[0];
+  const workFolder = mkdtempSync(join(tmpdir(), 'kswarm-project-workflow-fake-'));
+  const missingPath = join(workFolder, 'missing-final-report.md');
+
+  const workerDone = hub.handleWorkflowNodeResult({
+    workflowRunId: workflowRun.id,
+    nodeId: workerDispatch.nodeId,
+    attempt: workerDispatch.attempt,
+    handoffId: workerDispatch.handoffId,
+    fromAgent: workerDispatch.targetParticipantId,
+    output: {
+      summary: '声称已经生成项目最终报告，但路径不存在。',
+      artifacts: [{ path: missingPath, kind: 'markdown', label: 'missing-final-report.md' }],
+      workFolder,
+      evidenceRefs: [`artifact:${missingPath}`],
+    },
+    now: 1770000002000,
+  });
+  assert.equal(workerDone.ok, true);
+
+  const reviewerDispatch = workerDone.dispatches[0];
+  const reviewed = hub.handleWorkflowNodeReview({
+    workflowRunId: workflowRun.id,
+    nodeId: reviewerDispatch.nodeId,
+    attempt: reviewerDispatch.attempt,
+    handoffId: reviewerDispatch.handoffId,
+    fromAgent: reviewerDispatch.targetParticipantId,
+    reviewDecision: {
+      status: 'passed',
+      reason: 'reviewer 误判通过，但 artifact path 不存在。',
+      evidenceRefs: [`artifact:${missingPath}`],
+    },
+    output: { summary: '复核通过。' },
+    now: 1770000003000,
+  });
+
+  assert.equal(reviewed.ok, true);
+  assert.equal(reviewed.workflowRun.status, 'blocked');
+  assert.equal(reviewed.workflowRun.projectDelivery.status, 'failed');
+  assert.equal(reviewed.workflowRun.projectDelivery.reason, 'worker_artifact_invalid');
+  assert.equal(hub.getProject('proj-project-workflow-fake-artifact').status, 'active');
+  assert.deepEqual(
+    hub.getBoard('proj-project-workflow-fake-artifact').getAllTasks().map(task => task.status),
     ['pending', 'pending', 'pending'],
   );
 });
