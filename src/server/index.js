@@ -229,6 +229,15 @@ function broadcast(msg) {
 }
 
 normalizePersistedProjectPoAgents();
+const interruptedTaskWorkflows = hub.recoverInterruptedTaskWorkflows({
+  reason: 'kswarm_service_started',
+});
+if (interruptedTaskWorkflows.recovered?.length > 0) {
+  log('warn', 'Recovered interrupted task workflow runs on startup', {
+    recovered: interruptedTaskWorkflows.recovered.length,
+    skipped: interruptedTaskWorkflows.skipped?.length || 0,
+  });
+}
 
 // ─── Broker Connection ────────────────────────────────────────────
 let brokerConnected = false;

@@ -116,6 +116,29 @@ const desktopWorker = {
 }
 
 {
+  const readiness = classifyAgentReadiness(desktopPo, {
+    role: 'project_owner',
+    participants: [{ participantId: 'xiaok-po', lastSeenAt: now }],
+    probeResults: { 'xiaok-po': { ok: false, reason: 'readiness_probe_timeout', checkedAt: now } },
+    now,
+  });
+  assert.equal(readiness.ready, true);
+  assert.equal(readiness.reason, null);
+  assert.ok(readiness.checks.includes('readiness_probe_deferred'));
+}
+
+{
+  const readiness = classifyAgentReadiness(desktopWorker, {
+    role: 'worker',
+    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    probeResults: { 'xiaok-worker': { ok: false, reason: 'readiness_probe_timeout', checkedAt: now } },
+    now,
+  });
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.reason, 'readiness_probe_timeout');
+}
+
+{
   const project = {
     id: 'proj-1',
     poAgent: 'xiaok-po',

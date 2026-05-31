@@ -35,6 +35,10 @@ function firstTaskId(hub, projectId = 'proj-task-workflow') {
   return hub.getBoard(projectId).getAllTasks()[0].id;
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 test('creates task-scoped workflow proposal without dispatching or creating a run', () => {
   const hub = createHub({ silent: true });
   createActiveProject(hub);
@@ -231,6 +235,71 @@ test('passed task workflow submits the reviewed deliverable to the source task',
   assert.equal(submittedTask.result.artifacts[0].path, deliverablePath);
   assert.equal(submittedTask.result.provenance.workflowRunId, workflowRun.id);
   assert.equal(submittedTask.result.provenance.runtimeSource, 'kswarm-workflow');
+});
+
+test('cancelled task workflow releases the source task for redispatch', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-task-workflow-cancel');
+  const task = hub.getBoard('proj-task-workflow-cancel').getAllTasks()[0];
+  task.executionStrategyOverride = 'workflow';
+
+  const dispatched = hub.handleRequestDispatch('proj-task-workflow-cancel', 'xiaok-po');
+  assert.equal(dispatched.ok, true);
+  assert.equal(dispatched.workflowRuns.length, 1);
+
+  const workflowRun = dispatched.workflowRuns[0];
+  const runningTask = hub.getBoard('proj-task-workflow-cancel').getTask(task.id);
+  assert.equal(runningTask.status, 'dispatched');
+  assert.equal(runningTask.assignedExecutor, 'workflow');
+  assert.equal(runningTask.activeRunId, `workflow-${workflowRun.id}`);
+
+  const cancelled = hub.cancelWorkflowRun(workflowRun.id, { reason: 'human_cancelled', now: 1770000002000 });
+  assert.equal(cancelled.ok, true);
+  assert.equal(cancelled.workflowRun.status, 'cancelled');
+  assert.equal(cancelled.taskReset.ok, true);
+
+  const resetTask = hub.getBoard('proj-task-workflow-cancel').getTask(task.id);
+  assert.equal(resetTask.status, 'pending');
+  assert.equal(resetTask.activeRunId, null);
+  assert.equal(resetTask.assignedExecutor, null);
+});
+
+test('startup recovery releases interrupted persisted task workflow runs', async () => {
+  const dataDir = join(mkdtempSync(join(tmpdir(), 'kswarm-workflow-recovery-')), 'state.json');
+  const hub = createHub({ silent: true, dataDir });
+  createActiveProject(hub, 'proj-task-workflow-recover');
+  const task = hub.getBoard('proj-task-workflow-recover').getAllTasks()[0];
+  task.executionStrategyOverride = 'workflow';
+
+  const dispatched = hub.handleRequestDispatch('proj-task-workflow-recover', 'xiaok-po');
+  assert.equal(dispatched.ok, true);
+  assert.equal(dispatched.workflowRuns.length, 1);
+  const workflowRun = dispatched.workflowRuns[0];
+  const activeTask = hub.getBoard('proj-task-workflow-recover').getTask(task.id);
+  assert.equal(activeTask.status, 'dispatched');
+  assert.equal(activeTask.activeRunId, `workflow-${workflowRun.id}`);
+  hub.persistState();
+  await sleep(650);
+
+  const restoredHub = createHub({ silent: true, dataDir });
+  const recovered = restoredHub.recoverInterruptedTaskWorkflows({
+    reason: 'kswarm_service_started',
+    now: 1770000004000,
+  });
+  assert.equal(recovered.ok, true);
+  assert.equal(recovered.recovered.length, 1);
+  assert.equal(recovered.recovered[0].workflowRunId, workflowRun.id);
+
+  const resetTask = restoredHub.getBoard('proj-task-workflow-recover').getTask(task.id);
+  assert.equal(resetTask.status, 'pending');
+  assert.equal(resetTask.activeRunId, null);
+  assert.equal(resetTask.assignedExecutor, null);
+  assert.equal(restoredHub.getWorkflowRun(workflowRun.id).status, 'cancelled');
+
+  const redispatched = restoredHub.handleRequestDispatch('proj-task-workflow-recover', 'xiaok-po');
+  assert.equal(redispatched.ok, true);
+  assert.equal(redispatched.workflowRuns.length, 1);
+  assert.notEqual(redispatched.workflowRuns[0].id, workflowRun.id);
 });
 
 let passed = 0;

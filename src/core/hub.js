@@ -1966,12 +1966,69 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
     const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
     workflowRuns.set(cancelled.id, cancelled);
+    const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
     eventLog.emit('workflow.run.cancelled', {
       projectId: cancelled.projectId,
       workflowRunId,
       reason,
+      taskResetStatus: taskReset?.ok ? 'pending' : (taskReset?.error || null),
     });
-    return { ok: true, workflowRun: cancelled };
+    return { ok: true, workflowRun: cancelled, taskReset };
+  }
+
+  function recoverInterruptedTaskWorkflows({ reason = 'workflow_runtime_interrupted', now = Date.now() } = {}) {
+    const recovered = [];
+    const skipped = [];
+    for (const workflowRun of workflowRuns.values()) {
+      if (!workflowRun || workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) continue;
+      if (workflowRun.status !== 'running') continue;
+      const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
+      const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
+      workflowRuns.set(cancelled.id, cancelled);
+      if (taskReset?.ok) {
+        recovered.push({
+          projectId: cancelled.projectId,
+          workflowRunId: cancelled.id,
+          taskId: cancelled.scope?.taskId || null,
+          taskResetStatus: 'pending',
+        });
+        eventLog.emit('workflow.run.cancelled', {
+          projectId: cancelled.projectId,
+          workflowRunId: cancelled.id,
+          reason,
+          taskResetStatus: 'pending',
+        });
+      } else {
+        skipped.push({
+          projectId: cancelled.projectId,
+          workflowRunId: cancelled.id,
+          taskId: cancelled.scope?.taskId || null,
+          reason: taskReset?.error || 'task_reset_not_needed',
+        });
+      }
+    }
+    return { ok: true, recovered, skipped };
+  }
+
+  function maybeReleaseCancelledTaskWorkflow(workflowRun, { reason = 'workflow_cancelled' } = {}) {
+    if (!workflowRun || workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) return null;
+    const taskId = workflowRun.scope?.taskId;
+    if (!taskId) return null;
+    const board = boards.get(workflowRun.projectId);
+    if (!board) return { ok: false, error: 'task_board_not_found' };
+    const task = board.getTask(taskId);
+    if (!task) return { ok: false, error: 'source_task_not_found' };
+    const expectedRunId = `workflow-${workflowRun.id}`;
+    if (task.activeRunId !== expectedRunId) {
+      return { ok: false, error: 'source_task_run_mismatch', activeRunId: task.activeRunId || null, expectedRunId };
+    }
+    if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) {
+      return { ok: false, error: `source_task_not_active:${task.status}` };
+    }
+    return board.transition(task.id, 'pending', {
+      failureReason: reason,
+      assignedExecutor: null,
+    });
   }
 
   function handleWorkflowProgressBatch(workflowRunId, batch, { now = Date.now() } = {}) {
@@ -2365,6 +2422,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleWorkflowRuntimeUnavailable,
     handleWorkflowProgressBatch,
     cancelWorkflowRun,
+    recoverInterruptedTaskWorkflows,
   };
 
   const persisted = {};
@@ -2395,6 +2453,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleWorkflowRuntimeUnavailable: persisted.handleWorkflowRuntimeUnavailable,
     handleWorkflowProgressBatch: persisted.handleWorkflowProgressBatch,
     cancelWorkflowRun: persisted.cancelWorkflowRun,
+    recoverInterruptedTaskWorkflows: persisted.recoverInterruptedTaskWorkflows,
     listProjectWorkflowRuns,
     getWorkflowRun,
     getHumanActions,
