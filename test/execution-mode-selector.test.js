@@ -114,7 +114,7 @@ test('auto mode routes delivery review tasks through a task-scoped workflow run'
   assert.equal(hub.listProjectWorkflowRuns('proj-execution-mode').length, 1);
 });
 
-test('workflow preferred still keeps simple tasks on direct strategy', () => {
+test('workflow preferred routes simple tasks through workflow by default', () => {
   const project = { id: 'proj-preferred', executionMode: 'workflow_preferred' };
   const simpleTask = {
     id: 'simple',
@@ -130,12 +130,29 @@ test('workflow preferred still keeps simple tasks on direct strategy', () => {
   };
 
   const simple = selectTaskExecutionStrategy({ project, task: simpleTask });
-  assert.equal(simple.strategy, 'direct');
-  assert.equal(simple.reasonCode, 'simple_direct');
+  assert.equal(simple.strategy, 'workflow');
+  assert.equal(simple.modeSource, 'project_default');
+  assert.equal(simple.reasonCode, 'project_workflow_preferred');
 
   const review = selectTaskExecutionStrategy({ project, task: reviewTask });
   assert.equal(review.strategy, 'workflow');
-  assert.equal(review.reasonCode, 'delivery_review');
+  assert.equal(review.modeSource, 'project_default');
+  assert.equal(review.reasonCode, 'project_workflow_preferred');
+});
+
+test('auto mode still keeps simple tasks on direct strategy', () => {
+  const project = { id: 'proj-auto-simple', executionMode: 'auto' };
+  const simpleTask = {
+    id: 'simple',
+    title: '整理会议纪要',
+    status: 'pending',
+    assignedAgent: 'xiaok-worker',
+  };
+
+  const simple = selectTaskExecutionStrategy({ project, task: simpleTask });
+  assert.equal(simple.strategy, 'direct');
+  assert.equal(simple.modeSource, 'auto_selector');
+  assert.equal(simple.reasonCode, 'simple_direct');
 });
 
 test('selector uses concrete reason codes instead of vague complexity', () => {

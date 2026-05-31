@@ -23,13 +23,13 @@ export function selectTaskExecutionStrategy({ project = {}, task = {}, now = Dat
     return buildSelection('direct', 'project_default', 'project_direct_default', now);
   }
 
+  if (mode === 'workflow_preferred') {
+    return buildSelection('workflow', 'project_default', 'project_workflow_preferred', now);
+  }
+
   const reasonCode = inferWorkflowReasonCode(task);
   if (reasonCode) {
     return buildSelection('workflow', 'auto_selector', reasonCode, now);
-  }
-
-  if (mode === 'workflow_preferred' && !isSimpleDirectTask(task)) {
-    return buildSelection('workflow', 'auto_selector', 'project_workflow_preferred', now);
   }
 
   return buildSelection('direct', 'auto_selector', 'simple_direct', now);
