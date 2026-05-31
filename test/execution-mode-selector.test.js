@@ -114,7 +114,7 @@ test('auto mode routes delivery review tasks through a task-scoped workflow run'
   assert.equal(hub.listProjectWorkflowRuns('proj-execution-mode').length, 1);
 });
 
-test('workflow preferred routes simple tasks through workflow by default', () => {
+test('workflow preferred is not converted into task-scoped workflow selections', () => {
   const project = { id: 'proj-preferred', executionMode: 'workflow_preferred' };
   const simpleTask = {
     id: 'simple',
@@ -130,14 +130,14 @@ test('workflow preferred routes simple tasks through workflow by default', () =>
   };
 
   const simple = selectTaskExecutionStrategy({ project, task: simpleTask });
-  assert.equal(simple.strategy, 'workflow');
+  assert.equal(simple.strategy, 'direct');
   assert.equal(simple.modeSource, 'project_default');
-  assert.equal(simple.reasonCode, 'project_workflow_preferred');
+  assert.equal(simple.reasonCode, 'project_workflow_preferred_project_scope');
 
   const review = selectTaskExecutionStrategy({ project, task: reviewTask });
-  assert.equal(review.strategy, 'workflow');
+  assert.equal(review.strategy, 'direct');
   assert.equal(review.modeSource, 'project_default');
-  assert.equal(review.reasonCode, 'project_workflow_preferred');
+  assert.equal(review.reasonCode, 'project_workflow_preferred_project_scope');
 });
 
 test('auto mode still keeps simple tasks on direct strategy', () => {

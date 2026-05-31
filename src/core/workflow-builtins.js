@@ -11,7 +11,9 @@ import { applyWorkflowEvent, createWorkflowRun } from './workflow-run.js';
 export const PROJECT_DIAGNOSE_WORKFLOW_ID = 'project-diagnose';
 export const AGENT_REVIEW_SMOKE_WORKFLOW_ID = 'agent-review-smoke';
 export const PO_GENERATED_TASK_WORKFLOW_ID = 'po-generated-task-workflow';
+export const PO_GENERATED_PROJECT_WORKFLOW_ID = 'po-generated-project-workflow';
 export const TASK_WORKFLOW_DELIVERABLE_NODE_ID = 'worker-produce-deliverable';
+export const PROJECT_WORKFLOW_DELIVERABLE_NODE_ID = 'worker-produce-project-deliverable';
 
 export function createProjectDiagnoseWorkflowSpec({ project } = {}) {
   if (!project?.id) throwProjectRequired();
@@ -162,6 +164,62 @@ export function createPoGeneratedTaskWorkflowSpec({ project, task, workerAgent =
         title: '对抗性复核',
         nodes: [
           { id: 'reviewer-adversarial-check', title: 'Reviewer 复核交付物', kind: 'review', dependsOn: [TASK_WORKFLOW_DELIVERABLE_NODE_ID], required: true, inputRefs: [`${TASK_WORKFLOW_DELIVERABLE_NODE_ID}.output`], agentSelector: { participantId: reviewerAgent, requiredCapabilities: ['review_gate'] }, outputSchema: { type: 'object', required: ['reviewDecision'] }, evidenceRequired: true, permissions: { toolCategories: ['read_project_state'] }, failurePolicy: { strategy: 'block' } },
+        ],
+      },
+      {
+        id: 'reduce',
+        title: '门禁归约',
+        nodes: [
+          { id: 'reduce-review-gate', title: '归约 review gate', kind: 'reduce', dependsOn: ['reviewer-adversarial-check'], required: true, inputRefs: ['reviewer-adversarial-check.reviewDecision'], outputSchema: { type: 'object', required: ['status'] }, evidenceRequired: true, permissions: { toolCategories: ['read_project_state'] }, failurePolicy: { strategy: 'block' } },
+        ],
+      },
+    ],
+  };
+}
+
+export function createPoGeneratedProjectWorkflowSpec({ project, tasks = [], workerAgent = 'xiaok-worker', reviewerAgent = 'xiaok-po' } = {}) {
+  if (!project?.id) throwProjectRequired();
+  const assignedWorker = workerAgent || (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
+
+  return {
+    kind: 'kswarm_workflow_spec_v1',
+    id: PO_GENERATED_PROJECT_WORKFLOW_ID,
+    name: '项目交付物工作流',
+    description: `Worker Agent 执行项目「${project.name || project.id}」并产出最终项目交付物，Reviewer Agent 对抗性复核，通过后由 KSwarm 交付整个项目。`,
+    scope: { projectId: project.id },
+    budgets: { maxNodes: 3, maxParallelism: 1, maxAgents: 2, maxMinutes: 30, maxTokens: 30_000 },
+    permissions: { toolCategories: ['read_project_state', 'write_artifact'], allowWrite: true, allowShell: false, allowNetwork: false, allowRenderer: false },
+    outputContract: { kind: 'project_deliverable', requiredArtifactTypes: collectProjectRequiredOutputs(tasks) },
+    assumptions: [
+      'Worker 产出的是整个项目最终交付物，不是单个任务交付物或诊断摘要',
+      'Worker 必须在项目工作区内写入可复核的最终项目交付物文件',
+      'Reviewer 必须用 evidence refs 复核 Worker 项目交付物，不能直接修改任务或项目状态',
+      'Gate reducer 由 KSwarm 在 passed 后完成项目交付闭环',
+    ],
+    acceptanceRubric: {
+      id: 'po-generated-project-workflow-rubric',
+      title: '项目交付物工作流验收标准',
+      machineChecks: [
+        { id: 'project_deliverable_schema', title: 'Worker 项目交付物输出结构合法', checkKind: 'schema', required: true, inputRefs: [`${PROJECT_WORKFLOW_DELIVERABLE_NODE_ID}.output`] },
+      ],
+      judgmentChecks: [
+        { id: 'project_deliverable_evidence', title: '项目交付物和证据充分', prompt: '检查 Worker 交付物是否覆盖项目目标、项目要求和任务快照，是否包含可复核 artifact 和必要证据。', evidenceRequired: true, reviewerCount: 1, required: true },
+      ],
+      disagreementPolicy: 'block',
+    },
+    phases: [
+      {
+        id: 'deliver',
+        title: 'Worker 生成项目交付物',
+        nodes: [
+          { id: PROJECT_WORKFLOW_DELIVERABLE_NODE_ID, title: 'Worker 生成项目交付物', kind: 'agent', required: true, inputRefs: ['project.snapshot', 'task.snapshot'], agentSelector: { participantId: assignedWorker, requiredCapabilities: ['writing'] }, outputSchema: { type: 'object', required: ['summary', 'artifacts'] }, evidenceRequired: true, permissions: { toolCategories: ['read_project_state', 'write_artifact'], allowWrite: true }, failurePolicy: { strategy: 'block' } },
+        ],
+      },
+      {
+        id: 'review',
+        title: '对抗性复核',
+        nodes: [
+          { id: 'reviewer-adversarial-check', title: 'Reviewer 复核项目交付物', kind: 'review', dependsOn: [PROJECT_WORKFLOW_DELIVERABLE_NODE_ID], required: true, inputRefs: [`${PROJECT_WORKFLOW_DELIVERABLE_NODE_ID}.output`], agentSelector: { participantId: reviewerAgent, requiredCapabilities: ['review_gate'] }, outputSchema: { type: 'object', required: ['reviewDecision'] }, evidenceRequired: true, permissions: { toolCategories: ['read_project_state'] }, failurePolicy: { strategy: 'block' } },
         ],
       },
       {
@@ -374,6 +432,68 @@ export function createPoGeneratedTaskWorkflowRun({
   });
 }
 
+export function createPoGeneratedProjectWorkflowRun({
+  project,
+  tasks = [],
+  workerAgent = 'xiaok-worker',
+  reviewerAgent = 'xiaok-po',
+  requestedBy = 'human',
+  now = Date.now(),
+} = {}) {
+  if (!project?.id) throwProjectRequired();
+  const assignedWorker = workerAgent || (Array.isArray(project.members) && project.members[0]) || 'xiaok-worker';
+  const spec = createPoGeneratedProjectWorkflowSpec({ project, tasks, workerAgent: assignedWorker, reviewerAgent });
+
+  return createWorkflowRun({
+    id: `wf-${project.id}-${PO_GENERATED_PROJECT_WORKFLOW_ID}-${now}`,
+    projectId: project.id,
+    workflowId: PO_GENERATED_PROJECT_WORKFLOW_ID,
+    title: '项目交付物工作流',
+    requestedBy,
+    source: 'po_generated_project',
+    scope: spec.scope,
+    sourceTask: null,
+    spec,
+    budgets: spec.budgets,
+    permissions: spec.permissions,
+    outputContract: spec.outputContract,
+    acceptanceRubric: spec.acceptanceRubric,
+    assumptions: spec.assumptions,
+    phases: [
+      { id: 'deliver', title: 'Worker 生成项目交付物' },
+      { id: 'review', title: '对抗性复核' },
+      { id: 'reduce', title: '门禁归约' },
+    ],
+    nodes: [
+      {
+        id: PROJECT_WORKFLOW_DELIVERABLE_NODE_ID,
+        phaseId: 'deliver',
+        title: 'Worker 生成项目交付物',
+        kind: 'agent_task',
+        assignedAgent: assignedWorker,
+        input: buildPoProjectWorkflowInput({ project, tasks }),
+      },
+      {
+        id: 'reviewer-adversarial-check',
+        phaseId: 'review',
+        title: 'Reviewer 复核项目交付物',
+        kind: 'review',
+        dependsOn: [PROJECT_WORKFLOW_DELIVERABLE_NODE_ID],
+        assignedAgent: reviewerAgent,
+        input: { reviewFocus: ['项目目标覆盖', '最终交付物可读性', '证据充分性', '任务覆盖范围'] },
+      },
+      {
+        id: 'reduce-review-gate',
+        phaseId: 'reduce',
+        title: '归约 review gate',
+        kind: 'control',
+        dependsOn: ['reviewer-adversarial-check'],
+      },
+    ],
+    now,
+  });
+}
+
 function throwProjectRequired() {
   const error = new Error('project_required');
   error.code = 'project_required';
@@ -474,6 +594,38 @@ function buildPoTaskWorkflowInput({ project = {}, task = {}, tasks = [] }) {
     })),
     instruction: '执行当前任务并生成最终交付物。必须输出 summary、artifacts、evidenceRefs；如存在项目工作区，应把可复核文件写入工作区。',
   };
+}
+
+function buildPoProjectWorkflowInput({ project = {}, tasks = [] }) {
+  return {
+    project: {
+      id: project.id,
+      name: project.name,
+      goal: project.goal || '',
+      requirements: project.requirements || '',
+      status: project.status || '',
+    },
+    taskSnapshot: tasks.map(item => ({
+      id: item.id,
+      title: item.title,
+      description: item.description || item.brief || '',
+      status: item.status,
+      assignedAgent: item.assignedAgent || null,
+      acceptanceCriteria: item.acceptanceCriteria || '',
+      requiredOutputs: Array.isArray(item.requiredOutputs) ? clonePlainList(item.requiredOutputs) : [],
+    })),
+    sourceTask: null,
+    instruction: '执行整个项目并生成最终项目交付物。必须输出 summary、artifacts、evidenceRefs；如存在项目工作区，应把可复核文件写入工作区。',
+  };
+}
+
+function collectProjectRequiredOutputs(tasks = []) {
+  const outputs = [];
+  for (const task of tasks) {
+    if (!Array.isArray(task?.requiredOutputs)) continue;
+    for (const output of task.requiredOutputs) outputs.push(output);
+  }
+  return clonePlainList(outputs);
 }
 
 function formatSourceTask(task = {}) {

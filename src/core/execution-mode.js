@@ -24,7 +24,7 @@ export function selectTaskExecutionStrategy({ project = {}, task = {}, now = Dat
   }
 
   if (mode === 'workflow_preferred') {
-    return buildSelection('workflow', 'project_default', 'project_workflow_preferred', now);
+    return buildSelection('direct', 'project_default', 'project_workflow_preferred_project_scope', now);
   }
 
   const reasonCode = inferWorkflowReasonCode(task);
@@ -120,13 +120,6 @@ function hasMultiSourceEvidence(task = {}) {
     task.dependencies,
     task.dependencyRefs,
   ].some(value => Array.isArray(value) && value.length > 1);
-}
-
-function isSimpleDirectTask(task = {}) {
-  if (inferWorkflowReasonCode(task)) return false;
-  if (hasMultiSourceEvidence(task)) return false;
-  const text = taskText(task);
-  return !/分析多个|整合多个|综合|审查|合规|风险|关键|高质量|报告终稿/i.test(text);
 }
 
 function taskText(task = {}) {
