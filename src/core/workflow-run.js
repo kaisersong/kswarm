@@ -112,6 +112,8 @@ export function createWorkflowRun(input = {}) {
     },
     phases,
     nodes,
+    parallelGroups: Array.isArray(input.parallelGroups) ? input.parallelGroups.map(group => normalizeParallelGroup(group)) : [],
+    scriptCheckpoints: Array.isArray(input.scriptCheckpoints) ? input.scriptCheckpoints.map(checkpoint => normalizeScriptCheckpoint(checkpoint)) : [],
     summary: null,
     diagnosis: input.diagnosis || null,
     recovery: null,
@@ -223,8 +225,14 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
   return refreshSummary(refreshReadiness(next));
 }
 
+export function refreshWorkflowRunState(run = {}) {
+  return refreshSummary(refreshReadiness(cloneRun(run)));
+}
+
 export function summarizeWorkflowRun(run = {}) {
   const nodes = Array.isArray(run.nodes) ? run.nodes : [];
+  const parallelGroups = Array.isArray(run.parallelGroups) ? run.parallelGroups : [];
+  const scriptCheckpoints = Array.isArray(run.scriptCheckpoints) ? run.scriptCheckpoints : [];
   const counts = {
     total: nodes.length,
     completed: nodes.filter(node => node.status === 'completed').length,
@@ -242,6 +250,20 @@ export function summarizeWorkflowRun(run = {}) {
     cache: {
       storedNodeCount: storedNodes.length,
       reusableNodeCount: reusableNodes.length,
+    },
+    parallelGroups: {
+      total: parallelGroups.length,
+      completed: parallelGroups.filter(group => group.status === 'completed').length,
+      failed: parallelGroups.filter(group => group.status === 'failed').length,
+      blocked: parallelGroups.filter(group => group.status === 'blocked').length,
+      running: parallelGroups.filter(group => ['queued', 'running', 'waiting_for_children'].includes(group.status)).length,
+      cancelled: parallelGroups.filter(group => group.status === 'cancelled').length,
+    },
+    checkpoints: {
+      total: scriptCheckpoints.length,
+      completed: scriptCheckpoints.filter(checkpoint => checkpoint.status === 'completed').length,
+      waiting: scriptCheckpoints.filter(checkpoint => checkpoint.status === 'waiting').length,
+      failed: scriptCheckpoints.filter(checkpoint => checkpoint.status === 'failed').length,
     },
     blockingFailures: nodes
       .filter(node => ['failed', 'blocked'].includes(node.status))
@@ -269,6 +291,56 @@ function normalizeNode(node) {
     error: node.error || null,
     startedAt: node.startedAt || null,
     completedAt: node.completedAt || null,
+    parallelGroupId: node.parallelGroupId || null,
+    fanoutItemKey: node.fanoutItemKey || null,
+    fanoutItemLabel: node.fanoutItemLabel || null,
+    pipelineStageIndex: Number.isFinite(Number(node.pipelineStageIndex)) ? Number(node.pipelineStageIndex) : null,
+    required: node.required !== false,
+    outputSchema: clonePlainValue(node.outputSchema || null),
+    evidenceRequired: node.evidenceRequired === true,
+  };
+}
+
+function normalizeParallelGroup(group = {}) {
+  const failurePolicy = ['required_all', 'collect_errors', 'fail_fast', 'quorum'].includes(group.failurePolicy)
+    ? group.failurePolicy
+    : 'required_all';
+  return {
+    id: String(group.id || ''),
+    workflowRunId: group.workflowRunId ? String(group.workflowRunId) : null,
+    phaseId: group.phaseId ? String(group.phaseId) : null,
+    primitiveId: group.primitiveId ? String(group.primitiveId) : null,
+    kind: ['parallel', 'pipeline'].includes(group.kind) ? group.kind : 'parallel',
+    label: String(group.label || group.id || '并行分组'),
+    status: group.status || 'queued',
+    limit: Math.max(1, Number(group.limit || 1)),
+    totalCount: Math.max(0, Number(group.totalCount || 0)),
+    completedCount: Math.max(0, Number(group.completedCount || 0)),
+    failedCount: Math.max(0, Number(group.failedCount || 0)),
+    cancelledCount: Math.max(0, Number(group.cancelledCount || 0)),
+    requiredFailedCount: Math.max(0, Number(group.requiredFailedCount || 0)),
+    failurePolicy,
+    quorum: Number.isFinite(Number(group.quorum)) ? Number(group.quorum) : null,
+    createdAt: group.createdAt || null,
+    updatedAt: group.updatedAt || null,
+    completedAt: group.completedAt || null,
+  };
+}
+
+function normalizeScriptCheckpoint(checkpoint = {}) {
+  return {
+    id: String(checkpoint.id || ''),
+    workflowRunId: checkpoint.workflowRunId ? String(checkpoint.workflowRunId) : null,
+    scriptHash: checkpoint.scriptHash ? String(checkpoint.scriptHash) : null,
+    primitiveType: checkpoint.primitiveType ? String(checkpoint.primitiveType) : null,
+    primitiveId: checkpoint.primitiveId ? String(checkpoint.primitiveId) : null,
+    phaseId: checkpoint.phaseId ? String(checkpoint.phaseId) : null,
+    parallelGroupId: checkpoint.parallelGroupId ? String(checkpoint.parallelGroupId) : null,
+    status: checkpoint.status || 'started',
+    inputHash: checkpoint.inputHash ? String(checkpoint.inputHash) : null,
+    outputRefs: Array.isArray(checkpoint.outputRefs) ? checkpoint.outputRefs.map(String).filter(Boolean) : [],
+    createdAt: checkpoint.createdAt || null,
+    updatedAt: checkpoint.updatedAt || null,
   };
 }
 
@@ -307,21 +379,91 @@ function refreshPhases(run) {
 }
 
 function refreshSummary(run) {
-  const summary = summarizeWorkflowRun(run);
-  let status = run.status;
+  const withGroups = refreshParallelGroups(run);
+  const withCheckpoints = refreshScriptCheckpoints(withGroups);
+  const summary = summarizeWorkflowRun(withCheckpoints);
+  let status = withCheckpoints.status;
   if (!TERMINAL_RUN_STATUSES.has(status) && status !== 'awaiting_approval') {
-    if (run.gateDecision?.status && run.gateDecision.status !== 'passed') status = 'blocked';
+    if (withGroups.gateDecision?.status && withGroups.gateDecision.status !== 'passed') status = 'blocked';
     else if (summary.failed > 0) status = 'failed';
     else if (summary.blocked > 0) status = 'blocked';
     else if (summary.total > 0 && summary.completed === summary.total) status = 'completed';
     else status = 'running';
   }
   return {
-    ...run,
+    ...withGroups,
+    ...withCheckpoints,
     status,
-    completedAt: status === 'completed' ? (run.completedAt || run.updatedAt) : run.completedAt,
+    completedAt: status === 'completed' ? (withCheckpoints.completedAt || withCheckpoints.updatedAt) : withCheckpoints.completedAt,
     summary,
-    recovery: summarizeRecovery({ ...run, status, summary }),
+    recovery: summarizeRecovery({ ...withCheckpoints, status, summary }),
+  };
+}
+
+function refreshParallelGroups(run) {
+  const parallelGroups = Array.isArray(run.parallelGroups) ? run.parallelGroups : [];
+  if (parallelGroups.length === 0) return { ...run, parallelGroups: [] };
+  const nodes = Array.isArray(run.nodes) ? run.nodes : [];
+  return {
+    ...run,
+    parallelGroups: parallelGroups.map(rawGroup => {
+      const group = normalizeParallelGroup(rawGroup);
+      const groupNodes = nodes.filter(node => node.parallelGroupId === group.id);
+      const completedCount = groupNodes.filter(node => node.status === 'completed').length;
+      const failedCount = groupNodes.filter(node => node.status === 'failed').length;
+      const blockedCount = groupNodes.filter(node => node.status === 'blocked').length;
+      const cancelledCount = groupNodes.filter(node => node.status === 'cancelled').length;
+      const requiredFailedCount = groupNodes.filter(node => node.required !== false && ['failed', 'blocked'].includes(node.status)).length;
+      const totalCount = Math.max(group.totalCount, groupNodes.length);
+      let status = group.status;
+      if (totalCount > 0 && completedCount >= totalCount) status = 'completed';
+      else if (group.failurePolicy === 'required_all' && requiredFailedCount > 0) status = 'failed';
+      else if (blockedCount > 0) status = 'blocked';
+      else if (totalCount > 0 && cancelledCount >= totalCount) status = 'cancelled';
+      else if (groupNodes.length > 0) status = 'waiting_for_children';
+      else if (status === 'queued') status = 'running';
+      return {
+        ...group,
+        status,
+        totalCount,
+        completedCount,
+        failedCount,
+        cancelledCount,
+        requiredFailedCount,
+        updatedAt: run.updatedAt || group.updatedAt,
+        completedAt: status === 'completed' ? (group.completedAt || run.updatedAt || null) : group.completedAt,
+      };
+    }),
+  };
+}
+
+function refreshScriptCheckpoints(run) {
+  const checkpoints = Array.isArray(run.scriptCheckpoints) ? run.scriptCheckpoints : [];
+  if (checkpoints.length === 0) return { ...run, scriptCheckpoints: [] };
+  const nodes = Array.isArray(run.nodes) ? run.nodes : [];
+  const groups = Array.isArray(run.parallelGroups) ? run.parallelGroups : [];
+  return {
+    ...run,
+    scriptCheckpoints: checkpoints.map(rawCheckpoint => {
+      const checkpoint = normalizeScriptCheckpoint(rawCheckpoint);
+      let status = checkpoint.status;
+      if (checkpoint.primitiveType === 'parallel' || checkpoint.primitiveType === 'pipeline') {
+        const group = groups.find(item => item.id === checkpoint.parallelGroupId);
+        if (group?.status === 'completed') status = 'completed';
+        else if (['failed', 'blocked', 'cancelled'].includes(group?.status)) status = group.status;
+        else if (group) status = 'waiting';
+      } else if (checkpoint.primitiveType === 'agent') {
+        const node = nodes.find(item => checkpoint.outputRefs.includes(item.id));
+        if (node?.status === 'completed') status = 'completed';
+        else if (['failed', 'blocked', 'cancelled'].includes(node?.status)) status = node.status;
+        else if (node) status = 'waiting';
+      }
+      return {
+        ...checkpoint,
+        status,
+        updatedAt: run.updatedAt || checkpoint.updatedAt,
+      };
+    }),
   };
 }
 
@@ -335,6 +477,12 @@ function cloneRun(run) {
       dependsOn: [...(node.dependsOn || [])],
       output: clonePlainValue(node.output),
       cache: clonePlainValue(node.cache),
+      outputSchema: clonePlainValue(node.outputSchema),
+    })),
+    parallelGroups: (run.parallelGroups || []).map(group => ({ ...group })),
+    scriptCheckpoints: (run.scriptCheckpoints || []).map(checkpoint => ({
+      ...checkpoint,
+      outputRefs: [...(checkpoint.outputRefs || [])],
     })),
     summary: run.summary ? { ...run.summary } : null,
     diagnosis: clonePlainValue(run.diagnosis),

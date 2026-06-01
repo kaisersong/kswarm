@@ -34,7 +34,7 @@ import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
-import { applyWorkflowEvent, createWorkflowRun } from './workflow-run.js';
+import { applyWorkflowEvent, createWorkflowRun, refreshWorkflowRunState } from './workflow-run.js';
 import {
   AGENT_REVIEW_SMOKE_WORKFLOW_ID,
   PO_GENERATED_PROJECT_WORKFLOW_ID,
@@ -2086,12 +2086,109 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: [] };
   }
 
+  function beginWorkflowScriptParallelGroup(workflowRunId, {
+    phaseTitle,
+    label,
+    primitiveId = null,
+    kind = 'parallel',
+    totalCount = 0,
+    limit = 1,
+    failurePolicy = 'required_all',
+    quorum = null,
+    now = Date.now(),
+  } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
+    if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
+    if (!readWorkflowString(phaseTitle)) return { ok: false, error: 'workflow_script_phase_required' };
+
+    const normalizedKind = ['parallel', 'pipeline'].includes(kind) ? kind : 'parallel';
+    const normalizedFailurePolicy = ['required_all', 'collect_errors', 'fail_fast', 'quorum'].includes(failurePolicy)
+      ? failurePolicy
+      : 'required_all';
+    const phaseState = ensureScriptWorkflowPhase(workflowRun, phaseTitle);
+    const phase = phaseState.phase;
+    const groupId = allocateScriptParallelGroupId(workflowRun);
+    const parallelGroup = {
+      id: groupId,
+      workflowRunId,
+      phaseId: phase.id,
+      primitiveId: readWorkflowString(primitiveId) || groupId,
+      kind: normalizedKind,
+      label: readWorkflowString(label) || (normalizedKind === 'pipeline' ? '动态管线' : '并行分组'),
+      status: 'running',
+      limit: Math.max(1, Number(limit || 1)),
+      totalCount: Math.max(0, Number(totalCount || 0)),
+      completedCount: 0,
+      failedCount: 0,
+      cancelledCount: 0,
+      requiredFailedCount: 0,
+      failurePolicy: normalizedFailurePolicy,
+      quorum: Number.isFinite(Number(quorum)) ? Number(quorum) : null,
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    };
+    const nextRun = {
+      ...workflowRun,
+      updatedAt: now,
+      phases: phaseState.phases,
+      parallelGroups: [...(workflowRun.parallelGroups || []), parallelGroup],
+      scriptCheckpoints: [
+        ...(workflowRun.scriptCheckpoints || []),
+        createScriptCheckpoint(workflowRun, {
+          primitiveType: normalizedKind,
+          primitiveId: parallelGroup.primitiveId,
+          phaseId: phase.id,
+          parallelGroupId: groupId,
+          status: 'waiting',
+          input: {
+            label: parallelGroup.label,
+            totalCount: parallelGroup.totalCount,
+            limit: parallelGroup.limit,
+            failurePolicy: parallelGroup.failurePolicy,
+          },
+          now,
+        }),
+      ],
+      scriptState: {
+        ...(workflowRun.scriptState || {}),
+        parallelGroupCount: Number(workflowRun.scriptState?.parallelGroupCount || 0) + 1,
+        lastParallelGroupCreatedAt: now,
+      },
+    };
+    const refreshed = refreshWorkflowRunState(nextRun);
+    workflowRuns.set(refreshed.id, refreshed);
+    eventLog.emit('workflow.script.parallel_group.created', {
+      projectId: refreshed.projectId,
+      workflowRunId,
+      workflowId: refreshed.workflowId,
+      parallelGroupId: groupId,
+      phaseId: phase.id,
+      kind: normalizedKind,
+      failurePolicy: normalizedFailurePolicy,
+    });
+    return {
+      ok: true,
+      workflowRun: refreshed,
+      parallelGroup: refreshed.parallelGroups.find(group => group.id === groupId) || parallelGroup,
+    };
+  }
+
   function dispatchWorkflowScriptAgentNode(workflowRunId, {
     phaseTitle,
     label,
     prompt,
     assignedAgent = null,
     options = null,
+    parallelGroupId = null,
+    fanoutItemKey = null,
+    fanoutItemLabel = null,
+    pipelineStageIndex = null,
+    required = true,
+    outputSchema = null,
+    evidenceRequired = false,
     now = Date.now(),
   } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
@@ -2100,6 +2197,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
     if (!readWorkflowString(phaseTitle)) return { ok: false, error: 'workflow_script_phase_required' };
     if (!readWorkflowString(prompt)) return { ok: false, error: 'workflow_script_prompt_required' };
+    const normalizedParallelGroupId = readWorkflowString(parallelGroupId);
+    if (normalizedParallelGroupId && !(workflowRun.parallelGroups || []).some(group => group.id === normalizedParallelGroupId)) {
+      return { ok: false, error: 'workflow_parallel_group_not_found', parallelGroupId: normalizedParallelGroupId };
+    }
 
     const project = projects.get(workflowRun.projectId);
     const workerAgent = assignedAgent || (Array.isArray(project?.members) && project.members[0]) || 'xiaok-worker';
@@ -2137,6 +2238,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       error: null,
       startedAt: null,
       completedAt: null,
+      parallelGroupId: normalizedParallelGroupId || null,
+      fanoutItemKey: readWorkflowString(fanoutItemKey),
+      fanoutItemLabel: readWorkflowString(fanoutItemLabel),
+      pipelineStageIndex: Number.isFinite(Number(pipelineStageIndex)) ? Number(pipelineStageIndex) : null,
+      required: required !== false,
+      outputSchema: outputSchema && typeof outputSchema === 'object' && !Array.isArray(outputSchema)
+        ? JSON.parse(JSON.stringify(outputSchema))
+        : null,
+      evidenceRequired: evidenceRequired === true,
     };
 
     const withNode = {
@@ -2146,6 +2256,19 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         ? { ...item, nodeIds: [...new Set([...(item.nodeIds || []), nodeId])] }
         : item),
       nodes: [...workflowRun.nodes, node],
+      scriptCheckpoints: [
+        ...(workflowRun.scriptCheckpoints || []),
+        createScriptCheckpoint(workflowRun, {
+          primitiveType: 'agent',
+          primitiveId: nodeId,
+          phaseId: phase.id,
+          parallelGroupId: normalizedParallelGroupId || null,
+          status: 'waiting',
+          input: node.input,
+          outputRefs: [nodeId],
+          now,
+        }),
+      ],
       scriptState: {
         ...(workflowRun.scriptState || {}),
         dynamicNodeCount: Number(workflowRun.scriptState?.dynamicNodeCount || 0) + 1,
@@ -2171,7 +2294,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
   }
 
-  function completeScriptWorkflowRun(workflowRunId, { result = null, now = Date.now() } = {}) {
+  function completeScriptWorkflowRun(workflowRunId, { result = null, terminal = null, now = Date.now() } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
     if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
@@ -2209,6 +2332,37 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         completedAt: now,
       },
     };
+    const terminalDecision = normalizeWorkflowScriptTerminalDecision(terminal);
+    if (terminalDecision && terminalDecision.status !== 'passed') {
+      withResult = {
+        ...withResult,
+        status: 'blocked',
+        completedAt: null,
+        gateDecision: terminalDecision,
+        summary: {
+          ...(withResult.summary || {}),
+          primaryMessage: terminalDecision.reason || 'Workflow blocked',
+          blockingFailures: [
+            ...((withResult.summary?.blockingFailures || [])),
+            {
+              nodeId: runtimeNode.id,
+              title: runtimeNode.title,
+              status: 'blocked',
+              reason: terminalDecision.reason || terminalDecision.status,
+            },
+          ],
+        },
+      };
+      workflowRuns.set(withResult.id, withResult);
+      eventLog.emit('workflow.run.blocked', {
+        projectId: withResult.projectId,
+        workflowRunId,
+        workflowId: withResult.workflowId,
+        status: terminalDecision.status,
+        source: 'script_generated',
+      });
+      return { ok: true, workflowRun: withResult, dispatches: [], projectDelivery: null };
+    }
     const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
     withResult = projectFinalization.workflowRun;
     workflowRuns.set(withResult.id, withResult);
@@ -2695,6 +2849,54 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     }
     return nodeId;
   }
+
+  function allocateScriptParallelGroupId(workflowRun) {
+    const existing = new Set((workflowRun.parallelGroups || []).map(group => group.id));
+    let index = (workflowRun.parallelGroups || []).filter(group => String(group.id || '').startsWith('script-parallel-')).length + 1;
+    let groupId = `script-parallel-${index}`;
+    while (existing.has(groupId)) {
+      index += 1;
+      groupId = `script-parallel-${index}`;
+    }
+    return groupId;
+  }
+
+  function allocateScriptCheckpointId(workflowRun) {
+    const existing = new Set((workflowRun.scriptCheckpoints || []).map(checkpoint => checkpoint.id));
+    let index = (workflowRun.scriptCheckpoints || []).filter(checkpoint => String(checkpoint.id || '').startsWith('script-checkpoint-')).length + 1;
+    let checkpointId = `script-checkpoint-${index}`;
+    while (existing.has(checkpointId)) {
+      index += 1;
+      checkpointId = `script-checkpoint-${index}`;
+    }
+    return checkpointId;
+  }
+
+  function createScriptCheckpoint(workflowRun, {
+    primitiveType,
+    primitiveId,
+    phaseId = null,
+    parallelGroupId = null,
+    status = 'waiting',
+    input = null,
+    outputRefs = [],
+    now = Date.now(),
+  } = {}) {
+    return {
+      id: allocateScriptCheckpointId(workflowRun),
+      workflowRunId: workflowRun.id,
+      scriptHash: workflowRun.scriptHash || null,
+      primitiveType,
+      primitiveId: readWorkflowString(primitiveId) || primitiveType,
+      phaseId,
+      parallelGroupId,
+      status,
+      inputHash: createHash('sha256').update(JSON.stringify(input ?? null)).digest('hex'),
+      outputRefs: Array.isArray(outputRefs) ? outputRefs.map(String).filter(Boolean) : [],
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
   function defaultWorkflowPolicyFor(spec) {
     return {
       maxNodes: Math.max(1, flattenSpecNodeCount(spec)),
@@ -2771,6 +2973,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (value === null || value === undefined || value === '') return;
     target[key] = value;
   }
+
+  function normalizeWorkflowScriptTerminalDecision(terminal) {
+    if (!terminal || typeof terminal !== 'object' || Array.isArray(terminal)) return null;
+    const status = readWorkflowString(terminal.status);
+    if (!status || status === 'finished') return { status: 'passed', reason: readWorkflowString(terminal.reason), evidenceRefs: readWorkflowStringArray(terminal.evidenceRefs) };
+    const gateStatus = status === 'blocked' || status === 'needs_replanning' || status === 'needs_rubric_clarification'
+      ? status
+      : 'blocked';
+    return {
+      status: gateStatus,
+      reason: readWorkflowString(terminal.reason) || gateStatus,
+      evidenceRefs: readWorkflowStringArray(terminal.evidenceRefs),
+    };
+  }
+
   function getFirstDependencyOutput(workflowRun, node) {
     const dependencyId = Array.isArray(node.dependsOn) ? node.dependsOn[0] : null;
     if (!dependencyId) return null;
@@ -3490,6 +3707,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     createScriptWorkflowProposal,
     startWorkflowRunFromProposal,
     startScriptWorkflowRunFromProposal,
+    beginWorkflowScriptParallelGroup,
     dispatchWorkflowScriptAgentNode,
     completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow,
@@ -3526,6 +3744,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     createScriptWorkflowProposal: persisted.createScriptWorkflowProposal,
     startWorkflowRunFromProposal: persisted.startWorkflowRunFromProposal,
     startScriptWorkflowRunFromProposal: persisted.startScriptWorkflowRunFromProposal,
+    beginWorkflowScriptParallelGroup: persisted.beginWorkflowScriptParallelGroup,
     dispatchWorkflowScriptAgentNode: persisted.dispatchWorkflowScriptAgentNode,
     completeScriptWorkflowRun: persisted.completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,

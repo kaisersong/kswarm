@@ -431,6 +431,45 @@ test('script-generated workflow cannot be completed while dynamic agent nodes ar
   }
 });
 
+test('script-generated workflow terminal block keeps run blocked instead of delivered', () => {
+  const dir = makeTempDir('terminal-block');
+  try {
+    const hub = createHub({ eventLogDir: join(dir, 'events'), silent: true });
+    createActiveProject(hub, 'proj-script-block');
+
+    const proposal = hub.createScriptWorkflowProposal('proj-script-block', makePreview('proj-script-block'), {
+      requestedBy: 'human',
+      now: 1780000030000,
+    });
+    const started = hub.startScriptWorkflowRunFromProposal(proposal.workflowProposal.id, {
+      approvedBy: 'human',
+      now: 1780000030100,
+    });
+    const finished = hub.completeScriptWorkflowRun(started.workflowRun.id, {
+      result: {
+        status: 'blocked',
+        reason: '缺少 HTML 交付物',
+        evidenceRefs: ['artifacts/report.md'],
+      },
+      terminal: {
+        status: 'blocked',
+        reason: '缺少 HTML 交付物',
+        evidenceRefs: ['artifacts/report.md'],
+      },
+      now: 1780000030200,
+    });
+
+    assert.equal(finished.ok, true);
+    assert.equal(finished.workflowRun.status, 'blocked');
+    assert.equal(finished.workflowRun.gateDecision.status, 'blocked');
+    assert.equal(finished.workflowRun.gateDecision.reason, '缺少 HTML 交付物');
+    assert.deepEqual(finished.workflowRun.gateDecision.evidenceRefs, ['artifacts/report.md']);
+    assert.equal(hub.getProject('proj-script-block').status, 'active');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

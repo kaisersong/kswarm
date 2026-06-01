@@ -1547,6 +1547,30 @@ async function handleRequest(req, res) {
       return json(res, result, result.error === 'workflow_proposal_not_found' ? 404 : 400);
     }
 
+    const scriptWorkflowParallelGroupMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/parallel-groups$/);
+    if (scriptWorkflowParallelGroupMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId] = scriptWorkflowParallelGroupMatch;
+      const body = await parseBody(req);
+      const existingRun = hub.getWorkflowRun(workflowRunId);
+      if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
+      if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
+      const result = hub.beginWorkflowScriptParallelGroup(workflowRunId, {
+        phaseTitle: body?.phaseTitle,
+        label: body?.label,
+        primitiveId: body?.primitiveId,
+        kind: body?.kind,
+        totalCount: body?.totalCount,
+        limit: body?.limit,
+        failurePolicy: body?.failurePolicy,
+        quorum: body?.quorum,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+        return json(res, result, 201);
+      }
+      return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
+    }
+
     const scriptWorkflowNodeMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes$/);
     if (scriptWorkflowNodeMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowNodeMatch;
@@ -1560,6 +1584,13 @@ async function handleRequest(req, res) {
         prompt: body?.prompt,
         assignedAgent: body?.assignedAgent || null,
         options: body?.options || null,
+        parallelGroupId: body?.parallelGroupId || null,
+        fanoutItemKey: body?.fanoutItemKey || null,
+        fanoutItemLabel: body?.fanoutItemLabel || null,
+        pipelineStageIndex: body?.pipelineStageIndex ?? null,
+        required: body?.required !== false,
+        outputSchema: body?.outputSchema || null,
+        evidenceRequired: body?.evidenceRequired === true,
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
@@ -1579,6 +1610,7 @@ async function handleRequest(req, res) {
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
       const result = hub.completeScriptWorkflowRun(workflowRunId, {
         result: body?.result ?? null,
+        terminal: body?.terminal ?? null,
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_completed', projectId, workflowRun: result.workflowRun });

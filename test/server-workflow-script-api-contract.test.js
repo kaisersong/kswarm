@@ -16,11 +16,14 @@ function test(name, fn) { tests.push({ name, fn }); }
 test('server wires script-generated workflow proposal, run, node, and completion endpoints', () => {
   assert.match(source, /createScriptWorkflowProposal/);
   assert.match(source, /startScriptWorkflowRunFromProposal/);
+  assert.match(source, /beginWorkflowScriptParallelGroup/);
   assert.match(source, /dispatchWorkflowScriptAgentNode/);
   assert.match(source, /completeScriptWorkflowRun/);
   assert.ok(source.includes('script-generated\\/proposal'));
+  assert.ok(source.includes('script\\/parallel-groups'));
   assert.ok(source.includes('script\\/nodes'));
   assert.ok(source.includes('script\\/complete'));
+  assert.ok(source.includes('terminal: body?.terminal'));
 });
 
 let passed = 0;
