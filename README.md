@@ -8,6 +8,14 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
+## What's New in v0.8.2
+
+- **Durable Parallel Workflow Groups** — script-generated workflow runs can now create KSwarm-owned `parallelGroups` before branch dispatch. Group status, completion counters, failure policy, and timestamps are persisted with the workflow run.
+- **Branch Metadata and Script Checkpoints** — dynamic branch nodes store `parallelGroupId`, fan-out key/label, required/schema/evidence flags, and script checkpoints so Desktop can explain parallel progress from KSwarm snapshots.
+- **Script Terminal Decisions** — trusted script runtimes can finish normally or block a run with structured `blocked`, `needs_replanning`, or `needs_rubric_clarification` terminal decisions instead of forcing every script to appear completed.
+- **HTTP Contract for Parallel Scripts** — the server exposes `/script/parallel-groups`, forwards branch metadata through `/script/nodes`, and accepts structured terminal data on `/script/complete`.
+- **Workflow Test Coverage** — `npm run test:workflow` now includes durable parallel group coverage in addition to script-generated workflow control-plane and API contract tests.
+
 ## What's New in v0.8.1
 
 - **Script-Generated Workflow Runs** — KSwarm now owns durable control-plane state for trusted dynamic workflow scripts: proposals, approved runs, script runtime nodes, dynamic agent nodes, node handoffs, node results, and completion.
@@ -80,6 +88,7 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 - **Phase-aware Dispatch** — Only earliest incomplete phase dispatches; prevents premature parallel work
 - **Capability-aware Routing** — Retries and dispatches route to healthy agents with matching task/output capability
 - **Runtime Watchdogs** — Heartbeats, stdout/stderr telemetry, and stale-run detection prevent silent CLI hangs
+- **Durable Dynamic Workflow Parallelism** — script-generated workflow branches can be grouped, counted, checkpointed, and surfaced to Desktop without relying on runtime memory
 - **Deliverable Contracts** — Explicit PPTX/HTML/Markdown tasks are validated before review
 - **Plan Retry Recovery** — Projects interrupted during PO planning can be restarted safely
 - **File Handoff Packages** — Task context is written to durable handoff packages so agents read large requirements and prior artifacts from files

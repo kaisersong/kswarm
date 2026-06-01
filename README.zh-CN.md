@@ -8,6 +8,14 @@
 
 ---
 
+## v0.8.2 新特性
+
+- **持久化并行 Workflow Group**：script-generated workflow run 现在可以在分支派发前创建由 KSwarm 管控的 `parallelGroups`。分组状态、完成计数、失败策略和时间戳都会随 workflow run 持久化。
+- **分支元数据与脚本 Checkpoint**：动态分支节点会记录 `parallelGroupId`、fan-out key/label、required/schema/evidence 标记和脚本 checkpoint，Desktop 可以直接从 KSwarm snapshot 解释并行进度。
+- **脚本终态决策**：可信 script runtime 可以正常完成，也可以用结构化 `blocked`、`needs_replanning` 或 `needs_rubric_clarification` 终态阻塞 run，而不是把所有脚本都伪装成 completed。
+- **并行脚本 HTTP 契约**：server 新增 `/script/parallel-groups`，`/script/nodes` 会透传分支元数据，`/script/complete` 支持结构化 terminal 数据。
+- **Workflow 测试覆盖**：`npm run test:workflow` 已包含 durable parallel group 测试，同时保留 script-generated workflow 控制面和 API contract 测试。
+
 ## v0.8.1 新特性
 
 - **Script-Generated Workflow Run**：KSwarm 现在负责受控动态 workflow script 的持久化控制面状态，包括 proposal、approved run、script runtime node、动态 agent node、节点 handoff、节点结果和完成状态。
@@ -80,6 +88,7 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 - **阶段感知派发** — 只派发最早未完成阶段的任务；防止过早并行
 - **能力感知路由** — 派发和失败重试会选择健康且具备任务/输出能力的 agent
 - **Runtime Watchdog** — 通过 heartbeat、stdout/stderr telemetry 和 stale-run 检测避免 CLI 静默卡死
+- **持久化动态工作流并行状态** — script-generated workflow 分支可以被分组、计数、checkpoint，并展示到 Desktop，而不是依赖 runtime 内存状态
 - **交付物合同** — 显式 PPTX/HTML/Markdown 任务会在验收前校验产物类型
 - **计划重试恢复** — PO 制定计划阶段中断的项目可安全重新启动规划
 - **文件化 Handoff Package** — 任务上下文写入可持久化交接包，agent 从文件读取大段要求和上游产物
