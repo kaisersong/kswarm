@@ -190,6 +190,72 @@ test('script parallel group is durable and tracks branch node counters', () => {
   }
 });
 
+test('script parallel group with quorum completes after enough required branches pass', () => {
+  const dir = makeTempDir('quorum');
+  try {
+    const hub = createHub({ eventLogDir: join(dir, 'events'), silent: true });
+    const workflowRun = startScriptWorkflow(hub, 'proj-quorum');
+
+    const groupResult = hub.beginWorkflowScriptParallelGroup(workflowRun.id, {
+      phaseTitle: '并行复核',
+      label: '三路法定复核',
+      primitiveId: 'parallel-1',
+      kind: 'parallel',
+      totalCount: 3,
+      limit: 3,
+      failurePolicy: 'quorum',
+      quorum: 2,
+      now: 1781000010300,
+    });
+    assert.equal(groupResult.ok, true);
+
+    const branches = ['事实复核', '证据复核', '格式复核'].map((label, index) => {
+      const result = hub.dispatchWorkflowScriptAgentNode(workflowRun.id, {
+        phaseTitle: '并行复核',
+        label,
+        prompt: `${label}。`,
+        assignedAgent: 'xiaok-worker',
+        parallelGroupId: groupResult.parallelGroup.id,
+        fanoutItemKey: `branch-${index + 1}`,
+        fanoutItemLabel: label,
+        required: true,
+        now: 1781000010400 + index,
+      });
+      assert.equal(result.ok, true);
+      return result.dispatches[0];
+    });
+
+    for (const dispatch of branches.slice(0, 2)) {
+      const done = hub.handleWorkflowNodeResult({
+        workflowRunId: workflowRun.id,
+        nodeId: dispatch.nodeId,
+        attempt: dispatch.attempt,
+        handoffId: dispatch.handoffId,
+        fromAgent: 'xiaok-worker',
+        output: { summary: `${dispatch.nodeTitle}通过。` },
+        now: 1781000010600,
+      });
+      assert.equal(done.ok, true);
+    }
+
+    const blocked = hub.handleWorkflowRuntimeUnavailable({
+      workflowRunId: workflowRun.id,
+      nodeId: branches[2].nodeId,
+      attempt: branches[2].attempt,
+      handoffId: branches[2].handoffId,
+      reason: 'branch_failed',
+      now: 1781000010700,
+    });
+    assert.equal(blocked.ok, true);
+    assert.equal(blocked.workflowRun.parallelGroups[0].status, 'completed');
+    assert.equal(blocked.workflowRun.parallelGroups[0].completedCount, 2);
+    assert.equal(blocked.workflowRun.parallelGroups[0].requiredFailedCount, 1);
+    assert.equal(blocked.workflowRun.summary.parallelGroups.completed, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 for (const { name, fn } of tests) {
   try {
     await fn();

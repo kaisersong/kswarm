@@ -415,9 +415,15 @@ function refreshParallelGroups(run) {
       const cancelledCount = groupNodes.filter(node => node.status === 'cancelled').length;
       const requiredFailedCount = groupNodes.filter(node => node.required !== false && ['failed', 'blocked'].includes(node.status)).length;
       const totalCount = Math.max(group.totalCount, groupNodes.length);
+      const terminalCount = completedCount + failedCount + blockedCount + cancelledCount;
+      const quorum = Number.isFinite(Number(group.quorum)) ? Math.max(1, Number(group.quorum)) : totalCount;
       let status = group.status;
-      if (totalCount > 0 && completedCount >= totalCount) status = 'completed';
+      if (group.failurePolicy === 'quorum' && completedCount >= quorum) status = 'completed';
+      else if (totalCount > 0 && completedCount >= totalCount) status = 'completed';
+      else if (group.failurePolicy === 'collect_errors' && totalCount > 0 && terminalCount >= totalCount) status = 'completed';
+      else if (group.failurePolicy === 'fail_fast' && requiredFailedCount > 0) status = 'failed';
       else if (group.failurePolicy === 'required_all' && requiredFailedCount > 0) status = 'failed';
+      else if (group.failurePolicy === 'quorum' && totalCount > 0 && (completedCount + Math.max(0, totalCount - terminalCount)) < quorum) status = 'failed';
       else if (blockedCount > 0) status = 'blocked';
       else if (totalCount > 0 && cancelledCount >= totalCount) status = 'cancelled';
       else if (groupNodes.length > 0) status = 'waiting_for_children';
