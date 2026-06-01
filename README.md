@@ -8,6 +8,14 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
+## What's New in v0.8.1
+
+- **Script-Generated Workflow Runs** — KSwarm now owns durable control-plane state for trusted dynamic workflow scripts: proposals, approved runs, script runtime nodes, dynamic agent nodes, node handoffs, node results, and completion.
+- **Artifact-Producing Agent Delivery** — Project-level script workflows can deliver from the final artifact-producing agent node when the script runtime node only contains orchestration metadata.
+- **Required Output Enforcement** — Project delivery validates terminal task hard outputs, so a workflow requiring `report_html` must attach a readable HTML artifact instead of passing with markdown/json side products.
+- **Project Instance Identity** — New projects use UUID-style instance IDs and client request keys for idempotency. Same-name projects are no longer collapsed into one project instance.
+- **Desktop API Contract** — The HTTP API exposes script workflow proposal/start/node/complete endpoints and supports creating projects without auto-starting PO planning for controlled workflow E2E tests.
+
 ## Architecture
 
 ```

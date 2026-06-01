@@ -8,6 +8,14 @@
 
 ---
 
+## v0.8.1 新特性
+
+- **Script-Generated Workflow Run**：KSwarm 现在负责受控动态 workflow script 的持久化控制面状态，包括 proposal、approved run、script runtime node、动态 agent node、节点 handoff、节点结果和完成状态。
+- **从产出物 Agent 节点交付**：项目级 script workflow 完成时，如果 `script-runtime` 只有编排元数据，KSwarm 会从最终产出 artifact 的 agent 节点生成项目交付物。
+- **强输出合同校验**：项目交付会校验终态任务的硬输出要求；要求 `report_html` 的 workflow 必须挂上可读 HTML artifact，不能只用 markdown/json 辅助产物通过。
+- **项目实例身份**：新项目使用 UUID 风格实例 ID，并支持 `clientRequestKey` 做幂等创建；同名项目不再被误合并为同一个项目实例。
+- **Desktop API 契约**：HTTP API 新增 script workflow proposal/start/node/complete 端点，并支持创建项目时关闭自动 PO 规划，便于受控 workflow E2E 验证。
+
 ## 架构
 
 ```

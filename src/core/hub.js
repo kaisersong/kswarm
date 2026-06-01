@@ -15,7 +15,7 @@
 import { createTaskBoard, restoreTaskBoard } from './task-board.js';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
 import { createPersistence } from './persistence.js';
@@ -34,7 +34,7 @@ import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
-import { applyWorkflowEvent } from './workflow-run.js';
+import { applyWorkflowEvent, createWorkflowRun } from './workflow-run.js';
 import {
   AGENT_REVIEW_SMOKE_WORKFLOW_ID,
   PO_GENERATED_PROJECT_WORKFLOW_ID,
@@ -117,6 +117,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
   // Human action log — tracks all human decisions
   const humanActions = [];
+
+  if (persistence) {
+    const reconciliation = reconcileRecoveredScriptWorkflowProjectDeliveries();
+    if (reconciliation.delivered.length > 0 || reconciliation.blocked.length > 0) {
+      persistState();
+    }
+  }
 
   function recordHumanAction(action, data) {
     const entry = { ts: new Date().toISOString(), action, ...data };
@@ -239,8 +246,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
   // ─── Project lifecycle ─────────────────────────────────────────────
 
-  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct' }) {
+  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey }) {
     const createdAt = Date.now();
+    const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
+    const effectiveName = normalizeProjectNameForDisplay(name);
     const qualityRuleSet = compileEffectiveQualityRuleSet({
       goal: goal || '',
       requirements: requirements || '',
@@ -253,7 +262,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const effectivePlanningGuidance = appendQualityPlanningGuidance(planningGuidance || '', qualityPlanningGuidance);
     const project = {
       id,
-      name,
+      name: effectiveName,
       goal,
       requirements: requirements || '',
       planningGuidance: planningGuidance || '',
@@ -277,11 +286,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       summary: null,        // Project summary section text (set at synthesize)
       summaryScore: null,   // Project score 1-10 (parsed from synthesis)
     };
+    if (normalizedClientRequestKey) {
+      project.clientRequestKey = normalizedClientRequestKey;
+    }
     projects.set(id, project);
     boards.set(id, createTaskBoard(id));
 
-    eventLog.emit('project.created', { projectId: id, projectName: name, po: poAgent });
-    recordHumanAction('create_project', { projectId: id, projectName: name, poAgent });
+    eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: poAgent });
+    recordHumanAction('create_project', { projectId: id, projectName: effectiveName, poAgent });
 
     if (preparationContext) {
       project.preparation = deriveProjectPreparation({
@@ -295,10 +307,30 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       });
     }
 
-    if (!project.preparation || project.preparation.state === 'ready') {
+    if (autoAssignPo !== false && (!project.preparation || project.preparation.state === 'ready')) {
       sendAssignPo(project, effectivePlanningGuidance);
     }
     return project;
+  }
+
+  function findReusableProjectForCreateRequest({ clientRequestKey } = {}) {
+    const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
+    if (normalizedClientRequestKey) {
+      const exact = [...projects.values()]
+        .find(project => normalizeProjectCreateClientRequestKey(project.clientRequestKey) === normalizedClientRequestKey);
+      if (exact) return exact;
+    }
+    return null;
+  }
+
+  function normalizeProjectNameForDisplay(value) {
+    if (typeof value !== 'string') return '未命名项目';
+    return value.trim().replace(/\s+/g, ' ') || '未命名项目';
+  }
+
+  function normalizeProjectCreateClientRequestKey(value) {
+    if (typeof value !== 'string') return '';
+    return value.trim().replace(/\s+/g, ' ').slice(0, 240);
   }
 
   function normalizeAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
@@ -614,7 +646,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       return selection.strategy === 'workflow' && selection.modeSource === 'manual_override';
     });
 
-    if (projectExecutionMode === 'workflow_preferred' && !explicitTaskWorkflowDispatch) {
+    const taskGraphHasDispatchableWork = plannedTasks.length > 0;
+    if (projectExecutionMode === 'workflow_preferred' && !explicitTaskWorkflowDispatch && !taskGraphHasDispatchableWork) {
       const activeProjectWorkflow = findActiveProjectExecutionWorkflow(project.id);
       if (activeProjectWorkflow) {
         return {
@@ -1771,6 +1804,65 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowProposal: cancelled };
   }
 
+  function createScriptWorkflowProposal(projectId, preview, { requestedBy = 'human', now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+
+    const validation = validateScriptWorkflowPreview(projectId, preview);
+    if (!validation.ok) return validation;
+    const normalized = validation.preview;
+
+    const workflowProposal = {
+      id: `wfp-${projectId}-${normalized.workflowId}-${now}`,
+      projectId,
+      workflowId: normalized.workflowId,
+      strategy: 'workflow',
+      source: 'script_generated',
+      scope: normalized.scope,
+      sourceTask: null,
+      title: normalized.title,
+      description: normalized.description,
+      goal: normalized.description,
+      status: 'pending',
+      requestedBy,
+      createdAt: now,
+      updatedAt: now,
+      scriptHash: normalized.scriptHash,
+      scriptPreview: normalized,
+      scriptMeta: normalized.meta,
+      scriptAnalysis: normalized.analysis,
+      phases: normalized.phases.map(phase => ({
+        id: phase.id,
+        title: phase.title,
+        detail: phase.detail || null,
+        nodes: [],
+      })),
+      budgets: null,
+      budgetGate: null,
+      permissions: null,
+      outputContract: null,
+      acceptanceRubric: null,
+      assumptions: [],
+      approval: {
+        required: true,
+        status: 'pending',
+        budget: null,
+        approvedBy: null,
+        decidedAt: null,
+      },
+    };
+    workflowProposals.set(workflowProposal.id, workflowProposal);
+    eventLog.emit('workflow.proposal.created', {
+      projectId,
+      workflowProposalId: workflowProposal.id,
+      workflowId: normalized.workflowId,
+      source: 'script_generated',
+      requestedBy,
+    });
+    return { ok: true, workflowProposal, dispatches: [] };
+  }
+
   function startWorkflowRunFromProposal(workflowProposalId, {
     approvedBy = 'human',
     now = Date.now(),
@@ -1913,6 +2005,222 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     }
 
     return { ok: false, error: 'workflow_template_not_found' };
+  }
+
+  function startScriptWorkflowRunFromProposal(workflowProposalId, {
+    approvedBy = 'human',
+    now = Date.now(),
+    projectId = null,
+  } = {}) {
+    const proposal = workflowProposals.get(workflowProposalId);
+    if (!proposal) return { ok: false, error: 'workflow_proposal_not_found' };
+    if (proposal.source !== 'script_generated') return { ok: false, error: 'workflow_proposal_not_script_generated' };
+    if (proposal.approval?.status !== 'pending') return { ok: false, error: 'workflow_proposal_not_pending' };
+    if (projectId && proposal.projectId !== projectId) return { ok: false, error: 'workflow_proposal_project_mismatch' };
+    const project = projects.get(proposal.projectId);
+    const board = boards.get(proposal.projectId);
+    if (!project || !board) return { ok: false, error: 'project_not_found' };
+
+    const approvedProposal = {
+      ...proposal,
+      status: 'approved',
+      updatedAt: now,
+      approval: {
+        ...proposal.approval,
+        status: 'approved',
+        approvedBy,
+        decidedAt: now,
+      },
+    };
+    workflowProposals.set(approvedProposal.id, approvedProposal);
+
+    let workflowRun = createWorkflowRun({
+      id: `wf-${proposal.projectId}-${proposal.workflowId}-${now}`,
+      projectId: proposal.projectId,
+      workflowId: proposal.workflowId,
+      title: proposal.title,
+      source: 'script_generated',
+      requestedBy: approvedBy,
+      scope: proposal.scope,
+      approval: { required: false },
+      phases: [
+        { id: 'script-runtime', title: '动态工作流编排' },
+        ...proposal.phases.map(phase => ({ id: phase.id, title: phase.title })),
+      ],
+      nodes: [{
+        id: 'script-runtime',
+        phaseId: 'script-runtime',
+        title: '动态工作流编排',
+        kind: 'script_runtime',
+        assignedAgent: 'desktop-workflow-runtime',
+        input: {
+          workflowId: proposal.workflowId,
+          scriptHash: proposal.scriptHash,
+          preview: proposal.scriptPreview,
+        },
+      }],
+      now,
+    });
+    workflowRun = {
+      ...workflowRun,
+      workflowProposalId: approvedProposal.id,
+      scriptHash: approvedProposal.scriptHash,
+      scriptPreview: approvedProposal.scriptPreview,
+      scriptMeta: approvedProposal.scriptMeta,
+      scriptAnalysis: approvedProposal.scriptAnalysis,
+    };
+    const runtimeDispatch = dispatchWorkflowNode(workflowRun, 'script-runtime', {
+      assignedAgent: 'desktop-workflow-runtime',
+      now,
+    });
+    workflowRun = runtimeDispatch.workflowRun;
+    workflowRuns.set(workflowRun.id, workflowRun);
+    eventLog.emit('workflow.run.started', {
+      projectId: proposal.projectId,
+      workflowRunId: workflowRun.id,
+      workflowId: workflowRun.workflowId,
+      workflowProposalId,
+      source: 'script_generated',
+      requestedBy: approvedBy,
+    });
+    return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: [] };
+  }
+
+  function dispatchWorkflowScriptAgentNode(workflowRunId, {
+    phaseTitle,
+    label,
+    prompt,
+    assignedAgent = null,
+    options = null,
+    now = Date.now(),
+  } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
+    if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
+    if (!readWorkflowString(phaseTitle)) return { ok: false, error: 'workflow_script_phase_required' };
+    if (!readWorkflowString(prompt)) return { ok: false, error: 'workflow_script_prompt_required' };
+
+    const project = projects.get(workflowRun.projectId);
+    const workerAgent = assignedAgent || (Array.isArray(project?.members) && project.members[0]) || 'xiaok-worker';
+    const phaseState = ensureScriptWorkflowPhase(workflowRun, phaseTitle);
+    const phase = phaseState.phase;
+    const nodeId = allocateScriptAgentNodeId(workflowRun);
+    const title = readWorkflowString(label) || `动态任务 ${nodeId.replace(/^script-agent-/, '')}`;
+    const node = {
+      id: nodeId,
+      phaseId: phase.id,
+      title,
+      status: 'ready',
+      kind: 'agent_task',
+      dependsOn: [],
+      assignedAgent: workerAgent,
+      attempt: 0,
+      input: {
+        prompt: readWorkflowString(prompt),
+        label: title,
+        options: options && typeof options === 'object' && !Array.isArray(options) ? JSON.parse(JSON.stringify(options)) : null,
+        script: {
+          workflowId: workflowRun.workflowId,
+          workflowRunId,
+          scriptHash: workflowRun.scriptHash || null,
+          phaseId: phase.id,
+          phaseTitle: phase.title,
+          nodeId,
+        },
+      },
+      output: null,
+      reviewDecision: null,
+      runtime: null,
+      cache: null,
+      producerAgent: null,
+      error: null,
+      startedAt: null,
+      completedAt: null,
+    };
+
+    const withNode = {
+      ...workflowRun,
+      updatedAt: now,
+      phases: phaseState.phases.map(item => item.id === phase.id
+        ? { ...item, nodeIds: [...new Set([...(item.nodeIds || []), nodeId])] }
+        : item),
+      nodes: [...workflowRun.nodes, node],
+      scriptState: {
+        ...(workflowRun.scriptState || {}),
+        dynamicNodeCount: Number(workflowRun.scriptState?.dynamicNodeCount || 0) + 1,
+        lastNodeCreatedAt: now,
+      },
+    };
+    const dispatched = dispatchWorkflowNode(withNode, nodeId, {
+      assignedAgent: workerAgent,
+      input: node.input,
+      now,
+    });
+    workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+    eventLog.emit('workflow.script.node.created', {
+      projectId: dispatched.workflowRun.projectId,
+      workflowRunId,
+      workflowId: dispatched.workflowRun.workflowId,
+      nodeId,
+      phaseId: phase.id,
+      phaseTitle: phase.title,
+      assignedAgent: workerAgent,
+    });
+    emitWorkflowDispatchEvents(dispatched.workflowRun.projectId, dispatched.dispatches);
+    return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
+  }
+
+  function completeScriptWorkflowRun(workflowRunId, { result = null, now = Date.now() } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
+    if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
+
+    const incomplete = workflowRun.nodes.filter(node => node.kind === 'agent_task' && node.status !== 'completed');
+    if (incomplete.length > 0) {
+      return {
+        ok: false,
+        error: 'workflow_script_nodes_incomplete',
+        incompleteNodes: incomplete.map(node => ({ id: node.id, status: node.status, title: node.title })),
+      };
+    }
+    const runtimeNode = workflowRun.nodes.find(node => node.id === 'script-runtime');
+    if (!runtimeNode) return { ok: false, error: 'workflow_script_runtime_node_missing' };
+
+    const workflowResult = result && typeof result === 'object' && !Array.isArray(result)
+      ? sanitizeWorkflowNodeOutput(result)
+      : sanitizeWorkflowNodeOutput({ value: result });
+    const completed = applyWorkflowEvent(workflowRun, {
+      type: 'node_completed',
+      nodeId: runtimeNode.id,
+      output: {
+        ...workflowResult,
+        producedAt: now,
+        producerAgent: 'desktop-workflow-runtime',
+      },
+      fromAgent: 'desktop-workflow-runtime',
+    }, { now });
+    let withResult = {
+      ...completed,
+      scriptResult: JSON.parse(JSON.stringify(result ?? null)),
+      scriptState: {
+        ...(completed.scriptState || {}),
+        completedAt: now,
+      },
+    };
+    const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
+    withResult = projectFinalization.workflowRun;
+    workflowRuns.set(withResult.id, withResult);
+    eventLog.emit('workflow.run.completed', {
+      projectId: withResult.projectId,
+      workflowRunId,
+      workflowId: withResult.workflowId,
+      status: withResult.status,
+      source: 'script_generated',
+      projectDeliveryStatus: projectFinalization.delivery?.ok ? 'delivered' : (projectFinalization.delivery?.error || null),
+    });
+    return { ok: true, workflowRun: withResult, dispatches: [], projectDelivery: projectFinalization.delivery };
   }
 
   function startProjectDiagnoseWorkflow(projectId, { requestedBy = 'human', now = Date.now() } = {}) {
@@ -2301,6 +2609,92 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       updatedAt: now,
     };
   }
+  function validateScriptWorkflowPreview(projectId, preview) {
+    if (!preview || typeof preview !== 'object' || Array.isArray(preview)) return { ok: false, error: 'workflow_script_preview_required' };
+    if (preview.ok !== true) return { ok: false, error: 'workflow_script_preview_invalid' };
+    if (preview.source !== 'script_generated') return { ok: false, error: 'workflow_script_preview_source_invalid' };
+    if (preview.strategy !== 'workflow') return { ok: false, error: 'workflow_script_preview_strategy_invalid' };
+    if (preview.projectId !== projectId) return { ok: false, error: 'workflow_script_preview_project_mismatch' };
+    if (preview.script || preview.body || preview.sourceCode) return { ok: false, error: 'workflow_script_source_not_allowed' };
+
+    const workflowId = readWorkflowString(preview.workflowId);
+    if (!workflowId) return { ok: false, error: 'workflow_id_required' };
+    const title = readWorkflowString(preview.title || preview.description);
+    if (!title) return { ok: false, error: 'title_required' };
+    const description = readWorkflowString(preview.description || preview.title);
+    if (!description) return { ok: false, error: 'description_required' };
+    const scriptHash = readWorkflowString(preview.scriptHash);
+    if (!scriptHash) return { ok: false, error: 'workflow_script_hash_required' };
+
+    const phases = Array.isArray(preview.phases) ? preview.phases : [];
+    if (phases.length === 0) return { ok: false, error: 'workflow_script_phases_required' };
+    const normalizedPhases = [];
+    const phaseIds = new Set();
+    for (let index = 0; index < phases.length; index += 1) {
+      const phase = phases[index];
+      const id = readWorkflowString(phase?.id || `phase-${index + 1}`);
+      const phaseTitle = readWorkflowString(phase?.title);
+      if (!id) return { ok: false, error: 'workflow_script_phase_id_required' };
+      if (phaseIds.has(id)) return { ok: false, error: 'workflow_script_duplicate_phase_id', phaseId: id };
+      if (!phaseTitle) return { ok: false, error: 'workflow_script_phase_title_required' };
+      phaseIds.add(id);
+      normalizedPhases.push({
+        id,
+        title: phaseTitle,
+        detail: readWorkflowString(phase?.detail) || null,
+      });
+    }
+
+    return {
+      ok: true,
+      preview: {
+        ok: true,
+        workflowId,
+        source: 'script_generated',
+        strategy: 'workflow',
+        status: preview.status || 'pending_confirmation',
+        projectId,
+        scope: preview.scope && typeof preview.scope === 'object' && !Array.isArray(preview.scope)
+          ? JSON.parse(JSON.stringify(preview.scope))
+          : { projectId },
+        requestedBy: readWorkflowString(preview.requestedBy) || 'human',
+        createdAt: Number(preview.createdAt || Date.now()),
+        title,
+        description,
+        meta: preview.meta && typeof preview.meta === 'object' && !Array.isArray(preview.meta) ? JSON.parse(JSON.stringify(preview.meta)) : null,
+        phases: normalizedPhases,
+        scriptHash,
+        analysis: preview.analysis && typeof preview.analysis === 'object' && !Array.isArray(preview.analysis)
+          ? JSON.parse(JSON.stringify(preview.analysis))
+          : null,
+      },
+    };
+  }
+  function ensureScriptWorkflowPhase(workflowRun, phaseTitle) {
+    const normalizedTitle = readWorkflowString(phaseTitle);
+    const existing = workflowRun.phases.find(phase => phase.title === normalizedTitle || phase.id === normalizedTitle);
+    if (existing) return { phase: existing, phases: workflowRun.phases };
+    const idBase = normalizedTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'phase';
+    const existingIds = new Set(workflowRun.phases.map(phase => phase.id));
+    let index = workflowRun.phases.length + 1;
+    let id = `script-${idBase}`;
+    while (existingIds.has(id)) {
+      index += 1;
+      id = `script-${idBase}-${index}`;
+    }
+    const phase = { id, title: normalizedTitle, status: 'pending', nodeIds: [] };
+    return { phase, phases: [...workflowRun.phases, phase] };
+  }
+  function allocateScriptAgentNodeId(workflowRun) {
+    const existing = new Set(workflowRun.nodes.map(node => node.id));
+    let index = workflowRun.nodes.filter(node => String(node.id || '').startsWith('script-agent-')).length + 1;
+    let nodeId = `script-agent-${index}`;
+    while (existing.has(nodeId)) {
+      index += 1;
+      nodeId = `script-agent-${index}`;
+    }
+    return nodeId;
+  }
   function defaultWorkflowPolicyFor(spec) {
     return {
       maxNodes: Math.max(1, flattenSpecNodeCount(spec)),
@@ -2346,12 +2740,36 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, task };
   }
   function formatWorkflowSourceTask(task = {}) {
-    return {
+    const sourceTask = {
       id: task.id,
       title: task.title || '',
       status: task.status || '',
       assignedAgent: task.assignedAgent || null,
     };
+    assignWorkflowField(sourceTask, 'failureReason', readWorkflowString(task.failureReason));
+    assignWorkflowField(sourceTask, 'lastFailureClass', readWorkflowString(task.lastFailureClass));
+    if (Number(task.qualityFailureCount || 0) > 0) sourceTask.qualityFailureCount = Number(task.qualityFailureCount);
+    assignWorkflowField(sourceTask, 'repairInstruction', buildWorkflowRepairInstruction(task));
+    if (task.reviewResult?.passed === false) {
+      sourceTask.reviewResult = {
+        passed: false,
+        feedback: task.reviewResult.feedback || '',
+        failureClass: task.reviewResult.failureClass || null,
+        reviewedAt: task.reviewResult.reviewedAt || null,
+      };
+    }
+    return sourceTask;
+  }
+  function buildWorkflowRepairInstruction(task = {}) {
+    const explicit = readWorkflowString(task.repairInstruction);
+    if (explicit) return explicit;
+    const failureReason = readWorkflowString(task.failureReason);
+    if (failureReason) return failureReason;
+    return task.reviewResult?.passed === false ? readWorkflowString(task.reviewResult.feedback) : '';
+  }
+  function assignWorkflowField(target, key, value) {
+    if (value === null || value === undefined || value === '') return;
+    target[key] = value;
   }
   function getFirstDependencyOutput(workflowRun, node) {
     const dependencyId = Array.isArray(node.dependsOn) ? node.dependsOn[0] : null;
@@ -2473,11 +2891,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
-    const artifactValidation = validateWorkflowProjectArtifacts({ project, deliverable });
+    const artifactValidation = validateWorkflowProjectArtifacts({ project, board, deliverable });
     if (!artifactValidation.ok) {
       return {
-        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, artifactValidation.error || 'worker_artifact_invalid', { now }),
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, artifactValidation.error || 'worker_artifact_invalid', { now, details: artifactValidation }),
         delivery: artifactValidation,
+      };
+    }
+
+    if (!board.isAllDone()) {
+      return {
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, 'tasks_not_all_done', { now }),
+        delivery: { ok: false, error: 'tasks_not_all_done' },
       };
     }
 
@@ -2511,14 +2936,134 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       delivery,
     };
   }
-  function buildWorkflowProjectDeliverable({ workflowRun, producerNode }) {
+
+  function maybeDeliverScriptWorkflowProjectResult(workflowRun, { now = Date.now() } = {}) {
+    if (
+      workflowRun.source !== 'script_generated' ||
+      workflowRun.status !== 'completed' ||
+      workflowRun.scope?.taskId
+    ) {
+      return { workflowRun, delivery: null };
+    }
+
+    const project = projects.get(workflowRun.projectId);
+    const board = boards.get(workflowRun.projectId);
+    if (!project || !board || project.status === 'closed') return { workflowRun, delivery: null };
+
+    if (
+      project.status === 'delivered' &&
+      project.deliverable?.provenance?.workflowRunId === workflowRun.id
+    ) {
+      return {
+        workflowRun: {
+          ...workflowRun,
+          projectDelivery: workflowRun.projectDelivery || {
+            status: 'delivered',
+            deliveredAt: project.deliveredAt || now,
+            projectId: workflowRun.projectId,
+            workflowRunId: workflowRun.id,
+            taskCount: board.getAllTasks().filter(task => task.status === 'done').length,
+          },
+        },
+        delivery: { ok: true, alreadyDelivered: true },
+      };
+    }
+
+    const producerNode = selectScriptWorkflowProjectDeliverableProducer(workflowRun);
+    if (!producerNode?.output) return { workflowRun, delivery: null };
+
+    const deliverable = buildWorkflowProjectDeliverable({
+      workflowRun,
+      producerNode,
+      runtimeSource: 'kswarm-script-workflow',
+    });
+    if (deliverable.artifacts.length === 0) return { workflowRun, delivery: null };
+
+    const artifactValidation = validateWorkflowProjectArtifacts({ project, board, deliverable });
+    if (!artifactValidation.ok) {
+      return {
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, artifactValidation.error || 'worker_artifact_invalid', { now, details: artifactValidation }),
+        delivery: artifactValidation,
+      };
+    }
+
+    const taskCompletion = markProjectTasksDoneByWorkflow({
+      project,
+      board,
+      workflowRun,
+      deliverable,
+      producerNode,
+      now,
+      runtimeSource: 'kswarm-script-workflow',
+      completedBy: 'script_workflow',
+      reviewFeedback: '动态 workflow 已完成并生成项目交付物。',
+      executionReasonCode: 'script_workflow_completed',
+    });
+    if (!taskCompletion.ok) {
+      return {
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, taskCompletion.error || 'task_completion_failed', { now }),
+        delivery: taskCompletion,
+      };
+    }
+
+    const delivery = handleDeliver(workflowRun.projectId, deliverable, project.poAgent);
+    if (!delivery.ok) {
+      return {
+        workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, delivery.error || 'project_delivery_failed', { now }),
+        delivery,
+      };
+    }
+
+    return {
+      workflowRun: {
+        ...workflowRun,
+        projectDelivery: {
+          status: 'delivered',
+          deliveredAt: now,
+          projectId: workflowRun.projectId,
+          workflowRunId: workflowRun.id,
+          taskCount: taskCompletion.completedTaskIds.length,
+        },
+      },
+      delivery,
+    };
+  }
+
+  function reconcileRecoveredScriptWorkflowProjectDeliveries({ now = Date.now() } = {}) {
+    const delivered = [];
+    const blocked = [];
+    for (const workflowRun of workflowRuns.values()) {
+      const result = maybeDeliverScriptWorkflowProjectResult(workflowRun, { now });
+      if (result.workflowRun !== workflowRun) {
+        workflowRuns.set(result.workflowRun.id, result.workflowRun);
+      }
+      if (result.delivery?.ok) {
+        delivered.push({ projectId: workflowRun.projectId, workflowRunId: workflowRun.id });
+      } else if (result.delivery?.error) {
+        blocked.push({ projectId: workflowRun.projectId, workflowRunId: workflowRun.id, error: result.delivery.error });
+      }
+    }
+    return { ok: true, delivered, blocked };
+  }
+
+  function selectScriptWorkflowProjectDeliverableProducer(workflowRun) {
+    const runtimeNode = workflowRun.nodes.find(item => item.id === 'script-runtime' && item.output);
+    if (runtimeNode && collectWorkflowOutputArtifacts(runtimeNode.output).length > 0) return runtimeNode;
+    return [...workflowRun.nodes]
+      .reverse()
+      .find(item => item.kind === 'agent_task' && item.status === 'completed' && item.output && collectWorkflowOutputArtifacts(item.output).length > 0)
+      || runtimeNode
+      || [...workflowRun.nodes].reverse().find(item => item.kind === 'agent_task' && item.status === 'completed' && item.output);
+  }
+
+  function buildWorkflowProjectDeliverable({ workflowRun, producerNode, runtimeSource = 'kswarm-project-workflow' }) {
     const output = producerNode.output && typeof producerNode.output === 'object' ? producerNode.output : {};
     const summary = readWorkflowString(output.summary)
       || readWorkflowString(output.text)
       || '项目级工作流已生成最终交付物。';
     const workFolder = readWorkflowString(output.workFolder) || readWorkflowString(output.workspacePath);
     const artifactManifest = Array.isArray(output.artifactManifest) ? output.artifactManifest : [];
-    const artifacts = Array.isArray(output.artifacts) ? output.artifacts : [];
+    const artifacts = collectWorkflowOutputArtifacts(output);
     const evidenceRefs = mergeWorkflowArtifactEvidenceRefs(output.evidenceRefs, artifacts);
     return {
       summary,
@@ -2527,7 +3072,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       ...(workFolder ? { workFolder, workspacePath: workFolder } : {}),
       evidenceRefs,
       provenance: {
-        runtimeSource: 'kswarm-project-workflow',
+        runtimeSource,
         workflowRunId: workflowRun.id,
         workflowId: workflowRun.workflowId,
         producerNodeId: producerNode.id,
@@ -2535,7 +3080,70 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       },
     };
   }
-  function validateWorkflowProjectArtifacts({ project, deliverable } = {}) {
+
+  function collectWorkflowOutputArtifacts(output = {}) {
+    const collected = [];
+    const seen = new Set();
+    function addArtifact(artifact) {
+      const normalized = normalizeWorkflowArtifactRecord(artifact);
+      const path = readWorkflowArtifactPath(normalized);
+      if (!path || seen.has(path)) return;
+      if (isSystemPlanArtifactPath(path)) return;
+      seen.add(path);
+      collected.push(normalized);
+    }
+
+    for (const artifact of Array.isArray(output.artifacts) ? output.artifacts : []) addArtifact(artifact);
+    for (const artifact of Array.isArray(output.artifactManifest) ? output.artifactManifest : []) addArtifact(artifact);
+    for (const ref of readWorkflowStringArray(output.evidenceRefs)) {
+      const artifactPath = extractWorkflowArtifactPathFromText(ref);
+      if (artifactPath) addArtifact({ path: artifactPath });
+    }
+    return collected;
+  }
+
+  function normalizeWorkflowArtifactRecord(artifact) {
+    if (typeof artifact === 'string') {
+      return {
+        path: artifact,
+        label: basename(artifact.replace(/^artifact:/, '')),
+        kind: inferWorkflowArtifactKind(artifact),
+      };
+    }
+    if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) return {};
+    const path = readWorkflowArtifactPath(artifact);
+    return {
+      ...JSON.parse(JSON.stringify(artifact)),
+      ...(path && !artifact.path ? { path } : {}),
+      label: artifact.label || artifact.title || artifact.filename || artifact.name || (path ? basename(path) : undefined),
+      kind: artifact.kind || inferWorkflowArtifactKind(path),
+    };
+  }
+
+  function extractWorkflowArtifactPathFromText(value) {
+    const text = readWorkflowString(value);
+    if (!text) return '';
+    const normalized = text.replace(/^artifact:/, '');
+    const relativeMatch = normalized.match(/(?:^|[\s"'（(])(?:artifact:)?((?:\.\/)?artifacts\/[^\s,，;；:：)）\]】]+)/);
+    if (relativeMatch?.[1]) return relativeMatch[1].replace(/^\.\//, '');
+    const absoluteMatch = normalized.match(/((?:\/[^\s,，;；:：)）\]】]+)+\/artifacts\/[^\s,，;；:：)）\]】]+)/);
+    return absoluteMatch?.[1] || '';
+  }
+
+  function isSystemPlanArtifactPath(path) {
+    const name = basename(String(path || '').replace(/^artifact:/, ''));
+    return /^plan-v\d+\.md$/i.test(name);
+  }
+
+  function inferWorkflowArtifactKind(path) {
+    const lower = String(path || '').toLowerCase();
+    if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown';
+    if (lower.endsWith('.html') || lower.endsWith('.htm')) return 'html';
+    if (lower.endsWith('.pdf')) return 'pdf';
+    if (lower.endsWith('.json')) return 'json';
+    return 'file';
+  }
+  function validateWorkflowProjectArtifacts({ project, board, deliverable } = {}) {
     const artifacts = Array.isArray(deliverable?.artifacts) ? deliverable.artifacts : [];
     if (artifacts.length === 0) return { ok: false, error: 'worker_deliverable_missing' };
 
@@ -2550,7 +3158,59 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       const checked = validateWorkflowProjectArtifactPath(artifact, { workspaceRealPath });
       if (!checked.ok) return checked;
     }
+    const outputValidation = validateWorkflowProjectRequiredOutputs({ board, deliverable, workspacePath: workspaceRealPath });
+    if (!outputValidation.ok) return outputValidation;
     return { ok: true };
+  }
+  function validateWorkflowProjectRequiredOutputs({ board, deliverable, workspacePath = '' } = {}) {
+    const requiredOutputs = collectWorkflowTerminalRequiredOutputs(board);
+    if (requiredOutputs.length === 0) return { ok: true };
+    const result = validateDeliverableContract({
+      requiredOutputs,
+      artifacts: [
+        ...(Array.isArray(deliverable?.artifacts) ? deliverable.artifacts : []),
+        ...(Array.isArray(deliverable?.artifactManifest) ? deliverable.artifactManifest : []),
+      ],
+      workspacePath,
+    });
+    if (result.ok) return { ok: true };
+    return {
+      ok: false,
+      error: 'worker_required_output_missing',
+      failureClass: result.failureClass,
+      errors: result.errors,
+      missing: result.missing,
+    };
+  }
+  function collectWorkflowTerminalRequiredOutputs(board) {
+    if (!board || typeof board.getAllTasks !== 'function') return [];
+    const tasks = board.getAllTasks().filter(task => task.status !== 'cancelled');
+    if (tasks.length === 0) return [];
+    const referenced = new Set();
+    for (const task of tasks) {
+      for (const depRef of Array.isArray(task.dependencies) ? task.dependencies : []) {
+        const value = String(depRef || '').trim();
+        if (value) referenced.add(value);
+      }
+    }
+    const terminalTasks = tasks.filter(task => !isWorkflowTaskReferencedByDependency(task, referenced));
+    const outputs = [];
+    for (const task of terminalTasks.length > 0 ? terminalTasks : tasks) {
+      const requirements = inferTaskRequirements(task);
+      for (const output of requirements.requiredOutputs || []) {
+        if (output.enforcement === 'hard') outputs.push(output);
+      }
+    }
+    return outputs;
+  }
+  function isWorkflowTaskReferencedByDependency(task, referenced) {
+    const candidates = [
+      task.id,
+      task.localTaskId,
+      task.planItemId,
+      task.title,
+    ].map(value => String(value || '').trim()).filter(Boolean);
+    return candidates.some(value => referenced.has(value));
   }
   function validateWorkflowProjectArtifactPath(artifact, { workspaceRealPath = null } = {}) {
     if (!workspaceRealPath) return { ok: false, error: 'worker_artifact_invalid' };
@@ -2607,7 +3267,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       return false;
     }
   }
-  function markProjectTasksDoneByWorkflow({ project, board, workflowRun, deliverable, producerNode, now = Date.now() } = {}) {
+  function markProjectTasksDoneByWorkflow({
+    project,
+    board,
+    workflowRun,
+    deliverable,
+    producerNode,
+    now = Date.now(),
+    runtimeSource = 'kswarm-project-workflow',
+    completedBy = 'project_workflow',
+    reviewFeedback = '项目级 workflow gate 已通过。',
+    executionReasonCode = 'project_workflow_preferred',
+  } = {}) {
     const completedTaskIds = [];
     for (const task of board.getAllTasks()) {
       if (task.status === 'cancelled') continue;
@@ -2619,14 +3290,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         artifacts: deliverable.artifacts,
         evidenceRefs: deliverable.evidenceRefs,
         provenance: {
-          runtimeSource: 'kswarm-project-workflow',
+          runtimeSource,
           workflowRunId: workflowRun.id,
           workflowId: workflowRun.workflowId,
           producerNodeId: producerNode.id,
           producingAgent: producerNode.producerAgent || producerNode.assignedAgent || task.assignedAgent || null,
         },
       };
-      task.completedBy = 'project_workflow';
+      task.completedBy = completedBy;
       task.completedByWorkflowRunId = workflowRun.id;
       task.completedAt = now;
       task.updatedAt = now;
@@ -2644,13 +3315,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       task.recoveryReason = null;
       task.reviewResult = {
         passed: true,
-        feedback: '项目级 workflow gate 已通过。',
+        feedback: reviewFeedback,
         reviewedAt: now,
       };
       task.execution = {
         strategy: 'workflow',
         modeSource: 'project_default',
-        reasonCode: 'project_workflow_preferred',
+        reasonCode: executionReasonCode,
         workflowRunId: workflowRun.id,
         selectedAt: workflowRun.startedAt || workflowRun.createdAt || now,
       };
@@ -2661,14 +3332,22 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
           projectId: workflowRun.projectId,
           taskId: task.id,
           taskTitle: task.title,
-          confirmedBy: 'project_workflow',
+          confirmedBy: completedBy,
           workflowRunId: workflowRun.id,
         });
       }
     }
     return { ok: true, completedTaskIds };
   }
-  function markWorkflowProjectDeliveryBlocked(workflowRun, reason, { now = Date.now() } = {}) {
+  function markWorkflowProjectDeliveryBlocked(workflowRun, reason, { now = Date.now(), details = null } = {}) {
+    const deliveryDetails = details && typeof details === 'object'
+      ? {
+          ...(details.error ? { error: details.error } : {}),
+          ...(details.failureClass ? { failureClass: details.failureClass } : {}),
+          ...(Array.isArray(details.errors) ? { errors: details.errors } : {}),
+          ...(Array.isArray(details.missing) ? { missing: details.missing } : {}),
+        }
+      : {};
     return {
       ...workflowRun,
       status: 'blocked',
@@ -2683,6 +3362,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         projectId: workflowRun.projectId,
         failedAt: now,
         reason,
+        ...deliveryDetails,
       },
       summary: {
         ...(workflowRun.summary || {}),
@@ -2807,7 +3487,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleResolveProjectIntervention,
     createWorkflowProposal,
     cancelWorkflowProposal,
+    createScriptWorkflowProposal,
     startWorkflowRunFromProposal,
+    startScriptWorkflowRunFromProposal,
+    dispatchWorkflowScriptAgentNode,
+    completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow,
     handleWorkflowNodeResult,
@@ -2833,12 +3517,17 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getBoard,
     getEventLog,
     listProjects,
+    findReusableProjectForCreateRequest,
     getDispatchPlan,
     getProjectHealth,
     getProjectIntervention,
     createWorkflowProposal: persisted.createWorkflowProposal,
     cancelWorkflowProposal: persisted.cancelWorkflowProposal,
+    createScriptWorkflowProposal: persisted.createScriptWorkflowProposal,
     startWorkflowRunFromProposal: persisted.startWorkflowRunFromProposal,
+    startScriptWorkflowRunFromProposal: persisted.startScriptWorkflowRunFromProposal,
+    dispatchWorkflowScriptAgentNode: persisted.dispatchWorkflowScriptAgentNode,
+    completeScriptWorkflowRun: persisted.completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow: persisted.startAgentReviewSmokeWorkflow,
     handleWorkflowNodeResult: persisted.handleWorkflowNodeResult,

@@ -65,6 +65,7 @@ import { createBrokerTaskRequest } from './broker-task-request.js';
 import { normalizeProjectAgentSelection, reconcileProjectAgentSelectionWithEffectiveAgents } from '../core/agent-selection.js';
 import { getEffectiveAgentConcurrency } from '../core/effective-agent-concurrency.js';
 import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
+import { createProjectInstanceId } from '../core/project-id.js';
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
@@ -75,6 +76,7 @@ const SERVICE_FEATURES = [
   'workflow_task_strategy',
   'po_generated_workflow_proposals',
   'workflow_budget_cache_recovery',
+  'workflow_script_generated_runs',
 ];
 const runtimeInstancePool = createRuntimeInstancePool();
 
@@ -1369,8 +1371,9 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode } = body;
+      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, autoStartPlanning, clientRequestKey } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
+      const shouldAutoStartPlanning = autoStartPlanning !== false;
       const resolvedPoAgent = poAgent;
       const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== resolvedPoAgent) : [];
       const normalizedAgentSelection = normalizeProjectAgentSelection({
@@ -1379,8 +1382,25 @@ async function handleRequest(req, res) {
         agentSelection,
         defaultSource: 'default_seed',
       });
-      const id = `proj-${Date.now()}`;
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection, executionMode });
+      const reusableProject = hub.findReusableProjectForCreateRequest({
+        clientRequestKey,
+      });
+      if (reusableProject) {
+        log('info', `Project create request reused existing project: ${reusableProject.name}`, {
+          id: reusableProject.id,
+          requestedName: name,
+          reusedByClientRequestKey: Boolean(clientRequestKey && reusableProject.clientRequestKey === clientRequestKey),
+        });
+        return json(res, {
+          ok: true,
+          project: reusableProject,
+          reused: true,
+          preparation: reusableProject.preparation || null,
+          planningStart: { sent: false, reason: 'reused_existing_project' },
+        }, 200);
+      }
+      const id = createProjectInstanceId();
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection, executionMode, autoAssignPo: shouldAutoStartPlanning, clientRequestKey });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
@@ -1388,8 +1408,8 @@ async function handleRequest(req, res) {
 
       await ensureProjectAgentsStarted(project);
       const preparation = await prepareProjectForPlanning(project);
-      let planningStart = { sent: false, reason: 'preparation_blocked' };
-      if (preparation?.state === 'ready') {
+      let planningStart = { sent: false, reason: shouldAutoStartPlanning ? 'preparation_blocked' : 'auto_start_disabled' };
+      if (shouldAutoStartPlanning && preparation?.state === 'ready') {
         planningStart = await sendAssignPoForProject(project, { delayMs: 0 })
           .catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }));
       }
@@ -1405,7 +1425,7 @@ async function handleRequest(req, res) {
       });
       broadcast({ type: 'project_created', project });
 
-      return json(res, { ok: true, project }, 201);
+      return json(res, { ok: true, project, preparation, planningStart }, 201);
     }
 
     const executionModeMatch = path.match(/^\/projects\/([^/]+)\/execution-mode$/);
@@ -1469,6 +1489,16 @@ async function handleRequest(req, res) {
       return json(res, { workflowRun });
     }
 
+    const scriptWorkflowProposalMatch = path.match(/^\/projects\/([^/]+)\/workflows\/script-generated\/proposal$/);
+    if (scriptWorkflowProposalMatch && req.method === 'POST') {
+      const projectId = scriptWorkflowProposalMatch[1];
+      const body = await parseBody(req);
+      const result = hub.createScriptWorkflowProposal(projectId, body?.preview || body, {
+        requestedBy: body?.requestedBy || 'human',
+      });
+      return json(res, result, result.ok ? 201 : 400);
+    }
+
     const workflowProposalMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/proposal$/);
     if (workflowProposalMatch && req.method === 'POST') {
       const [, projectId, workflowId] = workflowProposalMatch;
@@ -1479,6 +1509,22 @@ async function handleRequest(req, res) {
         taskId: body?.taskId || null,
       });
       return json(res, result, result.ok ? 201 : 400);
+    }
+
+    const scriptWorkflowRunStartMatch = path.match(/^\/projects\/([^/]+)\/workflows\/script-generated\/runs$/);
+    if (scriptWorkflowRunStartMatch && req.method === 'POST') {
+      const projectId = scriptWorkflowRunStartMatch[1];
+      const body = await parseBody(req);
+      const result = hub.startScriptWorkflowRunFromProposal(body?.proposalId, {
+        approvedBy: body?.approvedBy || body?.requestedBy || 'human',
+        projectId,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_started', projectId, workflowRun: result.workflowRun });
+        const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
+        return json(res, { ...result, workflowRun }, 201);
+      }
+      return json(res, result, result.error === 'workflow_proposal_not_found' ? 404 : 400);
     }
 
     const workflowRunStartMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/runs$/);
@@ -1499,6 +1545,46 @@ async function handleRequest(req, res) {
         return json(res, { ...result, workflowRun }, 201);
       }
       return json(res, result, result.error === 'workflow_proposal_not_found' ? 404 : 400);
+    }
+
+    const scriptWorkflowNodeMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes$/);
+    if (scriptWorkflowNodeMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId] = scriptWorkflowNodeMatch;
+      const body = await parseBody(req);
+      const existingRun = hub.getWorkflowRun(workflowRunId);
+      if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
+      if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
+      const result = hub.dispatchWorkflowScriptAgentNode(workflowRunId, {
+        phaseTitle: body?.phaseTitle,
+        label: body?.label,
+        prompt: body?.prompt,
+        assignedAgent: body?.assignedAgent || null,
+        options: body?.options || null,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
+        return json(res, { ...result, workflowRun }, 201);
+      }
+      return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
+    }
+
+    const scriptWorkflowCompleteMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/complete$/);
+    if (scriptWorkflowCompleteMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId] = scriptWorkflowCompleteMatch;
+      const body = await parseBody(req);
+      const existingRun = hub.getWorkflowRun(workflowRunId);
+      if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
+      if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
+      const result = hub.completeScriptWorkflowRun(workflowRunId, {
+        result: body?.result ?? null,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_completed', projectId, workflowRun: result.workflowRun });
+        return json(res, result, 200);
+      }
+      return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
     }
 
     const workflowRunProgressMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/progress$/);

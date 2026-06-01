@@ -139,6 +139,39 @@ test('approved task workflow must match task identity and re-check hard budget l
   assert.deepEqual(started.dispatches[0].input.sourceTask.requiredOutputs, [{ type: 'markdown', enforcement: 'hard', source: 'task' }]);
 });
 
+test('task workflow proposal and run preserve rework context for observability', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-task-workflow-rework-context');
+  const task = hub.getBoard('proj-task-workflow-rework-context').getAllTasks()[0];
+  task.failureReason = '验收不通过：矩阵来源数为 1 的事件必须从 ✅ 改为 ⚡。';
+  task.lastFailureClass = 'quality_content_failed';
+  task.qualityFailureCount = 1;
+  task.repairInstruction = '按 PO 反馈统一 timeline 和 matrix 的验证标记。';
+
+  const proposal = hub.createWorkflowProposal('proj-task-workflow-rework-context', 'po-generated-task-workflow', {
+    requestedBy: 'xiaok-po',
+    taskId: task.id,
+    now: 1770000000000,
+  });
+  assert.equal(proposal.ok, true);
+  assert.equal(proposal.workflowProposal.sourceTask.failureReason, task.failureReason);
+  assert.equal(proposal.workflowProposal.sourceTask.repairInstruction, task.repairInstruction);
+  assert.equal(proposal.workflowProposal.sourceTask.qualityFailureCount, 1);
+
+  const started = hub.startWorkflowRunFromProposal(proposal.workflowProposal.id, {
+    projectId: 'proj-task-workflow-rework-context',
+    workflowId: 'po-generated-task-workflow',
+    taskId: task.id,
+    approvedBy: 'xiaok-po',
+    now: 1770000001000,
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.workflowRun.sourceTask.failureReason, task.failureReason);
+  assert.equal(started.workflowRun.sourceTask.repairInstruction, task.repairInstruction);
+  assert.equal(started.dispatches[0].input.sourceTask.failureReason, task.failureReason);
+  assert.match(started.dispatches[0].input.instruction, /返工/);
+});
+
 test('completed workflow nodes store run-internal cache metadata and recovery summary', () => {
   const hub = createHub({ silent: true });
   createActiveProject(hub);

@@ -578,6 +578,7 @@ function buildWorkerSmokeInput({ project = {}, tasks = [], task = null }) {
 }
 
 function buildPoTaskWorkflowInput({ project = {}, task = {}, tasks = [] }) {
+  const sourceTask = formatSourceTask(task);
   return {
     project: {
       id: project.id,
@@ -585,14 +586,14 @@ function buildPoTaskWorkflowInput({ project = {}, task = {}, tasks = [] }) {
       goal: project.goal || '',
       status: project.status || '',
     },
-    sourceTask: formatSourceTask(task),
+    sourceTask,
     taskSnapshot: tasks.map(item => ({
       id: item.id,
       title: item.title,
       status: item.status,
       assignedAgent: item.assignedAgent || null,
     })),
-    instruction: '执行当前任务并生成最终交付物。必须输出 summary、artifacts、evidenceRefs；如存在项目工作区，应把可复核文件写入工作区。',
+    instruction: buildPoTaskWorkflowInstruction(sourceTask),
   };
 }
 
@@ -629,7 +630,16 @@ function collectProjectRequiredOutputs(tasks = []) {
 }
 
 function formatSourceTask(task = {}) {
-  return {
+  const repairInstruction = buildRepairInstruction(task);
+  const failedReview = task.reviewResult && task.reviewResult.passed === false
+    ? {
+        passed: false,
+        feedback: task.reviewResult.feedback || '',
+        failureClass: task.reviewResult.failureClass || null,
+        reviewedAt: task.reviewResult.reviewedAt || null,
+      }
+    : null;
+  const sourceTask = {
     id: task.id,
     title: task.title || '',
     brief: task.brief || '',
@@ -641,6 +651,49 @@ function formatSourceTask(task = {}) {
     executionContract: task.executionContract && typeof task.executionContract === 'object' ? { ...task.executionContract } : null,
     evidenceContract: task.evidenceContract && typeof task.evidenceContract === 'object' ? { ...task.evidenceContract } : null,
   };
+  assignIfPresent(sourceTask, 'failureReason', readWorkflowString(task.failureReason));
+  assignIfPresent(sourceTask, 'lastFailureClass', readWorkflowString(task.lastFailureClass));
+  if (Number(task.qualityFailureCount || 0) > 0) sourceTask.qualityFailureCount = Number(task.qualityFailureCount);
+  assignIfPresent(sourceTask, 'repairInstruction', repairInstruction);
+  if (failedReview) sourceTask.reviewResult = failedReview;
+  return sourceTask;
+}
+
+function buildPoTaskWorkflowInstruction(sourceTask = {}) {
+  const base = '执行当前任务并生成最终交付物。必须输出 summary、artifacts、evidenceRefs；如存在项目工作区，应把可复核文件写入工作区。';
+  if (!hasRepairContext(sourceTask)) return base;
+  return [
+    '这是返工任务。必须优先处理 PO 反馈和失败原因，并在新交付物中明确修复这些问题。',
+    sourceTask.repairInstruction ? `返工要求：${sourceTask.repairInstruction}` : '',
+    base,
+  ].filter(Boolean).join(' ');
+}
+
+function buildRepairInstruction(task = {}) {
+  const explicit = readWorkflowString(task.repairInstruction);
+  if (explicit) return explicit;
+  const failureReason = readWorkflowString(task.failureReason);
+  if (failureReason) return failureReason;
+  const reviewFeedback = task.reviewResult?.passed === false ? readWorkflowString(task.reviewResult.feedback) : '';
+  return reviewFeedback || '';
+}
+
+function hasRepairContext(sourceTask = {}) {
+  return Boolean(
+    sourceTask.repairInstruction ||
+    sourceTask.failureReason ||
+    sourceTask.reviewResult?.passed === false ||
+    Number(sourceTask.qualityFailureCount || 0) > 0,
+  );
+}
+
+function assignIfPresent(target, key, value) {
+  if (value === null || value === undefined || value === '') return;
+  target[key] = value;
+}
+
+function readWorkflowString(value) {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
 function clonePlainList(list = []) {

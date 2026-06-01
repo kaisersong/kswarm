@@ -34,6 +34,27 @@ function createHighQualityProject(hub, id = 'proj-project-workflow') {
   return project;
 }
 
+function completeAllTasks(hub, projectId) {
+  const board = hub.getBoard(projectId);
+  for (const task of board.getAllTasks()) {
+    let result = board.transition(task.id, 'dispatched', { assignedAgent: task.assignedAgent });
+    assert.equal(result.ok, true);
+    result = board.transition(task.id, 'accepted');
+    assert.equal(result.ok, true);
+    result = board.transition(task.id, 'in_progress');
+    assert.equal(result.ok, true);
+    result = board.transition(task.id, 'submitted', {
+      result: {
+        summary: `完成 ${task.title}`,
+        artifacts: [],
+      },
+    });
+    assert.equal(result.ok, true);
+    result = board.transition(task.id, 'done');
+    assert.equal(result.ok, true);
+  }
+}
+
 function startProjectWorkflow(hub, projectId = 'proj-project-workflow') {
   const dispatched = hub.handleRequestDispatch(projectId, 'xiaok-po');
   assert.equal(dispatched.ok, true);
@@ -44,35 +65,138 @@ function startProjectWorkflow(hub, projectId = 'proj-project-workflow') {
   return dispatched;
 }
 
-test('workflow preferred dispatch starts one project-scoped workflow instead of task workflows', () => {
+test('workflow preferred dispatch continues task graph when ready tasks exist', () => {
   const hub = createHub({ silent: true });
   createHighQualityProject(hub);
 
-  const dispatched = startProjectWorkflow(hub);
+  const dispatched = hub.handleRequestDispatch('proj-project-workflow', 'xiaok-po');
+
+  assert.equal(dispatched.ok, true);
+  assert.deepEqual(dispatched.dispatched, ['proj-project-workflow__item-1']);
+  assert.deepEqual(dispatched.workflowDispatched, []);
+  assert.equal(dispatched.workflowRuns.length, 0);
+  assert.equal(dispatched.workflowNodeDispatches.length, 0);
+
+  const tasks = hub.getBoard('proj-project-workflow').getAllTasks();
+  assert.deepEqual(tasks.map(task => task.status), ['dispatched', 'pending', 'pending']);
+  assert.equal(hub.listProjectWorkflowRuns('proj-project-workflow').length, 0);
+});
+
+test('active project workflow does not block dispatchable task graph work', () => {
+  const hub = createHub({ silent: true });
+  createHighQualityProject(hub, 'proj-project-workflow-stale-active');
+
+  const proposal = hub.createWorkflowProposal('proj-project-workflow-stale-active', 'po-generated-project-workflow', {
+    requestedBy: 'xiaok-po',
+    now: 1770000000000,
+  });
+  assert.equal(proposal.ok, true);
+  const started = hub.startWorkflowRunFromProposal(proposal.workflowProposal.id, {
+    projectId: 'proj-project-workflow-stale-active',
+    workflowId: 'po-generated-project-workflow',
+    approvedBy: 'xiaok-po',
+    now: 1770000001000,
+  });
+  assert.equal(started.ok, true);
+  assert.equal(started.workflowRun.status, 'running');
+
+  const dispatched = hub.handleRequestDispatch('proj-project-workflow-stale-active', 'xiaok-po');
+
+  assert.equal(dispatched.ok, true);
+  assert.deepEqual(dispatched.dispatched, ['proj-project-workflow-stale-active__item-1']);
+  assert.deepEqual(dispatched.workflowDispatched, []);
+  assert.equal(dispatched.workflowRuns.length, 0);
+  assert.equal(dispatched.activeProjectWorkflowRun, undefined);
+
+  const tasks = hub.getBoard('proj-project-workflow-stale-active').getAllTasks();
+  assert.deepEqual(tasks.map(task => task.status), ['dispatched', 'pending', 'pending']);
+  assert.equal(hub.listProjectWorkflowRuns('proj-project-workflow-stale-active').length, 1);
+});
+
+test('project workflow cannot deliver over incomplete task graph', () => {
+  const hub = createHub({ silent: true });
+  createHighQualityProject(hub, 'proj-project-workflow-incomplete-graph');
+
+  const proposal = hub.createWorkflowProposal('proj-project-workflow-incomplete-graph', 'po-generated-project-workflow', {
+    requestedBy: 'xiaok-po',
+    now: 1770000000000,
+  });
+  assert.equal(proposal.ok, true);
+  const started = hub.startWorkflowRunFromProposal(proposal.workflowProposal.id, {
+    projectId: 'proj-project-workflow-incomplete-graph',
+    workflowId: 'po-generated-project-workflow',
+    approvedBy: 'xiaok-po',
+    now: 1770000001000,
+  });
+  assert.equal(started.ok, true);
+  const workflowRun = started.workflowRun;
+  const workerDispatch = started.dispatches[0];
+  const workFolder = mkdtempSync(join(tmpdir(), 'kswarm-project-workflow-incomplete-'));
+  const deliverablePath = join(workFolder, 'premature-final-report.md');
+  writeFileSync(deliverablePath, '# 提前返回的项目报告\n\n任务图尚未完成，不能交付。\n');
+
+  const workerDone = hub.handleWorkflowNodeResult({
+    workflowRunId: workflowRun.id,
+    nodeId: workerDispatch.nodeId,
+    attempt: workerDispatch.attempt,
+    handoffId: workerDispatch.handoffId,
+    fromAgent: workerDispatch.targetParticipantId,
+    output: {
+      summary: '提前生成项目最终报告。',
+      artifacts: [{ path: deliverablePath, kind: 'markdown', label: 'premature-final-report.md' }],
+      workFolder,
+    },
+    now: 1770000002000,
+  });
+  assert.equal(workerDone.ok, true);
+
+  const reviewerDispatch = workerDone.dispatches[0];
+  const reviewed = hub.handleWorkflowNodeReview({
+    workflowRunId: workflowRun.id,
+    nodeId: reviewerDispatch.nodeId,
+    attempt: reviewerDispatch.attempt,
+    handoffId: reviewerDispatch.handoffId,
+    fromAgent: reviewerDispatch.targetParticipantId,
+    reviewDecision: {
+      status: 'passed',
+      reason: 'reviewer 误判通过，但任务图仍未完成。',
+      evidenceRefs: [`artifact:${deliverablePath}`],
+    },
+    output: { summary: '复核通过。' },
+    now: 1770000003000,
+  });
+
+  assert.equal(reviewed.ok, true);
+  assert.equal(reviewed.workflowRun.status, 'blocked');
+  assert.equal(reviewed.workflowRun.projectDelivery.status, 'failed');
+  assert.equal(reviewed.workflowRun.projectDelivery.reason, 'tasks_not_all_done');
+  assert.equal(hub.getProject('proj-project-workflow-incomplete-graph').status, 'active');
+  assert.deepEqual(
+    hub.getBoard('proj-project-workflow-incomplete-graph').getAllTasks().map(task => task.status),
+    ['pending', 'pending', 'pending'],
+  );
+});
+
+test('workflow preferred dispatch starts project workflow after task graph is complete', () => {
+  const hub = createHub({ silent: true });
+  createHighQualityProject(hub, 'proj-project-workflow-complete-graph');
+  completeAllTasks(hub, 'proj-project-workflow-complete-graph');
+
+  const dispatched = startProjectWorkflow(hub, 'proj-project-workflow-complete-graph');
   const workflowRun = dispatched.workflowRuns[0];
 
   assert.equal(workflowRun.workflowId, 'po-generated-project-workflow');
-  assert.deepEqual(workflowRun.scope, { projectId: 'proj-project-workflow' });
+  assert.deepEqual(workflowRun.scope, { projectId: 'proj-project-workflow-complete-graph' });
   assert.equal(workflowRun.sourceTask, null);
   assert.equal(dispatched.workflowNodeDispatches[0].nodeId, 'worker-produce-project-deliverable');
   assert.equal(dispatched.workflowNodeDispatches[0].input.workflowRun.workflowId, 'po-generated-project-workflow');
   assert.equal(dispatched.workflowNodeDispatches[0].input.sourceTask, null);
-
-  const tasks = hub.getBoard('proj-project-workflow').getAllTasks();
-  assert.deepEqual(tasks.map(task => task.status), ['pending', 'pending', 'pending']);
-  assert.equal(hub.listProjectWorkflowRuns('proj-project-workflow').length, 1);
-
-  const duplicate = hub.handleRequestDispatch('proj-project-workflow', 'xiaok-po');
-  assert.equal(duplicate.ok, true);
-  assert.deepEqual(duplicate.dispatched, []);
-  assert.deepEqual(duplicate.workflowDispatched, []);
-  assert.equal(duplicate.workflowRuns.length, 0);
-  assert.equal(hub.listProjectWorkflowRuns('proj-project-workflow').length, 1);
 });
 
 test('passed project workflow delivers the whole project with artifact provenance', () => {
   const hub = createHub({ silent: true });
   createHighQualityProject(hub, 'proj-project-workflow-deliver');
+  completeAllTasks(hub, 'proj-project-workflow-deliver');
   const dispatched = startProjectWorkflow(hub, 'proj-project-workflow-deliver');
   const workflowRun = dispatched.workflowRuns[0];
   const workerDispatch = dispatched.workflowNodeDispatches[0];
@@ -162,6 +286,7 @@ test('workflow preferred single-task override still dispatches task workflow thr
 test('project workflow blocks delivery when the worker returns no artifact evidence', () => {
   const hub = createHub({ silent: true });
   createHighQualityProject(hub, 'proj-project-workflow-missing-artifact');
+  completeAllTasks(hub, 'proj-project-workflow-missing-artifact');
   const dispatched = startProjectWorkflow(hub, 'proj-project-workflow-missing-artifact');
   const workflowRun = dispatched.workflowRuns[0];
   const workerDispatch = dispatched.workflowNodeDispatches[0];
@@ -200,13 +325,14 @@ test('project workflow blocks delivery when the worker returns no artifact evide
   assert.equal(hub.getProject('proj-project-workflow-missing-artifact').status, 'active');
   assert.deepEqual(
     hub.getBoard('proj-project-workflow-missing-artifact').getAllTasks().map(task => task.status),
-    ['pending', 'pending', 'pending'],
+    ['done', 'done', 'done'],
   );
 });
 
 test('project workflow blocks delivery when artifact paths are not readable project files', () => {
   const hub = createHub({ silent: true });
   createHighQualityProject(hub, 'proj-project-workflow-fake-artifact');
+  completeAllTasks(hub, 'proj-project-workflow-fake-artifact');
   const dispatched = startProjectWorkflow(hub, 'proj-project-workflow-fake-artifact');
   const workflowRun = dispatched.workflowRuns[0];
   const workerDispatch = dispatched.workflowNodeDispatches[0];
@@ -252,7 +378,7 @@ test('project workflow blocks delivery when artifact paths are not readable proj
   assert.equal(hub.getProject('proj-project-workflow-fake-artifact').status, 'active');
   assert.deepEqual(
     hub.getBoard('proj-project-workflow-fake-artifact').getAllTasks().map(task => task.status),
-    ['pending', 'pending', 'pending'],
+    ['done', 'done', 'done'],
   );
 });
 

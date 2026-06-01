@@ -312,6 +312,7 @@ test('quality feedback returns repair retry strategy', () => {
 test('plan revision required temporal block requires Xiaok conversation', () => {
   const result = deriveProjectIntervention({
     project: { id: 'proj-temporal', name: 'Claude 本月动态分析', status: 'active' },
+    now: Date.UTC(2026, 4, 20, 4, 0, 0),
     tasks: [
       {
         id: 'p1-item3',
