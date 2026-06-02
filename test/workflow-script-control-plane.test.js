@@ -177,6 +177,7 @@ test('script-generated project workflow delivers project state from artifact evi
 
     assert.equal(finished.ok, true);
     assert.equal(finished.workflowRun.status, 'completed');
+    assert.equal(finished.workflowRun.gateDecision.status, 'passed');
     assert.equal(finished.workflowRun.projectDelivery.status, 'delivered');
 
     const deliveredProject = hub.getProject('proj-script-delivery');

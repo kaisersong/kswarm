@@ -2363,6 +2363,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       });
       return { ok: true, workflowRun: withResult, dispatches: [], projectDelivery: null };
     }
+    withResult = {
+      ...withResult,
+      gateDecision: terminalDecision || withResult.gateDecision || {
+        status: 'passed',
+        reason: 'Dynamic workflow script completed',
+        evidenceRefs: readWorkflowStringArray(workflowResult.evidenceRefs),
+      },
+    };
     const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
     withResult = projectFinalization.workflowRun;
     workflowRuns.set(withResult.id, withResult);
