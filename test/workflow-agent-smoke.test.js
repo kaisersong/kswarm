@@ -202,6 +202,32 @@ test('malformed reviewer decision and runtime unavailable block workflow recover
   assert.equal(malformed.workflowRun.nodes.find(node => node.id === 'reviewer-adversarial-check').error, 'malformed_review_decision');
 });
 
+test('runtime unavailable records the actual workflow node failure reason in event log', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-node-failure-reason');
+  const started = hub.startAgentReviewSmokeWorkflow('proj-node-failure-reason', { now: 1770000000000 });
+
+  const blocked = hub.handleWorkflowRuntimeUnavailable({
+    workflowRunId: started.workflowRun.id,
+    nodeId: 'worker-diagnose-project',
+    attempt: started.dispatches[0].attempt,
+    handoffId: started.dispatches[0].handoffId,
+    reason: 'Premature close',
+    now: 1770000000500,
+  });
+
+  assert.equal(blocked.ok, true);
+  assert.equal(blocked.workflowRun.status, 'blocked');
+  assert.equal(blocked.workflowRun.nodes.find(node => node.id === 'worker-diagnose-project').error, 'Premature close');
+
+  const events = hub.getEventLog().getEvents().filter(event => event.type === 'workflow.node.blocked');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].projectId, 'proj-node-failure-reason');
+  assert.equal(events[0].workflowRunId, started.workflowRun.id);
+  assert.equal(events[0].nodeId, 'worker-diagnose-project');
+  assert.equal(events[0].reason, 'Premature close');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {
