@@ -133,6 +133,94 @@ test('KualityForge script preview can create a KSwarm dynamic workflow and revie
     assert.equal(reviewer.dispatches[0].targetParticipantId, 'codex:gpt-5');
     assert.equal(reviewer.dispatches[0].input.options.outputArtifact, 'reviews/codex-gpt-5.md');
     assert.equal(reviewer.workflowRun.nodes.find(node => node.id === reviewer.nodeId).parallelGroupId, group.parallelGroup.id);
+
+    const dispatch = reviewer.dispatches[0];
+    assert.ok(dispatch.nodeId);
+    assert.equal(typeof dispatch.attempt, 'number');
+    assert.ok(dispatch.handoffId);
+
+    const nodeResult = hub.handleWorkflowNodeResult({
+      workflowRunId: started.workflowRun.id,
+      nodeId: reviewer.nodeId,
+      attempt: dispatch.attempt,
+      handoffId: dispatch.handoffId,
+      fromAgent: 'codex:gpt-5',
+      output: {
+        summary: 'KualityForge review artifact written: reviews/codex-gpt-5.md',
+        runnerId: 'codex:gpt-5',
+        artifact: 'reviews/codex-gpt-5.md',
+      },
+      now: 1782000000500,
+    });
+    assert.equal(nodeResult.ok, true);
+    const completedReviewer = nodeResult.workflowRun.nodes.find(node => node.id === reviewer.nodeId);
+    assert.equal(completedReviewer.status, 'completed');
+
+    const updatedGroup = nodeResult.workflowRun.parallelGroups.find(g => g.id === group.parallelGroup.id);
+    assert.equal(updatedGroup.completedCount, 1);
+    assert.equal(updatedGroup.failedCount, 0);
+    assert.equal(updatedGroup.requiredFailedCount, 0);
+
+    const completed = hub.completeScriptWorkflowRun(started.workflowRun.id, {
+      terminal: { status: 'passed' },
+      now: 1782000000600,
+    });
+    assert.equal(completed.ok, true);
+    assert.equal(completed.workflowRun.status, 'completed');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('completeScriptWorkflowRun stays strict: running reviewer node blocks completion as workflow_script_nodes_incomplete', () => {
+  const dir = makeTempDir('strict-complete');
+  try {
+    const hub = createHub({ eventLogDir: join(dir, 'events'), silent: true });
+    createActiveProject(hub);
+
+    const proposal = hub.createScriptWorkflowProposal('proj-kualityforge', makeKualityForgePreview(), {
+      requestedBy: 'codex',
+      now: 1782000000100,
+    });
+    assert.equal(proposal.ok, true);
+
+    const started = hub.startScriptWorkflowRunFromProposal(proposal.workflowProposal.id, {
+      approvedBy: 'human',
+      now: 1782000000200,
+    });
+    assert.equal(started.ok, true);
+
+    const group = hub.beginWorkflowScriptParallelGroup(started.workflowRun.id, {
+      phaseTitle: 'Parallel Review',
+      label: 'KualityForge reviewer fan-out',
+      primitiveId: 'reviewer-fanout',
+      totalCount: 1,
+      limit: 1,
+      failurePolicy: 'required_all',
+      now: 1782000000300,
+    });
+    assert.equal(group.ok, true);
+
+    const reviewer = hub.dispatchWorkflowScriptAgentNode(started.workflowRun.id, {
+      phaseTitle: 'Parallel Review',
+      label: 'KualityForge review: codex:gpt-5',
+      prompt: 'Write reviews/codex-gpt-5.md with a fenced kualityforge-review JSON block.',
+      assignedAgent: 'codex:gpt-5',
+      parallelGroupId: group.parallelGroup.id,
+      fanoutItemKey: 'reviewer-codex-gpt-5',
+      fanoutItemLabel: 'codex:gpt-5',
+      required: true,
+      now: 1782000000400,
+    });
+    assert.equal(reviewer.ok, true);
+
+    // No node result written back: reviewer node is still running.
+    const completed = hub.completeScriptWorkflowRun(started.workflowRun.id, {
+      terminal: { status: 'passed' },
+      now: 1782000000600,
+    });
+    assert.equal(completed.ok, false);
+    assert.equal(completed.error, 'workflow_script_nodes_incomplete');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

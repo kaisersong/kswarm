@@ -2985,7 +2985,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   function normalizeWorkflowScriptTerminalDecision(terminal) {
     if (!terminal || typeof terminal !== 'object' || Array.isArray(terminal)) return null;
     const status = readWorkflowString(terminal.status);
-    if (!status || status === 'finished') return { status: 'passed', reason: readWorkflowString(terminal.reason), evidenceRefs: readWorkflowStringArray(terminal.evidenceRefs) };
+    if (!status || status === 'finished' || status === 'passed') return { status: 'passed', reason: readWorkflowString(terminal.reason), evidenceRefs: readWorkflowStringArray(terminal.evidenceRefs) };
     const gateStatus = status === 'blocked' || status === 'needs_replanning' || status === 'needs_rubric_clarification'
       ? status
       : 'blocked';

@@ -26,6 +26,20 @@ test('server wires script-generated workflow proposal, run, node, and completion
   assert.ok(source.includes('terminal: body?.terminal'));
 });
 
+test('server wires script node-result write-back endpoint with attempt/handoff/fromAgent/output and workflow_run_updated broadcast', () => {
+  assert.ok(source.includes('script\\/nodes\\/([^/]+)\\/result'));
+  assert.match(source, /handleWorkflowNodeResult/);
+  const routeStart = source.indexOf('scriptWorkflowNodeResultMatch');
+  assert.ok(routeStart > -1);
+  const routeBlock = source.slice(routeStart, routeStart + 1400);
+  assert.match(routeBlock, /attempt: body\?\.attempt/);
+  assert.match(routeBlock, /handoffId: body\?\.handoffId/);
+  assert.match(routeBlock, /fromAgent: body\?\.fromAgent/);
+  assert.match(routeBlock, /output: body\?\.output/);
+  assert.match(routeBlock, /type: 'workflow_run_updated'/);
+  assert.match(routeBlock, /sendWorkflowNodeHandoffs/);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {
