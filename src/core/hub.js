@@ -2476,6 +2476,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         evidenceRefs: readWorkflowStringArray(workflowResult.evidenceRefs),
       },
     };
+    const { projectDelivery: _staleProjectDelivery, ...workflowRunWithoutStaleDelivery } = withResult;
+    withResult = refreshWorkflowRunState({
+      ...workflowRunWithoutStaleDelivery,
+      status: 'completed',
+      completedAt: now,
+    });
     const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
     withResult = projectFinalization.workflowRun;
     workflowRuns.set(withResult.id, withResult);

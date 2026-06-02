@@ -339,6 +339,94 @@ test('script-generated project workflow blocks delivery when final task requires
   }
 });
 
+test('blocked script-generated project workflow can redeliver after runtime supplies required html artifact', () => {
+  const dir = makeTempDir('project-delivery-redeliver');
+  try {
+    const hub = createHub({ eventLogDir: join(dir, 'events'), silent: true });
+    const projectId = 'proj-script-redeliver';
+    const project = hub.createProject({
+      id: projectId,
+      name: 'HTML 报告工作流项目',
+      goal: '验证动态 workflow 补齐 HTML 报告后可以重新交付',
+      poAgent: 'xiaok-po',
+      members: ['xiaok-worker'],
+    });
+    project.workFolder = dir;
+    const added = hub.handleHumanAddTasks(projectId, [
+      {
+        id: 'final-report',
+        title: '生成 HTML 报告',
+        assignedAgent: 'xiaok-worker',
+        requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+      },
+    ]);
+    assert.equal(added.ok, true);
+    assert.equal(hub.handleApprove(projectId).ok, true);
+
+    mkdirSync(join(dir, 'artifacts'), { recursive: true });
+    writeFileSync(join(dir, 'artifacts', 'agent-final-report.md'), '# Agent final report\n\nOnly markdown was produced.\n');
+    writeFileSync(join(dir, 'artifacts', 'agent-final-report.html'), '<!DOCTYPE html><html><body>Final HTML report</body></html>\n');
+
+    const proposal = hub.createScriptWorkflowProposal(projectId, makePreview(projectId), {
+      requestedBy: 'human',
+      now: 1780000013000,
+    });
+    const started = hub.startScriptWorkflowRunFromProposal(proposal.workflowProposal.id, {
+      approvedBy: 'human',
+      now: 1780000013100,
+    });
+    const dispatched = hub.dispatchWorkflowScriptAgentNode(started.workflowRun.id, {
+      phaseTitle: '生成报告',
+      label: '生成 HTML 报告',
+      prompt: '生成最终 HTML 报告。',
+      assignedAgent: 'xiaok-worker',
+      now: 1780000013200,
+    });
+    assert.equal(dispatched.ok, true);
+    assert.equal(hub.handleWorkflowNodeResult({
+      workflowRunId: started.workflowRun.id,
+      nodeId: dispatched.nodeId,
+      attempt: dispatched.dispatches[0].attempt,
+      handoffId: dispatched.dispatches[0].handoffId,
+      fromAgent: 'xiaok-worker',
+      output: {
+        summary: '只生成了 markdown 报告。',
+        artifacts: [{ path: 'artifacts/agent-final-report.md', kind: 'markdown', label: 'agent-final-report.md' }],
+        evidenceRefs: ['artifact:artifacts/agent-final-report.md'],
+      },
+      now: 1780000013300,
+    }).ok, true);
+
+    const blocked = hub.completeScriptWorkflowRun(started.workflowRun.id, {
+      result: { summary: '脚本编排完成。' },
+      now: 1780000013400,
+    });
+    assert.equal(blocked.ok, true);
+    assert.equal(blocked.workflowRun.status, 'blocked');
+    assert.equal(blocked.workflowRun.projectDelivery.error, 'worker_required_output_missing');
+
+    const delivered = hub.completeScriptWorkflowRun(started.workflowRun.id, {
+      result: {
+        summary: '已补齐最终 HTML 报告。',
+        artifacts: [{ path: 'artifacts/agent-final-report.html', kind: 'report_html', label: 'agent-final-report.html' }],
+        evidenceRefs: ['artifact:artifacts/agent-final-report.html'],
+        workFolder: dir,
+      },
+      terminal: { status: 'passed', reason: 'required report_html artifact supplied' },
+      now: 1780000013500,
+    });
+
+    assert.equal(delivered.ok, true);
+    assert.equal(delivered.workflowRun.status, 'completed');
+    assert.equal(delivered.workflowRun.projectDelivery.status, 'delivered');
+    assert.equal(hub.getProject(projectId).status, 'delivered');
+    assert.equal(hub.getProject(projectId).deliverable.artifacts[0].path, 'artifacts/agent-final-report.html');
+    assert.deepEqual(hub.getBoard(projectId).getAllTasks().map(task => task.status), ['done']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('restores historical completed script workflow deliveries on hub startup', async () => {
   const dir = makeTempDir('project-delivery-recovery');
   try {
