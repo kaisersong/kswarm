@@ -1626,6 +1626,27 @@ async function handleRequest(req, res) {
       return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
     }
 
+    const scriptWorkflowNodeRetryMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes\/([^/]+)\/retry$/);
+    if (scriptWorkflowNodeRetryMatch && req.method === 'POST') {
+      const [, projectId, workflowRunId, nodeId] = scriptWorkflowNodeRetryMatch;
+      const body = await parseBody(req);
+      const existingRun = hub.getWorkflowRun(workflowRunId);
+      if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
+      if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
+      if (existingRun.source !== 'script_generated') return json(res, { ok: false, error: 'workflow_run_not_script_generated' }, 400);
+      const result = hub.retryWorkflowScriptAgentNode(workflowRunId, {
+        nodeId,
+        assignedAgent: body?.assignedAgent || null,
+      });
+      if (result.ok) {
+        broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+        await sendWorkflowNodeHandoffs(projectId, result.dispatches || []);
+        const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
+        return json(res, { ...result, workflowRun }, 200);
+      }
+      return json(res, result, result.error === 'workflow_run_not_found' ? 404 : 400);
+    }
+
     const scriptWorkflowCompleteMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/complete$/);
     if (scriptWorkflowCompleteMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowCompleteMatch;

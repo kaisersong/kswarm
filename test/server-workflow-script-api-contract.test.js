@@ -40,6 +40,17 @@ test('server wires script node-result write-back endpoint with attempt/handoff/f
   assert.match(routeBlock, /sendWorkflowNodeHandoffs/);
 });
 
+test('server wires script node retry endpoint with workflow update broadcast and handoff dispatch', () => {
+  assert.ok(source.includes('script\\/nodes\\/([^/]+)\\/retry'));
+  assert.match(source, /retryWorkflowScriptAgentNode/);
+  const routeStart = source.indexOf('scriptWorkflowNodeRetryMatch');
+  assert.ok(routeStart > -1);
+  const routeBlock = source.slice(routeStart, routeStart + 1400);
+  assert.match(routeBlock, /assignedAgent: body\?\.assignedAgent/);
+  assert.match(routeBlock, /type: 'workflow_run_updated'/);
+  assert.match(routeBlock, /sendWorkflowNodeHandoffs/);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

@@ -432,6 +432,68 @@ test('script-generated workflow cannot be completed while dynamic agent nodes ar
   }
 });
 
+test('script-generated workflow can retry a blocked dynamic agent node in the same durable run', () => {
+  const dir = makeTempDir('retry-blocked-node');
+  try {
+    const hub = createHub({ eventLogDir: join(dir, 'events'), silent: true });
+    createActiveProject(hub);
+
+    const proposal = hub.createScriptWorkflowProposal('proj-script', makePreview(), { now: 1780000002000 });
+    const started = hub.startScriptWorkflowRunFromProposal(proposal.workflowProposal.id, { now: 1780000002100 });
+    const group = hub.beginWorkflowScriptParallelGroup(started.workflowRun.id, {
+      phaseTitle: '扫描项目状态',
+      label: '两路扫描',
+      primitiveId: 'parallel-1',
+      kind: 'parallel',
+      totalCount: 1,
+      limit: 1,
+      failurePolicy: 'required_all',
+      now: 1780000002200,
+    });
+    assert.equal(group.ok, true);
+    const dispatched = hub.dispatchWorkflowScriptAgentNode(started.workflowRun.id, {
+      phaseTitle: '扫描项目状态',
+      label: '检查项目任务状态',
+      prompt: '请检查项目当前任务、风险和阻塞。',
+      assignedAgent: 'xiaok-worker',
+      parallelGroupId: group.parallelGroup.id,
+      fanoutItemKey: 'branch-1',
+      fanoutItemLabel: '检查项目任务状态',
+      now: 1780000002300,
+    });
+    assert.equal(dispatched.ok, true);
+    const blocked = hub.handleWorkflowRuntimeUnavailable({
+      workflowRunId: started.workflowRun.id,
+      nodeId: dispatched.nodeId,
+      attempt: dispatched.dispatches[0].attempt,
+      handoffId: dispatched.dispatches[0].handoffId,
+      reason: 'structured_json_missing',
+      now: 1780000002400,
+    });
+    assert.equal(blocked.ok, true);
+    assert.equal(blocked.workflowRun.status, 'blocked');
+    assert.equal(blocked.workflowRun.parallelGroups[0].status, 'failed');
+
+    const retried = hub.retryWorkflowScriptAgentNode(started.workflowRun.id, {
+      nodeId: dispatched.nodeId,
+      now: 1780000002500,
+    });
+
+    assert.equal(retried.ok, true);
+    assert.equal(retried.dispatches.length, 1);
+    assert.equal(retried.dispatches[0].nodeId, dispatched.nodeId);
+    assert.equal(retried.dispatches[0].attempt, 2);
+    assert.equal(retried.workflowRun.status, 'running');
+    const retriedNode = retried.workflowRun.nodes.find(node => node.id === dispatched.nodeId);
+    assert.equal(retriedNode.status, 'running');
+    assert.equal(retriedNode.error, null);
+    assert.equal(retried.workflowRun.parallelGroups[0].status, 'waiting_for_children');
+    assert.equal(retried.workflowRun.scriptCheckpoints.find(item => item.primitiveId === dispatched.nodeId).status, 'waiting');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('script-generated workflow terminal block keeps run blocked instead of delivered', () => {
   const dir = makeTempDir('terminal-block');
   try {

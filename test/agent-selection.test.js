@@ -47,19 +47,44 @@ import { normalizeProjectAgentSelection, reconcileProjectAgentSelectionWithEffec
   const project = {
     id: 'proj-stale-selection',
     poAgent: 'xiaok-po',
-    members: ['xiaok-worker'],
+    members: ['xiaok-worker', null, { id: 'bad-object' }, ''],
     agentSelection: {
       poAgent: { agentId: 'po-smoke', source: 'default_seed' },
-      members: [{ agentId: 'xiaok-worker', source: 'default_seed' }],
+      members: [
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+        { agentId: { source: 'default_seed' }, source: 'default_seed' },
+      ],
     },
   };
 
   const changed = reconcileProjectAgentSelectionWithEffectiveAgents(project);
 
   assert.equal(changed, true);
+  assert.deepEqual(project.members, ['xiaok-worker']);
   assert.equal(project.agentSelection.poAgent.agentId, 'xiaok-po');
   assert.equal(project.agentSelection.poAgent.source, 'system_migration');
   assert.deepEqual(project.agentSelection.members, [{ agentId: 'xiaok-worker', source: 'default_seed' }]);
+}
+
+{
+  const selection = normalizeProjectAgentSelection({
+    poAgent: 'xiaok-po',
+    members: ['xiaok-worker', null, { source: 'default_seed' }, ''],
+    defaultSource: 'default_seed',
+    agentSelection: {
+      poAgent: { agentId: 'xiaok-po', source: 'default_seed' },
+      members: [
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+        { agentId: { source: 'default_seed' }, source: 'default_seed' },
+        null,
+        '',
+      ],
+    },
+  });
+
+  assert.deepEqual(selection.members, [
+    { agentId: 'xiaok-worker', source: 'default_seed' },
+  ]);
 }
 
 console.log('agent-selection tests passed');

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHub } from '../src/core/hub.js';
 
 const now = 1779550000000;
@@ -155,6 +158,95 @@ function createProject(hub, overrides = {}) {
   assert.equal(project.preparation.blockers[0].agentId, 'cli-qoder');
   assert.equal(project.preparation.blockers[0].selectedBy, 'explicit_user');
   assert.equal(bridge.getSentOf('assign_po').length, 0);
+}
+
+{
+  const bridge = createMockBridge();
+  const hub = createHub({ bridge, silent: true });
+
+  const project = createProject(hub, {
+    id: 'proj-invalid-member',
+    members: ['xiaok-worker', null, { source: 'default_seed' }, ''],
+    agentSelection: {
+      poAgent: { agentId: 'xiaok-po', source: 'default_seed' },
+      members: [
+        { agentId: 'xiaok-worker', source: 'default_seed' },
+        { agentId: { source: 'default_seed' }, source: 'default_seed' },
+        null,
+      ],
+    },
+    preparationContext: {
+      agents: [desktopPo, desktopWorker],
+      participants: [
+        { participantId: 'xiaok-po', lastSeenAt: now },
+        { participantId: 'xiaok-worker', lastSeenAt: now },
+      ],
+      probeResults: {
+        'xiaok-po': { ok: true, checkedAt: now },
+        'xiaok-worker': { ok: true, checkedAt: now },
+      },
+      now,
+    },
+  });
+
+  assert.deepEqual(project.members, ['xiaok-worker']);
+  assert.deepEqual(project.agentSelection.members, [
+    { agentId: 'xiaok-worker', source: 'default_seed' },
+  ]);
+  assert.equal(project.preparation.state, 'ready');
+  assert.equal(project.preparation.blockers.some(blocker => blocker.agentId === '[object Object]'), false);
+}
+
+{
+  const stateFile = join(mkdtempSync(join(tmpdir(), 'kswarm-legacy-prep-')), 'state.json');
+  writeFileSync(stateFile, JSON.stringify({
+    projects: [
+      {
+        id: 'proj-legacy-prep',
+        name: 'Legacy Preparation Project',
+        goal: 'Verify legacy preparation cleanup',
+        poAgent: 'xiaok-po',
+        members: ['xiaok-worker', null],
+        agentSelection: {
+          poAgent: { agentId: 'xiaok-po', source: 'default_seed' },
+          members: [
+            { agentId: 'xiaok-worker', source: 'default_seed' },
+            { agentId: { source: 'default_seed' }, source: 'default_seed' },
+          ],
+        },
+        preparation: {
+          state: 'blocked',
+          checkedAt: now,
+          generation: 2,
+          checks: [
+            { agentId: 'xiaok-po', role: 'project_owner', ready: true, readiness: 'ready' },
+            { agentId: 'xiaok-worker', role: 'worker', ready: true, readiness: 'ready' },
+            { agentId: '[object Object]', role: 'worker', ready: false, readiness: 'unavailable', reason: 'agent_missing' },
+          ],
+          blockers: [
+            { agentId: '[object Object]', role: 'worker', reason: 'agent_missing', readiness: 'unavailable' },
+          ],
+          replacements: [],
+        },
+        status: 'planning',
+        createdAt: now,
+      },
+    ],
+    boards: [{ projectId: 'proj-legacy-prep', tasks: [] }],
+    workflowRuns: [],
+    workflowProposals: [],
+  }));
+
+  const hub = createHub({ silent: true, dataDir: stateFile });
+  const project = hub.getProject('proj-legacy-prep');
+
+  assert.deepEqual(project.members, ['xiaok-worker']);
+  assert.deepEqual(project.agentSelection.members, [
+    { agentId: 'xiaok-worker', source: 'default_seed' },
+  ]);
+  assert.equal(project.preparation.state, 'ready');
+  assert.deepEqual(project.preparation.blockers, []);
+  assert.equal(project.preparation.checks.some(check => check.agentId === '[object Object]'), false);
 }
 
 console.log('project-preparation tests passed');

@@ -69,6 +69,7 @@ import {
   buildQualityPromptExcerpt,
   compileEffectiveQualityRuleSet,
 } from './quality-rules.js';
+import { reconcileProjectAgentSelectionWithEffectiveAgents } from './agent-selection.js';
 
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
@@ -86,7 +87,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const saved = persistence.load();
     if (saved && saved.projects) {
       for (const p of saved.projects) {
-        projects.set(p.id, { ...p, executionMode: normalizeProjectExecutionMode(p.executionMode) });
+        const project = normalizeRecoveredProject(p);
+        projects.set(project.id, project);
       }
       for (const { projectId, tasks } of (saved.boards || [])) {
         boards.set(projectId, restoreTaskBoard(tasks, projectId));
@@ -173,7 +175,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   }
 
   function normalizeAgentId(value) {
-    return String(value || '').trim();
+    return typeof value === 'string' && value.trim() ? value.trim() : '';
   }
 
   function getActiveTasksAcrossLiveProjects() {
@@ -250,6 +252,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const createdAt = Date.now();
     const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
     const effectiveName = normalizeProjectNameForDisplay(name);
+    const normalizedPoAgent = normalizeAgentId(poAgent);
+    const normalizedMembers = normalizeAgentIdList(members).filter(agentId => agentId !== normalizedPoAgent);
     const qualityRuleSet = compileEffectiveQualityRuleSet({
       goal: goal || '',
       requirements: requirements || '',
@@ -268,10 +272,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       planningGuidance: planningGuidance || '',
       qualityRuleSet,
       qualityPlanningGuidance,
-      agentSelection: normalizeAgentSelection({ poAgent, members, agentSelection }),
+      agentSelection: normalizeAgentSelection({ poAgent: normalizedPoAgent, members: normalizedMembers, agentSelection }),
       preparation: null,
-      poAgent,
-      members,
+      poAgent: normalizedPoAgent,
+      members: normalizedMembers,
       executionMode: normalizeProjectExecutionMode(executionMode),
       executionModeUpdatedAt: createdAt,
       executionModeUpdatedBy: 'system_default',
@@ -292,8 +296,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     projects.set(id, project);
     boards.set(id, createTaskBoard(id));
 
-    eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: poAgent });
-    recordHumanAction('create_project', { projectId: id, projectName: effectiveName, poAgent });
+    eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: normalizedPoAgent });
+    recordHumanAction('create_project', { projectId: id, projectName: effectiveName, poAgent: normalizedPoAgent });
 
     if (preparationContext) {
       project.preparation = deriveProjectPreparation({
@@ -333,22 +337,75 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return value.trim().replace(/\s+/g, ' ').slice(0, 240);
   }
 
+  function normalizeAgentIdList(values = []) {
+    const result = [];
+    for (const value of Array.isArray(values) ? values : []) {
+      const agentId = normalizeAgentId(value);
+      if (agentId && !result.includes(agentId)) result.push(agentId);
+    }
+    return result;
+  }
+
+  function normalizeSelectionMember(member, index, members, fallbackSource) {
+    const record = member && typeof member === 'object' && !Array.isArray(member) ? member : null;
+    const agentId = record
+      ? (normalizeAgentId(record.agentId) || normalizeAgentId(record.id) || normalizeAgentId(members[index]))
+      : (normalizeAgentId(member) || normalizeAgentId(members[index]));
+    if (!agentId) return null;
+    return {
+      agentId,
+      source: record?.source || fallbackSource,
+    };
+  }
+
   function normalizeAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
     return {
       ...(agentSelection && typeof agentSelection === 'object' ? agentSelection : {}),
       poAgent: {
-        agentId: agentSelection?.poAgent?.agentId || poAgent,
+        agentId: normalizeAgentId(agentSelection?.poAgent?.agentId) || normalizeAgentId(poAgent),
         source: agentSelection?.poAgent?.source || 'system_migration',
       },
       members: Array.isArray(agentSelection?.members)
-        ? agentSelection.members.map(member => ({
-            agentId: member?.agentId || member?.id || member,
-            source: member?.source || 'system_migration',
-          })).filter(member => member.agentId)
-        : (Array.isArray(members) ? members : []).map(agentId => ({
+        ? agentSelection.members
+          .map((member, index) => normalizeSelectionMember(member, index, members, 'system_migration'))
+          .filter(Boolean)
+        : normalizeAgentIdList(members).map(agentId => ({
             agentId,
             source: 'system_migration',
       })),
+    };
+  }
+
+  function normalizeRecoveredProject(project) {
+    const normalized = {
+      ...project,
+      executionMode: normalizeProjectExecutionMode(project?.executionMode),
+    };
+    reconcileProjectAgentSelectionWithEffectiveAgents(normalized);
+    normalized.preparation = normalizeRecoveredProjectPreparation(normalized, normalized.preparation);
+    return normalized;
+  }
+
+  function normalizeRecoveredProjectPreparation(project, preparation) {
+    if (!preparation || typeof preparation !== 'object') return preparation || null;
+    const selectedAgentIds = new Set([
+      normalizeAgentId(project?.poAgent),
+      ...normalizeAgentIdList(project?.members || []),
+    ].filter(Boolean));
+    const keepSelectedRecord = record => {
+      const agentId = normalizeAgentId(record?.agentId || record?.participantId);
+      return agentId && selectedAgentIds.has(agentId);
+    };
+    const checks = (Array.isArray(preparation.checks) ? preparation.checks : [])
+      .filter(keepSelectedRecord);
+    const blockers = (Array.isArray(preparation.blockers) ? preparation.blockers : [])
+      .filter(keepSelectedRecord);
+    if (checks.length === 0 && blockers.length === 0) return null;
+    return {
+      ...preparation,
+      checks,
+      blockers,
+      state: blockers.length > 0 ? 'blocked' : 'ready',
     };
   }
 
@@ -2294,6 +2351,54 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
   }
 
+  function retryWorkflowScriptAgentNode(workflowRunId, { nodeId, assignedAgent = null, now = Date.now() } = {}) {
+    const workflowRun = workflowRuns.get(workflowRunId);
+    if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
+    if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
+    const node = workflowRun.nodes.find(item => item.id === nodeId);
+    if (!node) return { ok: false, error: 'workflow_node_not_found' };
+    if (node.kind !== 'agent_task') return { ok: false, error: 'workflow_node_not_agent_task' };
+    if (!['blocked', 'failed'].includes(node.status)) return { ok: false, error: 'workflow_node_not_retryable' };
+
+    const resetRun = refreshWorkflowRunState({
+      ...workflowRun,
+      status: 'running',
+      completedAt: null,
+      updatedAt: now,
+      nodes: workflowRun.nodes.map(item => item.id === nodeId
+        ? {
+            ...item,
+            status: 'ready',
+            error: null,
+            output: null,
+            reviewDecision: null,
+            runtime: null,
+            cache: null,
+            producerAgent: null,
+            completedAt: null,
+          }
+        : item),
+    });
+    const retryAgent = assignedAgent || node.assignedAgent || null;
+    const dispatched = dispatchWorkflowNode(resetRun, nodeId, {
+      assignedAgent: retryAgent,
+      input: node.input,
+      now,
+    });
+    workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+    eventLog.emit('workflow.script.node.retry_dispatched', {
+      projectId: dispatched.workflowRun.projectId,
+      workflowRunId,
+      workflowId: dispatched.workflowRun.workflowId,
+      nodeId,
+      assignedAgent: retryAgent,
+      attempt: dispatched.dispatches[0]?.attempt || null,
+    });
+    emitWorkflowDispatchEvents(dispatched.workflowRun.projectId, dispatched.dispatches);
+    return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
+  }
+
   function completeScriptWorkflowRun(workflowRunId, { result = null, terminal = null, now = Date.now() } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
@@ -3717,6 +3822,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     startScriptWorkflowRunFromProposal,
     beginWorkflowScriptParallelGroup,
     dispatchWorkflowScriptAgentNode,
+    retryWorkflowScriptAgentNode,
     completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow,
@@ -3754,6 +3860,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     startScriptWorkflowRunFromProposal: persisted.startScriptWorkflowRunFromProposal,
     beginWorkflowScriptParallelGroup: persisted.beginWorkflowScriptParallelGroup,
     dispatchWorkflowScriptAgentNode: persisted.dispatchWorkflowScriptAgentNode,
+    retryWorkflowScriptAgentNode: persisted.retryWorkflowScriptAgentNode,
     completeScriptWorkflowRun: persisted.completeScriptWorkflowRun,
     startProjectDiagnoseWorkflow: persisted.startProjectDiagnoseWorkflow,
     startAgentReviewSmokeWorkflow: persisted.startAgentReviewSmokeWorkflow,
