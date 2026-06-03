@@ -298,7 +298,7 @@ function getCurrentDateForPrompt() {
 
 // ─── CLI Harness: spawn real CLI binaries (multica-aligned) ───────────────────
 
-const CLI_TIMEOUT = 480_000; // 8 min per task execution
+const CLI_TIMEOUT = 900_000; // 15 min per task execution (large-repo reviews can be slow)
 
 /**
  * Run a task through the agent's native CLI binary.
@@ -498,6 +498,9 @@ function runCodex(binPath, prompt, model, workFolder) {
       timeout: CLI_TIMEOUT,
     });
     registerActiveChild(child);
+    // Prompt is passed as a CLI arg; close stdin so codex exec does not block
+    // waiting on "Reading additional input from stdin...".
+    child.stdin.end();
 
     let output = '';
     let stderr = '';
@@ -508,11 +511,16 @@ function runCodex(binPath, prompt, model, workFolder) {
       for (const line of lines) {
         try {
           const event = JSON.parse(line);
-          // Codex exec JSON: look for message events with assistant content
-          if (event.type === 'message' && event.content) {
+          // Codex exec --json NDJSON: assistant text arrives as
+          // { type: 'item.completed', item: { type: 'agent_message', text } }.
+          if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item.text) {
+            output += event.item.text;
+          } else if (event.type === 'message' && event.content) {
             output += typeof event.content === 'string' ? event.content : JSON.stringify(event.content);
-          } else if (event.message) {
-            output += typeof event.message === 'string' ? event.message : '';
+          } else if (event.item?.text && event.item?.type === 'agent_message') {
+            output += event.item.text;
+          } else if (event.message && typeof event.message === 'string') {
+            output += event.message;
           }
         } catch {
           // Plain text output — include it
@@ -730,9 +738,7 @@ function runQoder(binPath, prompt, model, workFolder) {
  */
 function runXiaok(binPath, prompt, model, workFolder) {
   return new Promise((resolve, reject) => {
-    const args = [prompt, '-p', '--output-format', 'stream-json'];
-    if (model) args.push('-m', model);
-    if (workFolder && existsSync(workFolder)) args.push('-w', workFolder);
+    const args = ['chat', prompt, '-p', '--auto'];
 
     const cwd = workFolder && existsSync(workFolder) ? workFolder : process.cwd();
     const child = spawn(binPath, args, {
@@ -820,12 +826,126 @@ async function handleIntent(intent) {
   } else if (kind === 'request_task' && taskId) {
     console.log(`[${ALIAS}] Received task: ${payload?.title || taskId}`);
     await doTask(taskId, payload);
+  } else if (kind === 'workflow_node_handoff' && payload?.nodeId) {
+    console.log(`[${ALIAS}] 🧩 Workflow node handoff: ${payload.nodeId} (${payload.nodeTitle || 'agent node'})`);
+    await handleWorkflowNodeHandoff(payload);
   } else if (kind === 'cancel_run' && payload?.runId) {
     console.log(`[${ALIAS}] Received cancel_run for: ${payload.runId}`);
     await cancelActiveRun(payload);
   } else if (kind === 'respond_approval' && payload?.decision === 'approved') {
     console.log(`[${ALIAS}] 📋 Project approved, auto-dispatching...`);
     await handleApprovalReceived(payload.projectId);
+  }
+}
+
+// ─── Workflow node handoff (script-generated workflows, e.g. KualityForge) ────
+
+async function handleWorkflowNodeHandoff(payload) {
+  const workflowRunId = payload?.workflowRunId;
+  const nodeId = payload?.nodeId;
+  const attempt = payload?.attempt;
+  const handoffId = payload?.handoffId;
+  const input = payload?.input || {};
+  const options = input?.options || {};
+  const project = payload?.project || {};
+  const projectId = project.id || input?.workflowRun?.projectId || payload?.projectId;
+  const prompt = input?.prompt || input?.value || '';
+  const runnerId = options.runnerId || AGENT_ID;
+  const artifactRoot = options.artifactRoot || null;
+  const outputArtifact = options.outputArtifact || null;
+  const workFolder = project.workFolder || options.target || process.cwd();
+
+  const failNode = async (reason) => {
+    console.log(`[${ALIAS}]   ✗ Workflow node ${nodeId} failed: ${reason}`);
+    await client.sendIntent({
+      kind: 'workflow_node_failed',
+      taskId: workflowRunId,
+      threadId: `thread-${workflowRunId}`,
+      payload: { projectId, workflowRunId, nodeId, attempt, handoffId, participantId: AGENT_ID, failureReason: reason },
+    });
+  };
+
+  if (!workflowRunId || !nodeId) {
+    console.log(`[${ALIAS}]   ⚠ Workflow handoff missing identity, ignoring`);
+    return;
+  }
+  if (!prompt) {
+    await failNode('workflow_node_prompt_missing');
+    return;
+  }
+
+  reportStatus('working');
+  try {
+    let cliOutput = null;
+    try {
+      cliOutput = await runCLIHarness(prompt, workFolder);
+    } catch (err) {
+      console.log(`[${ALIAS}]   ⚠ CLI harness failed: ${err.message}`);
+      cliOutput = null;
+    }
+    if (!cliOutput && llm) {
+      try {
+        cliOutput = await llmGenerateReport(prompt);
+      } catch (err) {
+        console.log(`[${ALIAS}]   ⚠ LLM fallback failed: ${err.message}`);
+      }
+    }
+
+    // Reviewer agents are instructed to SAVE the review file themselves (to
+    // outputArtifact, relative to their workFolder cwd). That on-disk file is
+    // the one carrying the required fenced `kualityforge-review` block; the CLI
+    // stdout is usually just a chat summary. Prefer the agent-written file.
+    let reviewContent = cliOutput;
+    if (artifactRoot && outputArtifact) {
+      const agentWrittenPath = join(workFolder, outputArtifact);
+      try {
+        if (existsSync(agentWrittenPath)) {
+          const fileContent = readFileSync(agentWrittenPath, 'utf-8');
+          if (fileContent && fileContent.trim()) {
+            reviewContent = fileContent;
+            console.log(`[${ALIAS}]   → Harvested agent-written review: ${agentWrittenPath}`);
+          }
+        }
+      } catch (err) {
+        console.log(`[${ALIAS}]   ⚠ Could not harvest agent-written review: ${err.message}`);
+      }
+    }
+
+    if (!reviewContent || !reviewContent.trim()) {
+      await failNode('workflow_node_no_output');
+      return;
+    }
+
+    if (artifactRoot && outputArtifact) {
+      const artifactPath = join(artifactRoot, outputArtifact);
+      mkdirSync(join(artifactPath, '..'), { recursive: true });
+      writeFileSync(artifactPath, reviewContent, 'utf-8');
+      console.log(`[${ALIAS}]   → Wrote workflow artifact: ${artifactPath}`);
+    }
+
+    await client.sendIntent({
+      kind: 'workflow_node_result',
+      taskId: workflowRunId,
+      threadId: `thread-${workflowRunId}`,
+      payload: {
+        projectId,
+        workflowRunId,
+        nodeId,
+        attempt,
+        handoffId,
+        participantId: AGENT_ID,
+        output: {
+          summary: `Workflow node ${nodeId} completed by ${runnerId}`,
+          runnerId,
+          artifact: outputArtifact || undefined,
+        },
+      },
+    });
+    console.log(`[${ALIAS}]   ✓ Workflow node ${nodeId} result reported`);
+  } catch (err) {
+    await failNode(err.message || 'workflow_node_error');
+  } finally {
+    reportStatus('idle');
   }
 }
 
