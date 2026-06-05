@@ -119,6 +119,7 @@ export function createBrokerClient({
     const body = {
       intentId: `${participantId}-${intentKind}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       kind: intentKind,
+      opaque: true,
       fromParticipantId: participantId,
       taskId,
       threadId,

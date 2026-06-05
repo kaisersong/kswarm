@@ -301,6 +301,35 @@ test('dispatch planning does not reroute worker tasks to project-owner-only PO',
   assert.equal(plan.projectGate, 'waiting_for_capable_agent');
 });
 
+test('retry with future retryNotBefore is deferred with retry_backoff', () => {
+  const now = 1_000_000;
+  const plan = planDispatch({
+    projectId: 'proj-a',
+    tasks: [
+      { id: 'item-1-retry-1', title: '重试', status: 'pending', assignedAgent: 'worker', dependencies: [], retryNotBefore: now + 5_000 },
+    ],
+    allActiveTasks: [],
+    now,
+  });
+  assert.deepEqual(plan.dispatchedTasks, []);
+  assert.equal(plan.blocked[0].taskId, 'item-1-retry-1');
+  assert.equal(plan.blocked[0].reason, 'retry_backoff');
+});
+
+test('retry whose backoff window elapsed is dispatched', () => {
+  const now = 1_000_000;
+  const plan = planDispatch({
+    projectId: 'proj-a',
+    tasks: [
+      { id: 'item-1-retry-1', title: '重试', status: 'pending', assignedAgent: 'worker', dependencies: [], retryNotBefore: now - 1 },
+    ],
+    allActiveTasks: [],
+    now,
+  });
+  assert.equal(plan.dispatchedTasks.length, 1);
+  assert.equal(plan.dispatchedTasks[0].id, 'item-1-retry-1');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

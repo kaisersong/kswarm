@@ -37,6 +37,7 @@ test('empty store seeds dedicated desktop xiaok PO and worker without CLI runtim
     assert.equal(po.runtimeType, 'xiaok');
     assert.equal(po.runtimeSource, 'desktop-agent-runtime');
     assert.equal(po.runtimePath ?? null, null);
+    assert.deepEqual(po.execution, { mode: 'hosted', hostParticipantId: 'xiaok-desktop' });
     assert.deepEqual(po.roles, ['project_owner']);
     assert.equal(po.provider ?? null, null);
     assert.equal(po.apiKey ?? null, null);
@@ -45,6 +46,7 @@ test('empty store seeds dedicated desktop xiaok PO and worker without CLI runtim
     assert.equal(worker.runtimeType, 'xiaok');
     assert.equal(worker.runtimeSource, 'desktop-agent-runtime');
     assert.equal(worker.runtimePath ?? null, null);
+    assert.deepEqual(worker.execution, { mode: 'hosted', hostParticipantId: 'xiaok-desktop' });
     assert.deepEqual(worker.roles, ['worker']);
     assert.equal(worker.provider ?? null, null);
     assert.equal(worker.apiKey ?? null, null);
@@ -54,7 +56,9 @@ test('empty store seeds dedicated desktop xiaok PO and worker without CLI runtim
     const persisted = JSON.parse(readFileSync(join(home, '.kswarm', 'agents.json'), 'utf-8'));
     assert.equal(persisted.some(agent => agent.id === 'xiaok'), false);
     assert.equal(persisted.find(agent => agent.id === 'xiaok-po').runtimePath ?? null, null);
+    assert.deepEqual(persisted.find(agent => agent.id === 'xiaok-po').execution, { mode: 'hosted', hostParticipantId: 'xiaok-desktop' });
     assert.equal(persisted.find(agent => agent.id === 'xiaok-worker').runtimePath ?? null, null);
+    assert.deepEqual(persisted.find(agent => agent.id === 'xiaok-worker').execution, { mode: 'hosted', hostParticipantId: 'xiaok-desktop' });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -122,6 +126,7 @@ test('legacy desktop xiaok seed provider secrets are scrubbed on load', async ()
     const po = store.get('xiaok-po');
     assert.equal(po.runtimeSource, 'desktop-agent-runtime');
     assert.equal(po.runtimePath ?? null, null);
+    assert.deepEqual(po.execution, { mode: 'hosted', hostParticipantId: 'xiaok-desktop' });
     assert.equal(po.provider ?? null, null);
     assert.equal(po.apiKey ?? null, null);
     assert.equal(po.model ?? null, null);

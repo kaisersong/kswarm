@@ -1,6 +1,7 @@
 import { isRoutable } from './runtime-health.js';
 import { inferTaskRequirements } from './task-requirements.js';
 import { canonicalizeOutputType, normalizeOutputTypes } from './output-types.js';
+import { isWorkerEligible } from './roles.js';
 
 export function evaluateTaskRoute(task = {}, agent = null, now = Date.now()) {
   if (!agent) return { ok: false, reason: 'agent_missing' };
@@ -91,9 +92,7 @@ function orderAgentsByPreference(agents, assignedAgent) {
 function shouldConsiderAgentForTask(agent, task = {}) {
   if (!agent) return false;
   if (agent.id === task.assignedAgent) return true;
-  const roles = normalizeList(agent.roles);
-  if (roles.length === 0) return true;
-  return roles.includes('worker') || !roles.includes('project_owner');
+  return isWorkerEligible(agent);
 }
 
 function limitedAssignedRuntimeMatches({ agent, task, requirements, route }) {

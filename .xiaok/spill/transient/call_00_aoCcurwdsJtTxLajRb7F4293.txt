@@ -1,0 +1,139 @@
+1	/**
+2	 * CreateProjectModal — project creation form.
+3	 */
+4	
+5	import { useState, useEffect } from 'react';
+6	import { X, FolderOpen } from 'lucide-react';
+7	import { useKSwarm } from '../../hooks/useKSwarm';
+8	
+9	export function CreateProjectModal({ open, agents, onClose, onCreate }) {
+10	  const [name, setName] = useState('');
+11	  const [goal, setGoal] = useState('');
+12	  const [requirements, setRequirements] = useState('');
+13	  const [poAgent, setPoAgent] = useState('');
+14	  const [members, setMembers] = useState([]);
+15	  const [workFolder, setWorkFolder] = useState('');
+16	  const [submitting, setSubmitting] = useState(false);
+17	
+18	  // Auto-select PO agent: xiaok seed agent first, then xiaok-cli, then any PO agent
+19	  useEffect(() => {
+20	    if (open && !poAgent && agents.length > 0) {
+21	      const seedAgent = agents.find(a => a.id === 'xiaok');
+22	      const cliAgent = agents.find(a => a.id === 'cli-xiaok');
+23	      const po = agents.find(a => a.roles?.includes('project_owner'));
+24	      if (seedAgent) setPoAgent(seedAgent.id);
+25	      else if (cliAgent) setPoAgent(cliAgent.id);
+26	      else if (po) setPoAgent(po.id);
+27	      else if (agents.length > 0) setPoAgent(agents[0].id);
+28	    }
+29	  }, [open, agents, poAgent]);
+30	
+31	  if (!open) return null;
+32	
+33	  const poAgents = agents.filter(a => a.roles?.includes('project_owner'));
+34	  const workerAgents = agents.filter(a => a.id !== poAgent);
+35	
+36	  const toggleMember = (id) => {
+37	    setMembers(prev => prev.includes(id) ? prev.filter(m => m !== id) : [...prev, id]);
+38	  };
+39	
+40	  const handleSubmit = async (e) => {
+41	    e.preventDefault();
+42	    if (!name.trim() || !poAgent) return;
+43	    setSubmitting(true);
+44	    await onCreate({ name: name.trim(), goal: goal.trim(), requirements: requirements.trim(), poAgent, members, workFolder: workFolder.trim() || undefined });
+45	    setName(''); setGoal(''); setRequirements(''); setPoAgent(''); setMembers([]); setWorkFolder('');
+46	    setSubmitting(false);
+47	    onClose();
+48	  };
+49	
+50	  return (
+51	    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-8" onClick={onClose} data-testid="modal-create-project">
+52	      <div className="relative w-full max-w-lg max-h-[80vh] overflow-y-auto rounded-2xl border border-gray-300 bg-gray-50 shadow-xl p-6" onClick={e => e.stopPropagation()}>
+53	        <div className="mb-5 flex items-center justify-between">
+54	          <h2 className="text-[14px] font-semibold text-gray-900">新建项目</h2>
+55	          <button type="button" onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded-lg text-gray-500 hover:bg-gray-100"><X size={16} /></button>
+56	        </div>
+57	        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+58	          <div className="flex flex-col gap-1.5">
+59	            <label className="text-[11px] font-medium text-gray-500">项目名称</label>
+60	            <input data-testid="input-project-name" type="text" value={name} onChange={e => setName(e.target.value)} placeholder="例：竞品分析报告" autoFocus
+61	              className="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500" />
+62	          </div>
+63	          <div className="flex flex-col gap-1.5">
+64	            <label className="text-[11px] font-medium text-gray-500">目标</label>
+65	            <input data-testid="input-project-goal" type="text" value={goal} onChange={e => setGoal(e.target.value)} placeholder="描述你希望完成什么..."
+66	              className="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500" />
+67	          </div>
+68	          <div className="flex flex-col gap-1.5">
+69	            <label className="text-[11px] font-medium text-gray-500">项目要求</label>
+70	            <textarea data-testid="input-project-requirements" value={requirements} onChange={e => setRequirements(e.target.value)} placeholder="格式要求、参考资料、限制条件、期望的产出物形式..." rows={4}
+71	              className="rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500 resize-none" />
+72	          </div>
+73	          <div className="flex flex-col gap-1.5">
+74	            <label className="text-[11px] font-medium text-gray-500">工作目录 <span className="text-gray-400">(可选，留空自动创建)</span></label>
+75	            <div className="flex items-center gap-2">
+76	              <input type="text" value={workFolder} onChange={e => setWorkFolder(e.target.value)} placeholder="~/projects/my-project"
+77	                className="flex-1 rounded-lg border border-gray-300 bg-gray-50 px-3 py-2 text-sm text-gray-900 placeholder-gray-400 outline-none focus:border-indigo-500" />
+78	              <button type="button" onClick={async (e) => {
+79	                e.stopPropagation();
+80	                if (window.showDirectoryPicker) {
+81	                  try { const h = await window.showDirectoryPicker(); if (h) setWorkFolder(h.name); } catch {}
+82	                } else {
+83	                  const p = prompt('输入工作目录路径（绝对路径）：');
+84	                  if (p) setWorkFolder(p.trim());
+85	                }
+86	              }} className="rounded-lg p-2 text-gray-500 hover:bg-gray-100" title="选择目录">
+87	                <FolderOpen size={15} />
+88	              </button>
+89	            </div>
+90	          </div>
+91	          <div className="flex flex-col gap-1.5">
+92	            <label className="text-[11px] font-medium text-gray-500">项目负责人</label>
+93	            {agents.length === 0 ? (
+94	              <p className="text-[12px] text-gray-500 py-2">请先创建智能体</p>
+95	            ) : (
+96	              <div className="flex flex-wrap gap-1.5">
+97	                {(poAgents.length > 0 ? poAgents : agents).map(agent => (
+98	                  <button key={agent.id} type="button" onClick={() => setPoAgent(agent.id)}
+99	                    className={`rounded-lg px-2.5 py-1.5 text-[12px] font-medium transition-colors ${
+100	                      poAgent === agent.id ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-500 hover:text-gray-900'
+101	                    }`}>
+102	                    <span>{agent.name}</span>
+103	                    {agent.status === 'offline' && <span className="ml-1 text-[10px] text-gray-400">(离线)</span>}
+104	                  </button>
+105	                ))}
+106	              </div>
+107	            )}
+108	          </div>
+109	          {workerAgents.length > 0 && (
+110	            <div className="flex flex-col gap-1.5">
+111	              <label className="text-[11px] font-medium text-gray-500">执行者 <span className="text-gray-400">(可多选，可选)</span></label>
+112	              <div className="flex flex-wrap gap-1.5">
+113	                {workerAgents.map(agent => {
+114	                  const selected = members.includes(agent.id);
+115	                  return (
+116	                    <button key={agent.id} type="button" onClick={() => toggleMember(agent.id)}
+117	                      className={`rounded-lg px-2.5 py-1.5 text-[12px] font-medium transition-colors ${
+118	                        selected ? 'bg-gray-100 text-gray-900 ring-1 ring-zinc-600' : 'bg-gray-100 text-gray-500 hover:text-gray-900'
+119	                      }`}>
+120	                      {agent.name}
+121	                    </button>
+122	                  );
+123	                })}
+124	              </div>
+125	            </div>
+126	          )}
+127	          <div className="mt-2 flex justify-end gap-2">
+128	            <button type="button" onClick={onClose} className="rounded-lg px-4 py-1.5 text-sm text-gray-500 hover:bg-gray-100">取消</button>
+129	            <button type="submit" disabled={!name.trim() || !poAgent || submitting}
+130	              className="rounded-lg bg-indigo-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50">
+131	              {submitting ? '创建中...' : '创建项目'}
+132	            </button>
+133	          </div>
+134	        </form>
+135	      </div>
+136	    </div>
+137	  );
+138	}
+139	

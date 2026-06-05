@@ -27,6 +27,10 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
       blocked.push({ taskId: task.id, reason: 'dependency_unresolved', dependencies: [...task.unresolvedDependencies] });
       continue;
     }
+    if (Number.isFinite(task.retryNotBefore) && task.retryNotBefore > now) {
+      blocked.push({ taskId: task.id, reason: 'retry_backoff', retryNotBefore: task.retryNotBefore });
+      continue;
+    }
     if (!task.assignedAgent) {
       skipped.push({ taskId: task.id, reason: 'unassigned_task' });
       continue;

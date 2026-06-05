@@ -11,6 +11,36 @@ import { createHub } from '../src/core/hub.js';
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+test('all tasks done but not delivered surfaces a manual ready_to_deliver intervention', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-deliver', name: '交付项目', status: 'active' },
+    tasks: [
+      { id: 'item-1', title: '生成报告', status: 'done', result: { artifacts: [{ filename: 'report.html' }] } },
+      { id: 'item-2', title: '复盘总结', status: 'done', result: { artifacts: [{ filename: 'summary.md' }] } },
+    ],
+    agents: [],
+    now: 1779094300000,
+  });
+
+  assert.equal(result.required, true);
+  assert.equal(result.primaryAction.id, 'confirm_delivery');
+  assert.equal(result.severity, 'action_required');
+  assert.match(result.message, /交付|deliver/i);
+});
+
+test('a delivered project needs no intervention even if all tasks are done', () => {
+  const result = deriveProjectIntervention({
+    project: { id: 'proj-delivered', name: '已交付', status: 'delivered' },
+    tasks: [
+      { id: 'item-1', title: '生成报告', status: 'done', result: { artifacts: [{ filename: 'report.html' }] } },
+    ],
+    agents: [],
+    now: 1779094300000,
+  });
+
+  assert.equal(result.required, false);
+});
+
 test('failed dependency root exposes one continue action', () => {
   const result = deriveProjectIntervention({
     project: { id: 'proj-1', name: '外贸趋势分析', status: 'active' },

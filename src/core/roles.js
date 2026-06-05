@@ -145,3 +145,57 @@ export const HUB_INTENTS = {
   submit_result: { from: 'worker', action: 'update_and_forward_to_po' },
   ask_question: { from: 'worker', action: 'forward_to_po' },
 };
+
+/**
+ * ═══════════════════════════════════════════════════════════════
+ * Unified role policy (single source of truth)
+ * ═══════════════════════════════════════════════════════════════
+ *
+ * Historically three different `hasRole` helpers disagreed on what an
+ * agent with empty/missing `roles` meant: readiness treated it as a
+ * universal match, while replacement and PO selection treated it as no
+ * match. That let a role-less agent receive new work yet never rescue
+ * failing work, and let the UI offer a role-less agent as PO even though
+ * any plan retry would discard it.
+ *
+ * Unified semantics:
+ *   - A role-less agent is WORKER-eligible everywhere (worker-universal).
+ *   - A role-less agent is NEVER auto-eligible as PROJECT OWNER; PO
+ *     requires the explicit `project_owner` role.
+ */
+
+function normalizeAgentRoles(agent) {
+  return Array.isArray(agent?.roles) ? agent.roles.filter(Boolean) : [];
+}
+
+/** Strict membership: does the agent explicitly declare this role? */
+export function agentHasExplicitRole(agent, role) {
+  if (!role) return true;
+  return normalizeAgentRoles(agent).includes(role);
+}
+
+/**
+ * Role match used by gating layers. Role-less agents match `worker`
+ * (and any non-PO role) but must explicitly declare `project_owner`.
+ */
+export function agentMatchesRole(agent, role) {
+  if (!role) return true;
+  if (role === ROLES.PO) return agentHasExplicitRole(agent, ROLES.PO);
+  const roles = normalizeAgentRoles(agent);
+  if (roles.length === 0) return true;
+  return roles.includes(role);
+}
+
+/** Worker-eligible: role-less or explicitly a worker. */
+export function isWorkerEligible(agent) {
+  if (!agent) return false;
+  const roles = normalizeAgentRoles(agent);
+  if (roles.length === 0) return true;
+  return roles.includes(ROLES.WORKER);
+}
+
+/** PO-eligible: must explicitly declare project_owner. */
+export function isProjectOwnerEligible(agent) {
+  if (!agent) return false;
+  return agentHasExplicitRole(agent, ROLES.PO);
+}

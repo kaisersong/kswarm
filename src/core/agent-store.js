@@ -14,12 +14,14 @@ import { homedir } from 'os';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
 import { createUnknownRuntimeHealth, recordRuntimeSuccess } from './runtime-health.js';
+import { resolveAgentExecution } from './agent-execution.js';
 
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const AGENTS_FILE = join(KSWARM_HOME, 'agents.json');
 const XIAOK_PO_SEED_ID = 'xiaok-po';
 const XIAOK_WORKER_SEED_ID = 'xiaok-worker';
 const DESKTOP_AGENT_RUNTIME_SOURCE = 'desktop-agent-runtime';
+const XIAOK_DESKTOP_HOST_PARTICIPANT_ID = 'xiaok-desktop';
 const XIAOK_FULL_TASK_CAPABILITIES = [
   'coding',
   'testing',
@@ -253,6 +255,7 @@ export function createAgentStore(options = {}) {
       capabilities: XIAOK_FULL_TASK_CAPABILITIES,
       taskCapabilities: XIAOK_FULL_TASK_CAPABILITIES,
       outputCapabilities: XIAOK_DIRECT_OUTPUT_CAPABILITIES,
+      execution: { mode: 'hosted', hostParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID },
     };
 
     if (missingPo) {
@@ -558,6 +561,7 @@ function normalizeAgent(agent) {
   if (isXiaokRuntime(normalized)) {
     normalized = normalizeXiaokRuntime(normalized);
   }
+  normalized.execution = resolveAgentExecution(normalized);
   normalized.runtimeHealth = normalizeRuntimeHealth(normalized, normalized.runtimeHealth);
   return normalized;
 }
@@ -595,6 +599,7 @@ function scrubDesktopXiaokSeedExecutionFields(agent = {}) {
     baseUrl: null,
     apiKey: null,
     customEnv: {},
+    execution: { mode: 'hosted', hostParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID },
   };
 }
 

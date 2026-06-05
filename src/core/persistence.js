@@ -5,10 +5,16 @@
  * Loads on startup to restore state across restarts.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const DEFAULT_PATH = new URL('../../../data/state.json', import.meta.url).pathname;
+
+function writeAtomic(filePath, data) {
+  const tmp = `${filePath}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, filePath);
+}
 
 export function createPersistence(filePath = DEFAULT_PATH) {
   mkdirSync(dirname(filePath), { recursive: true });
@@ -36,7 +42,7 @@ export function createPersistence(filePath = DEFAULT_PATH) {
         if (dirty) {
           dirty = false;
           try {
-            writeFileSync(filePath, JSON.stringify(state(), null, 2));
+            writeAtomic(filePath, JSON.stringify(state(), null, 2));
           } catch (err) {
             console.warn('[persistence] Failed to save state:', err.message);
           }
@@ -47,7 +53,7 @@ export function createPersistence(filePath = DEFAULT_PATH) {
 
   function saveSync(state) {
     try {
-      writeFileSync(filePath, JSON.stringify(state(), null, 2));
+      writeAtomic(filePath, JSON.stringify(state(), null, 2));
       dirty = false;
     } catch (err) {
       console.warn('[persistence] Failed to save state:', err.message);

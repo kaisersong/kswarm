@@ -1,4 +1,5 @@
 import { isRoutable } from './runtime-health.js';
+import { isWorkerEligible } from './roles.js';
 
 const BASIC_INVOCATION_FAILURES = new Set([
   'runtime_offline',
@@ -137,7 +138,7 @@ function rankReplacementCandidates({ task = {}, agents = [], now = Date.now() })
   return (Array.isArray(agents) ? agents : [])
     .filter(agent => agent && !agent.archivedAt)
     .filter(agent => normalizeId(agent.id) && normalizeId(agent.id) !== currentAgent)
-    .filter(agent => hasRole(agent, 'worker'))
+    .filter(agent => isWorkerEligible(agent))
     .map(agent => {
       const route = isRoutable(agent, requiredCapabilities, requiredOutputs, now);
       return {
@@ -162,10 +163,6 @@ function candidateScore(agent, preferredMembers) {
   if (agent.runtimeHealth?.state === 'healthy') score += 5;
   if (agent.status && agent.status !== 'offline') score += 1;
   return score;
-}
-
-function hasRole(agent, role) {
-  return Array.isArray(agent?.roles) && agent.roles.includes(role);
 }
 
 function normalizeFailureClass(value) {

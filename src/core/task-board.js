@@ -159,6 +159,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
         status: 'dispatched',
         createdAt: now,
         lastHeartbeatAt: now,
+        leaseTimeoutMs: meta.leaseTimeoutMs || 600_000,
         leaseExpiresAt: meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000)),
         artifactManifest: [],
         submissionAcked: false,
@@ -173,7 +174,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
       task.runLease.assignedRuntimeInstance = task.assignedRuntimeInstance || meta.assignedRuntimeInstance || task.runLease.assignedRuntimeInstance || null;
       task.runLease.assignedExecutor = null;
       task.runLease.lastHeartbeatAt = now;
-      task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+      task.runLease.leaseTimeoutMs = meta.leaseTimeoutMs || task.runLease.leaseTimeoutMs || 600_000;
+      task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + task.runLease.leaseTimeoutMs);
     }
     if (newStatus === 'in_progress') {
       task.startedAt = now;
@@ -181,7 +183,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
         task.runLease.status = 'in_progress';
         task.runLease.startedAt = now;
         task.runLease.lastHeartbeatAt = now;
-        task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + (meta.leaseTimeoutMs || 600_000));
+        task.runLease.leaseTimeoutMs = meta.leaseTimeoutMs || task.runLease.leaseTimeoutMs || 600_000;
+        task.runLease.leaseExpiresAt = meta.leaseExpiresAt || (now + task.runLease.leaseTimeoutMs);
       }
     }
     if (newStatus === 'pending') {
@@ -391,7 +394,35 @@ export function createTaskBoard(projectId = 'legacy-project') {
       ...telemetry,
       updatedAt: now,
     };
-    task.runLease.lastHeartbeatAt = telemetry.lastHeartbeatAt || now;
+    const heartbeatAt = telemetry.lastHeartbeatAt || now;
+    task.runLease.lastHeartbeatAt = heartbeatAt;
+    const toleranceMs = task.runLease.leaseTimeoutMs || 600_000;
+    task.runLease.leaseExpiresAt = heartbeatAt + toleranceMs;
+    task.updatedAt = now;
+    return { ok: true, taskId: task.id };
+  }
+
+  function markRunSuspended(taskId, now = Date.now()) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) {
+      return { ok: false, error: 'not_active' };
+    }
+    task.suspendedAt = now;
+    task.updatedAt = now;
+    return { ok: true, taskId: task.id };
+  }
+
+  function refreshLeaseForResume(taskId, { leaseTimeoutMs = 600_000 } = {}) {
+    const task = getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    const now = Date.now();
+    if (task.runLease) {
+      const toleranceMs = task.runLease.leaseTimeoutMs || leaseTimeoutMs;
+      task.runLease.lastHeartbeatAt = now;
+      task.runLease.leaseExpiresAt = now + toleranceMs;
+    }
+    if (task.suspendedAt) delete task.suspendedAt;
     task.updatedAt = now;
     return { ok: true, taskId: task.id };
   }
@@ -586,6 +617,8 @@ export function createTaskBoard(projectId = 'legacy-project') {
     resetStaleRun,
     markRecoveryStatus,
     updateRunTelemetry,
+    markRunSuspended,
+    refreshLeaseForResume,
     resolveTaskId,
     getDispatchable,
     getDispatchableInPhase,

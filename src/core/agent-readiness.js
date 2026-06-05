@@ -1,4 +1,6 @@
 import { canonicalizeOutputType, normalizeOutputTypes } from './output-types.js';
+import { agentMatchesRole } from './roles.js';
+import { getBrokerPresenceParticipantId, isHostedAgent } from './agent-execution.js';
 
 const DEFAULT_PRESENCE_MAX_AGE_MS = 120_000;
 const DESKTOP_RUNTIME_SOURCE = 'desktop-agent-runtime';
@@ -74,9 +76,10 @@ export function classifyAgentReadiness(agent, options = {}) {
   if (base.capacity === 'available') base.checks.push('runtime_capacity_available');
 
   if (isDesktopRuntimeAgent(agent)) {
-    const participant = findParticipant(options.participants, agentId, now, options.presenceMaxAgeMs);
+    const brokerParticipantId = getBrokerPresenceParticipantId(agent) || agentId;
+    const participant = findParticipant(options.participants, brokerParticipantId, now, options.presenceMaxAgeMs);
     if (!participant) return fail(base, 'broker_participant_missing');
-    base.participantId = participant.participantId || agentId;
+    base.participantId = participant.participantId || brokerParticipantId;
     base.checks.push('broker_online');
 
     const probe = findProbeResult(options.probeResults, agentId, now);
@@ -298,11 +301,11 @@ function normalizeReason(value) {
 }
 
 function hasRole(agent, role) {
-  return !role || (Array.isArray(agent?.roles) && agent.roles.includes(role));
+  return agentMatchesRole(agent, role);
 }
 
 function isDesktopRuntimeAgent(agent) {
-  return agent?.runtimeSource === DESKTOP_RUNTIME_SOURCE || DESKTOP_SEED_AGENT_IDS.has(agent?.id);
+  return isHostedAgent(agent) || agent?.runtimeSource === DESKTOP_RUNTIME_SOURCE || DESKTOP_SEED_AGENT_IDS.has(agent?.id);
 }
 
 function findParticipant(participants = [], agentId, now, maxAge = DEFAULT_PRESENCE_MAX_AGE_MS) {
@@ -310,7 +313,7 @@ function findParticipant(participants = [], agentId, now, maxAge = DEFAULT_PRESE
   return list.find(participant => {
     const participantId = normalizeId(participant?.participantId || participant?.id || participant);
     if (participantId !== agentId) return false;
-    const lastSeenAt = Number(participant?.lastSeenAt || participant?.updatedAt || participant?.seenAt || 0);
+    const lastSeenAt = Number(participant?.lastSeenAt || participant?.lastSeen || participant?.updatedAt || participant?.seenAt || 0);
     if (!lastSeenAt) return true;
     return Number(now) - lastSeenAt <= maxAge;
   }) || null;

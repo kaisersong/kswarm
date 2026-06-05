@@ -24,9 +24,11 @@ function indexJournals(journals = []) {
 
 function isLeaseExpired(task, now, leaseTimeoutMs) {
   const lease = task.runLease || {};
+  const tolerance = lease.leaseTimeoutMs || leaseTimeoutMs;
+  const lastSeen = lease.lastHeartbeatAt || task.updatedAt || task.createdAt || null;
+  if (typeof lastSeen === 'number') return now - lastSeen >= tolerance;
   if (typeof lease.leaseExpiresAt === 'number') return now >= lease.leaseExpiresAt;
-  const lastSeen = lease.lastHeartbeatAt || task.updatedAt || task.createdAt || now;
-  return now - lastSeen >= leaseTimeoutMs;
+  return true;
 }
 
 function durableArtifactsFromJournal(journal) {
@@ -74,8 +76,19 @@ export function planProjectRecovery({
 
     if (ACTIVE_RUN_STATUSES.has(task.status)) {
       const agentId = task.assignedAgent || task.runLease?.assignedAgent || null;
+      const runtimeInstance = task.assignedRuntimeInstance || task.runLease?.assignedRuntimeInstance || null;
       const expired = isLeaseExpired(task, now, leaseTimeoutMs);
-      if (!expired && agentId && onlineAgents.has(agentId)) {
+      const liveOnline = (runtimeInstance && onlineAgents.has(runtimeInstance)) || (agentId && onlineAgents.has(agentId));
+      if (task.suspendedAt) {
+        actions.push({
+          type: 'resume_task',
+          projectId: project.id,
+          taskId: task.id,
+          runId,
+          agentId,
+          reason: 'resume_after_suspend',
+        });
+      } else if (!expired && liveOnline) {
         actions.push({
           type: 'resume_task',
           projectId: project.id,
@@ -84,6 +97,15 @@ export function planProjectRecovery({
           agentId,
           reason: 'lease_unexpired_agent_online',
         });
+      } else if (!expired && !liveOnline) {
+        actions.push({
+          type: 'defer_recovery',
+          projectId: project.id,
+          taskId: task.id,
+          runId,
+          agentId,
+          reason: 'agent_not_yet_online',
+        });
       } else {
         actions.push({
           type: 'reset_pending',
@@ -91,7 +113,7 @@ export function planProjectRecovery({
           taskId: task.id,
           runId,
           agentId,
-          reason: expired ? 'lease_expired' : 'agent_offline',
+          reason: 'lease_expired',
         });
       }
       continue;

@@ -1,0 +1,208 @@
+1	/**
+2	 * ProjectDetailPage — full project detail with plan, kanban, activity, deliverables tabs.
+3	 */
+4	
+5	import { useState, useEffect, useRef } from 'react';
+6	import { useParams, useNavigate } from 'react-router-dom';
+7	import { ArrowLeft, FileText, LayoutGrid, Activity, Package, CheckCircle2, Send, XCircle, Archive, RefreshCw, AlertTriangle, Clock3 } from 'lucide-react';
+8	import { useKSwarm } from '../../hooks/useKSwarm';
+9	import { deriveAgentStatuses } from '../../utils/agent-status';
+10	import { PlanView } from './PlanView';
+11	import { KanbanBoard } from './KanbanBoard';
+12	import { ActivityTimeline } from './ActivityTimeline';
+13	import { DeliverableView } from './DeliverableView';
+14	
+15	const TABS = [
+16	  { id: 'plan', label: '计划', icon: FileText },
+17	  { id: 'board', label: '看板', icon: LayoutGrid },
+18	  { id: 'activity', label: '动态', icon: Activity },
+19	  { id: 'deliverables', label: '产物', icon: Package },
+20	];
+21	
+22	const STATUS_LABELS = {
+23	  draft: '草稿', planning: '规划中', created: '已创建', active: '进行中',
+24	  review: '审核中', delivered: '已交付', closed: '已关闭',
+25	};
+26	
+27	const PRE_APPROVAL_STATUSES = new Set(['draft', 'created', 'planning']);
+28	function isInterruptedPlanProject(project, plan, tasks) {
+29	  return project?.status === 'active' && !plan && (tasks || []).length === 0;
+30	}
+31	
+32	function canRetryPlanForProject(project, plan, tasks) {
+33	  if (!project || project.status === 'closed' || project.status === 'delivered') return false;
+34	  return PRE_APPROVAL_STATUSES.has(project.status) || isInterruptedPlanProject(project, plan, tasks);
+35	}
+36	
+37	export function ProjectDetailPage() {
+38	  const { projectId } = useParams();
+39	  const navigate = useNavigate();
+40	  const { getProjectFullDetail, approveProject, dispatchTasks, deliverProject, closeProject, retryPlan, connected, agents, participants, logs } = useKSwarm();
+41	  const [detail, setDetail] = useState(null);
+42	  const [activeTab, setActiveTab] = useState('board');
+43	  const [loading, setLoading] = useState(true);
+44	  const [actionLoading, setActionLoading] = useState(null);
+45	  const [confirmClose, setConfirmClose] = useState(false);
+46	  const refreshRef = useRef(null);
+47	
+48	  const load = async () => {
+49	    if (!projectId) return;
+50	    const data = await getProjectFullDetail(projectId);
+51	    if (data) setDetail(data);
+52	    return data;
+53	  };
+54	
+55	  useEffect(() => {
+56	    if (!projectId) return;
+57	    let cancelled = false;
+58	    const doLoad = async () => { const data = await load(); if (!cancelled) setLoading(false); };
+59	    doLoad();
+60	    refreshRef.current = setInterval(load, 5000);
+61	    return () => { cancelled = true; if (refreshRef.current) clearInterval(refreshRef.current); };
+62	  }, [projectId]);
+63	
+64	  const refreshOnce = async () => { return await load(); };
+65	
+66	  const handleAction = async (action, fn) => {
+67	    if (!projectId) return;
+68	    setActionLoading(action);
+69	    await fn();
+70	    await refreshOnce();
+71	    setActionLoading(null);
+72	  };
+73	
+74	  if (loading) {
+75	    return <div className="flex h-full items-center justify-center bg-white"><div className="h-5 w-5 animate-spin rounded-full border-2 border-gray-400 border-t-transparent" /></div>;
+76	  }
+77	
+78	  if (!detail) {
+79	    return (
+80	      <div className="flex h-full flex-col items-center justify-center gap-3 bg-white">
+81	        <p className="text-sm text-gray-500">项目未找到</p>
+82	        <button type="button" onClick={() => navigate('/')} className="text-sm text-gray-500 hover:text-gray-900">返回项目列表</button>
+83	      </div>
+84	    );
+85	  }
+86	
+87	  const { project, tasks, activities, humanActions, workspace, plan, planProgress, projectHealth, dispatchPlan } = detail;
+88	  const showApprove = project.status === 'created' || project.status === 'draft' || project.status === 'planning';
+89	  const showRetryPlan = canRetryPlanForProject(project, plan, tasks);
+90	  const showInterruptedPlanHint = isInterruptedPlanProject(project, plan, tasks);
+91	  const showDispatch = project.status === 'active' && tasks.some(t => t.status === 'pending');
+92	  const showDeliver = project.status === 'active' && tasks.every(t => t.status === 'done' || t.status === 'cancelled');
+93	  const showClose = project.status === 'active' || project.status === 'delivered';
+94	  const statusLabel = STATUS_LABELS[project.status] || project.status;
+95	
+96	  return (
+97	    <div className="flex h-full flex-col overflow-hidden bg-white text-gray-900">
+98	      <div className="flex items-center gap-3 border-b border-gray-200 px-6 py-4">
+99	        <button type="button" onClick={() => navigate('/')} className="rounded-md p-1.5 text-gray-500 hover:bg-gray-100">
+100	          <ArrowLeft size={16} />
+101	        </button>
+102	        <div className="flex-1 min-w-0">
+103	          <div className="flex items-center gap-2">
+104	            <h1 className="text-[14px] font-semibold text-gray-900 truncate">{project.name}</h1>
+105	            <span className="text-[10px] px-1.5 py-0.5 rounded-full border border-gray-300 text-gray-500">{statusLabel}</span>
+106	          </div>
+107	          {project.goal && <p className="text-[12px] text-gray-500 truncate mt-0.5">{project.goal}</p>}
+108	          {project.requirements && <p className="text-[11px] text-gray-500 mt-0.5 line-clamp-1">{project.requirements}</p>}
+109	          {workspace?.path && (
+110	            <div className="flex items-center gap-1.5 mt-0.5">
+111	              <span className="text-[10px] text-gray-500">Workspace:</span>
+112	              <span className="text-[10px] text-gray-500 font-mono truncate max-w-[300px]">{workspace.path}</span>
+113	              {workspace.artifacts?.length > 0 && <span className="text-[9px] px-1 rounded bg-gray-100 text-gray-500">{workspace.artifacts.length} files</span>}
+114	            </div>
+115	          )}
+116	          {showInterruptedPlanHint && (
+117	            <p className="text-[10px] text-yellow-400 mt-1">计划中断，可重新制定计划</p>
+118	          )}
+119	          {!showInterruptedPlanHint && (project.status === 'created' || project.status === 'draft' || project.status === 'planning') && !plan && (
+120	            <p className="text-[10px] text-yellow-400 mt-1">等待 PO 制定计划...</p>
+121	          )}
+122	          {(project.status === 'created' || project.status === 'draft' || project.status === 'planning') && plan && (
+123	            <p className="text-[10px] text-green-400 mt-1">Plan v{plan.version} 已就绪，可审批</p>
+124	          )}
+125	        </div>
+126	        <div className="flex items-center gap-2">
+127	          {showRetryPlan && (
+128	            <button type="button" onClick={() => handleAction('retry', () => retryPlan(projectId))} disabled={actionLoading === 'retry'}
+129	              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-indigo-400 bg-gray-100 hover:brightness-95 disabled:opacity-50">
+130	              <RefreshCw size={13} /><span>{actionLoading === 'retry' ? '...' : '重新制定计划'}</span>
+131	            </button>
+132	          )}
+133	          {showApprove && (
+134	            <button type="button" onClick={() => handleAction('approve', () => approveProject(projectId))} disabled={actionLoading === 'approve'}
+135	              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-green-400 bg-gray-100 hover:brightness-95 disabled:opacity-50">
+136	              <CheckCircle2 size={13} /><span>{actionLoading === 'approve' ? '...' : '审批'}</span>
+137	            </button>
+138	          )}
+139	          {showDispatch && (
+140	            <button type="button" onClick={() => handleAction('dispatch', () => dispatchTasks(projectId, project?.poAgent))} disabled={actionLoading === 'dispatch'}
+141	              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-gray-900 bg-gray-100 hover:brightness-95 disabled:opacity-50">
+142	              <Send size={13} /><span>{actionLoading === 'dispatch' ? '...' : '分发任务'}</span>
+143	            </button>
+144	          )}
+145	          {showDeliver && (
+146	            <button type="button" onClick={() => handleAction('deliver', () => deliverProject(projectId))} disabled={actionLoading === 'deliver'}
+147	              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-green-400 bg-gray-100 hover:brightness-95 disabled:opacity-50">
+148	              <Archive size={13} /><span>{actionLoading === 'deliver' ? '...' : '交付'}</span>
+149	            </button>
+150	          )}
+151	          {showClose && !confirmClose && (
+152	            <button type="button" onClick={() => setConfirmClose(true)}
+153	              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[12px] font-medium text-red-400 bg-gray-100 hover:brightness-95">
+154	              <XCircle size={13} /><span>完成项目</span>
+155	            </button>
+156	          )}
+157	          {confirmClose && (
+158	            <div className="flex items-center gap-1">
+159	              <button type="button" onClick={() => handleAction('close', () => closeProject(projectId))} disabled={actionLoading === 'close'}
+160	                className="rounded-lg px-2.5 py-1 text-[11px] font-medium bg-red-400 text-white">
+161	                {actionLoading === 'close' ? '...' : '确认完成'}
+162	              </button>
+163	              <button type="button" onClick={() => setConfirmClose(false)} className="rounded-lg px-2.5 py-1 text-[11px] font-medium text-gray-500 hover:bg-gray-100">取消</button>
+164	            </div>
+165	          )}
+166	          {!connected && <span className="rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400">离线</span>}
+167	        </div>
+168	      </div>
+169	
+170	      <ProjectHealthBanner health={projectHealth} dispatchPlan={dispatchPlan} />
+171	      <AgentStatusStrip project={project} tasks={tasks} agents={agents} participants={participants} logs={logs} />
+172	
+173	      <div className="flex items-center gap-1 border-b border-gray-200 px-6">
+174	        {TABS.map(tab => {
+175	          const Icon = tab.icon;
+176	          return (
+177	            <button key={tab.id} type="button" onClick={() => setActiveTab(tab.id)}
+178	              className={`flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[12px] font-medium transition-colors ${
+179	                activeTab === tab.id ? 'border-gray-900 text-gray-900' : 'border-transparent text-gray-500 hover:text-gray-500'
+180	              }`}>
+181	              <Icon size={14} /><span>{tab.label}</span>
+182	            </button>
+183	          );
+184	        })}
+185	      </div>
+186	
+187	      <div className="flex-1 overflow-y-auto">
+188	        {activeTab === 'plan' && <PlanView plan={plan} planProgress={planProgress} tasks={tasks} />}
+189	        {activeTab === 'board' && <KanbanBoard project={{ ...project, tasks }} />}
+190	        {activeTab === 'activity' && <ActivityTimeline project={project} activities={activities} humanActions={humanActions} />}
+191	        {activeTab === 'deliverables' && <DeliverableView project={project} tasks={tasks} />}
+192	      </div>
+193	    </div>
+194	  );
+195	}
+196	
+197	const HEALTH_STYLES = {
+198	  blocked: { icon: AlertTriangle, label: '阻塞', cls: 'border-red-200 bg-red-50 text-red-700' },
+199	  waiting: { icon: Clock3, label: '等待', cls: 'border-yellow-200 bg-yellow-50 text-yellow-700' },
+200	  needs_review: { icon: CheckCircle2, label: '待审核', cls: 'border-green-200 bg-green-50 text-green-700' },
+201	  running: { icon: Activity, label: '运行中', cls: 'border-blue-200 bg-blue-50 text-blue-700' },
+202	  dispatchable: { icon: Send, label: '可派发', cls: 'border-indigo-200 bg-indigo-50 text-indigo-700' },
+203	  complete: { icon: CheckCircle2, label: '已完成', cls: 'border-green-200 bg-green-50 text-green-700' },
+204	  idle: { icon: Clock3, label: '空闲', cls: 'border-gray-200 bg-gray-50 text-gray-600' },
+205	};
+206	
+207	function ProjectHealthBanner({ health, dispatchPlan }) {
+...(已截断)

@@ -1,0 +1,200 @@
+100	      for (const run of (saved.workflowRuns || [])) {
+101	        if (run?.id) workflowRuns.set(run.id, run);
+102	      }
+103	      for (const proposal of (saved.workflowProposals || [])) {
+104	        if (proposal?.id) workflowProposals.set(proposal.id, proposal);
+105	      }
+106	      if (!silent) console.log(`[hub] Restored ${saved.projects.length} projects from disk`);
+107	    }
+108	  }
+109	
+110	  function persistState() {
+111	    if (!persistence) return;
+112	    persistence.save(() => ({
+113	      projects: [...projects.values()],
+114	      boards: [...boards.entries()].map(([projectId, board]) => ({
+115	        projectId,
+116	        tasks: board.getAllTasks(),
+117	      })),
+118	      workflowRuns: [...workflowRuns.values()],
+119	      workflowProposals: [...workflowProposals.values()],
+120	      humanActions,
+121	    }));
+122	  }
+123	
+124	  // Human action log — tracks all human decisions
+125	  const humanActions = [];
+126	
+127	  if (persistence) {
+128	    const reconciliation = reconcileRecoveredScriptWorkflowProjectDeliveries();
+129	    if (reconciliation.delivered.length > 0 || reconciliation.blocked.length > 0) {
+130	      persistState();
+131	    }
+132	  }
+133	
+134	  function recordHumanAction(action, data) {
+135	    const entry = { ts: new Date().toISOString(), action, ...data };
+136	    humanActions.push(entry);
+137	    return entry;
+138	  }
+139	
+140	  function prepareTasksForBoard(project, taskList) {
+141	    return expandCompositeTasks(taskList, {
+142	      projectId: project.id,
+143	      members: project.members || [],
+144	      poAgent: project.poAgent,
+145	    });
+146	  }
+147	
+148	  function buildDispatchPlan(projectId) {
+149	    const board = boards.get(projectId);
+150	    if (!board) return null;
+151	    const project = projects.get(projectId);
+152	    return planDispatch({
+153	      projectId,
+154	      tasks: board.getAllTasks(),
+155	      allActiveTasks: getActiveTasksAcrossLiveProjects(),
+156	      agentProfiles: getProjectAgentProfiles(project),
+157	      agentConcurrency: typeof runtimeInstanceAllocator?.getAgentConcurrency === 'function'
+158	        ? runtimeInstanceAllocator.getAgentConcurrency()
+159	        : {},
+160	    });
+161	  }
+162	
+163	  function getProjectAgentProfiles(project) {
+164	    const profiles = listAgentProfiles(typeof getAgentProfiles === 'function' ? getAgentProfiles() : null);
+165	    if (!project) return profiles;
+166	    const allowed = new Set([
+167	      project.poAgent,
+168	      ...(Array.isArray(project.members) ? project.members : []),
+169	    ].map(normalizeAgentId).filter(Boolean));
+170	    if (allowed.size === 0) return profiles;
+171	    return profiles.filter(agent => allowed.has(normalizeAgentId(agent?.id)));
+172	  }
+173	
+174	  function listAgentProfiles(agentProfiles) {
+175	    if (agentProfiles instanceof Map) return [...agentProfiles.values()];
+176	    if (Array.isArray(agentProfiles)) return agentProfiles;
+177	    if (agentProfiles && typeof agentProfiles === 'object') return Object.values(agentProfiles);
+178	    return [];
+179	  }
+180	
+181	  function normalizeAgentId(value) {
+182	    return typeof value === 'string' && value.trim() ? value.trim() : '';
+183	  }
+184	
+185	  function getActiveTasksAcrossLiveProjects() {
+186	    const liveBoards = new Map();
+187	    for (const [projectId, board] of boards.entries()) {
+188	      if (isLiveProject(projects.get(projectId))) liveBoards.set(projectId, board);
+189	    }
+190	    return getActiveTasksAcrossBoards(liveBoards);
+191	  }
+192	
+193	  function isLiveProject(project) {
+194	    return Boolean(project && project.status !== 'closed' && project.status !== 'delivered');
+195	  }
+196	
+197	  function updatePlanItemCompleted(project, task) {
+198	    if (!project?.plan) return;
+199	    for (const phase of project.plan.phases || []) {
+200	      const item = (phase.items || []).find(i => i.id === task.planItemId || i.title === task.title);
+201	      if (item) { item.status = 'completed'; break; }
+202	    }
+203	  }
+204	
+205	  function maybeCompleteCompositeParent(projectId, childTask) {
+206	    if (!childTask?.parentTaskId) return null;
+207	    const board = boards.get(projectId);
+208	    const parent = board?.getTask(childTask.parentTaskId);
+209	    if (!parent?.isCompositeParent || parent.status === 'done') return null;
+210	    const children = (parent.childTaskIds || []).map(id => board.getTask(id)).filter(Boolean);
+211	    if (children.length !== parent.childTaskIds.length || children.some(child => child.status !== 'done')) return null;
+212	    const finalChild = [...children].reverse().find(child => child.compositeRole === 'final') || childTask;
+213	    const result = board.completeCompositeParent(parent.id, finalChild.result || childTask.result || null);
+214	    if (result.ok) {
+215	      const project = projects.get(projectId);
+216	      updatePlanItemCompleted(project, parent);
+217	      eventLog.emit('task.done', {
+218	        projectId,
+219	        taskId: parent.id,
+220	        taskTitle: parent.title,
+221	        confirmedBy: 'composite_children',
+222	      });
+223	    }
+224	    return result;
+225	  }
+226	
+227	  function maybeCompleteRetryParent(projectId, retryTask) {
+228	    if (!retryTask?.parentTaskId) return null;
+229	    const board = boards.get(projectId);
+230	    const parent = board?.getTask(retryTask.parentTaskId);
+231	    if (!parent || parent.isCompositeParent || parent.status === 'done') return null;
+232	    if (retryTask.status !== 'done') return null;
+233	    const result = board.completeRetryParent(parent.id, retryTask.result || null, {
+234	      completedBy: 'retry_child',
+235	      completedByTaskId: retryTask.id,
+236	      recoveredBy: retryTask.completedBy || 'retry_child',
+237	      recoveryReason: 'retry_child_completed',
+238	    });
+239	    if (result.ok && !result.alreadyDone) {
+240	      const project = projects.get(projectId);
+241	      updatePlanItemCompleted(project, parent);
+242	      eventLog.emit('task.done', {
+243	        projectId,
+244	        taskId: parent.id,
+245	        taskTitle: parent.title,
+246	        confirmedBy: 'retry_child',
+247	        retryTaskId: retryTask.id,
+248	      });
+249	    }
+250	    return result;
+251	  }
+252	
+253	  // ─── Project lifecycle ─────────────────────────────────────────────
+254	
+255	  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey }) {
+256	    const createdAt = Date.now();
+257	    const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
+258	    const effectiveName = normalizeProjectNameForDisplay(name);
+259	    const normalizedPoAgent = normalizeAgentId(poAgent);
+260	    const normalizedMembers = normalizeAgentIdList(members).filter(agentId => agentId !== normalizedPoAgent);
+261	    const qualityRuleSet = compileEffectiveQualityRuleSet({
+262	      goal: goal || '',
+263	      requirements: requirements || '',
+264	      overlays: typeof getQualityOverlays === 'function' ? getQualityOverlays() : [],
+265	      now: createdAt,
+266	    });
+267	    const qualityPlanningGuidance = qualityRuleSet.rules.length > 0
+268	      ? buildQualityPromptExcerpt(qualityRuleSet, { role: 'po', budgetChars: 1600 }).text
+269	      : '';
+270	    const effectivePlanningGuidance = appendQualityPlanningGuidance(planningGuidance || '', qualityPlanningGuidance);
+271	    const project = {
+272	      id,
+273	      name: effectiveName,
+274	      goal,
+275	      requirements: requirements || '',
+276	      planningGuidance: planningGuidance || '',
+277	      qualityRuleSet,
+278	      qualityPlanningGuidance,
+279	      agentSelection: normalizeAgentSelection({ poAgent: normalizedPoAgent, members: normalizedMembers, agentSelection }),
+280	      preparation: null,
+281	      poAgent: normalizedPoAgent,
+282	      members: normalizedMembers,
+283	      executionMode: normalizeProjectExecutionMode(executionMode),
+284	      executionModeUpdatedAt: createdAt,
+285	      executionModeUpdatedBy: 'system_default',
+286	      status: 'created',  // created → planning → active → closed
+287	      createdAt,
+288	      closedAt: null,
+289	      closedBy: null,
+290	      deliverable: null,
+291	      plan: null,           // Plan-Do: structured plan set by PO
+292	      planArtifact: null,   // URL to plan markdown artifact
+293	      enableSummary: enableSummary !== false,  // default true, backwards-compatible
+294	      summary: null,        // Project summary section text (set at synthesize)
+295	      summaryScore: null,   // Project score 1-10 (parsed from synthesis)
+296	    };
+297	    if (normalizedClientRequestKey) {
+298	      project.clientRequestKey = normalizedClientRequestKey;
+299	    }

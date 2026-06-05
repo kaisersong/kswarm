@@ -1,0 +1,250 @@
+255	  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey }) {
+256	    const createdAt = Date.now();
+257	    const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
+258	    const effectiveName = normalizeProjectNameForDisplay(name);
+259	    const normalizedPoAgent = normalizeAgentId(poAgent);
+260	    const normalizedMembers = normalizeAgentIdList(members).filter(agentId => agentId !== normalizedPoAgent);
+261	    const qualityRuleSet = compileEffectiveQualityRuleSet({
+262	      goal: goal || '',
+263	      requirements: requirements || '',
+264	      overlays: typeof getQualityOverlays === 'function' ? getQualityOverlays() : [],
+265	      now: createdAt,
+266	    });
+267	    const qualityPlanningGuidance = qualityRuleSet.rules.length > 0
+268	      ? buildQualityPromptExcerpt(qualityRuleSet, { role: 'po', budgetChars: 1600 }).text
+269	      : '';
+270	    const effectivePlanningGuidance = appendQualityPlanningGuidance(planningGuidance || '', qualityPlanningGuidance);
+271	    const project = {
+272	      id,
+273	      name: effectiveName,
+274	      goal,
+275	      requirements: requirements || '',
+276	      planningGuidance: planningGuidance || '',
+277	      qualityRuleSet,
+278	      qualityPlanningGuidance,
+279	      agentSelection: normalizeAgentSelection({ poAgent: normalizedPoAgent, members: normalizedMembers, agentSelection }),
+280	      preparation: null,
+281	      poAgent: normalizedPoAgent,
+282	      members: normalizedMembers,
+283	      executionMode: normalizeProjectExecutionMode(executionMode),
+284	      executionModeUpdatedAt: createdAt,
+285	      executionModeUpdatedBy: 'system_default',
+286	      status: 'created',  // created → planning → active → closed
+287	      createdAt,
+288	      closedAt: null,
+289	      closedBy: null,
+290	      deliverable: null,
+291	      plan: null,           // Plan-Do: structured plan set by PO
+292	      planArtifact: null,   // URL to plan markdown artifact
+293	      enableSummary: enableSummary !== false,  // default true, backwards-compatible
+294	      summary: null,        // Project summary section text (set at synthesize)
+295	      summaryScore: null,   // Project score 1-10 (parsed from synthesis)
+296	    };
+297	    if (normalizedClientRequestKey) {
+298	      project.clientRequestKey = normalizedClientRequestKey;
+299	    }
+300	    projects.set(id, project);
+301	    boards.set(id, createTaskBoard(id));
+302	
+303	    eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: normalizedPoAgent });
+304	    recordHumanAction('create_project', { projectId: id, projectName: effectiveName, poAgent: normalizedPoAgent });
+305	
+306	    if (preparationContext) {
+307	      project.preparation = deriveProjectPreparation({
+308	        ...preparationContext,
+309	        project,
+310	      });
+311	      eventLog.emit('project.preparation_checked', {
+312	        projectId: id,
+313	        state: project.preparation.state,
+314	        blockers: project.preparation.blockers,
+315	      });
+316	    }
+317	
+318	    if (autoAssignPo !== false && (!project.preparation || project.preparation.state === 'ready')) {
+319	      sendAssignPo(project, effectivePlanningGuidance);
+320	    }
+321	    return project;
+322	  }
+323	
+324	  function findReusableProjectForCreateRequest({ clientRequestKey } = {}) {
+325	    const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
+326	    if (normalizedClientRequestKey) {
+327	      const exact = [...projects.values()]
+328	        .find(project => normalizeProjectCreateClientRequestKey(project.clientRequestKey) === normalizedClientRequestKey);
+329	      if (exact) return exact;
+330	    }
+331	    return null;
+332	  }
+333	
+334	  function normalizeProjectNameForDisplay(value) {
+335	    if (typeof value !== 'string') return '未命名项目';
+336	    return value.trim().replace(/\s+/g, ' ') || '未命名项目';
+337	  }
+338	
+339	  function normalizeProjectCreateClientRequestKey(value) {
+340	    if (typeof value !== 'string') return '';
+341	    return value.trim().replace(/\s+/g, ' ').slice(0, 240);
+342	  }
+343	
+344	  function normalizeAgentIdList(values = []) {
+345	    const result = [];
+346	    for (const value of Array.isArray(values) ? values : []) {
+347	      const agentId = normalizeAgentId(value);
+348	      if (agentId && !result.includes(agentId)) result.push(agentId);
+349	    }
+350	    return result;
+351	  }
+352	
+353	  function normalizeSelectionMember(member, index, members, fallbackSource) {
+354	    const record = member && typeof member === 'object' && !Array.isArray(member) ? member : null;
+355	    const agentId = record
+356	      ? (normalizeAgentId(record.agentId) || normalizeAgentId(record.id) || normalizeAgentId(members[index]))
+357	      : (normalizeAgentId(member) || normalizeAgentId(members[index]));
+358	    if (!agentId) return null;
+359	    return {
+360	      agentId,
+361	      source: record?.source || fallbackSource,
+362	    };
+363	  }
+364	
+365	  function normalizeAgentSelection({ poAgent, members = [], agentSelection = null } = {}) {
+366	    return {
+367	      ...(agentSelection && typeof agentSelection === 'object' ? agentSelection : {}),
+368	      poAgent: {
+369	        agentId: normalizeAgentId(agentSelection?.poAgent?.agentId) || normalizeAgentId(poAgent),
+370	        source: agentSelection?.poAgent?.source || 'system_migration',
+371	      },
+372	      members: Array.isArray(agentSelection?.members)
+373	        ? agentSelection.members
+374	          .map((member, index) => normalizeSelectionMember(member, index, members, 'system_migration'))
+375	          .filter(Boolean)
+376	        : normalizeAgentIdList(members).map(agentId => ({
+377	            agentId,
+378	            source: 'system_migration',
+379	      })),
+380	    };
+381	  }
+382	
+383	  function normalizeRecoveredProject(project) {
+384	    const normalized = {
+385	      ...project,
+386	      executionMode: normalizeProjectExecutionMode(project?.executionMode),
+387	    };
+388	    reconcileProjectAgentSelectionWithEffectiveAgents(normalized);
+389	    normalized.preparation = normalizeRecoveredProjectPreparation(normalized, normalized.preparation);
+390	    return normalized;
+391	  }
+392	
+393	  function normalizeRecoveredProjectPreparation(project, preparation) {
+394	    if (!preparation || typeof preparation !== 'object') return preparation || null;
+395	    const selectedAgentIds = new Set([
+396	      normalizeAgentId(project?.poAgent),
+397	      ...normalizeAgentIdList(project?.members || []),
+398	    ].filter(Boolean));
+399	    const keepSelectedRecord = record => {
+400	      const agentId = normalizeAgentId(record?.agentId || record?.participantId);
+401	      return agentId && selectedAgentIds.has(agentId);
+402	    };
+403	    const checks = (Array.isArray(preparation.checks) ? preparation.checks : [])
+404	      .filter(keepSelectedRecord);
+405	    const blockers = (Array.isArray(preparation.blockers) ? preparation.blockers : [])
+406	      .filter(keepSelectedRecord);
+407	    if (checks.length === 0 && blockers.length === 0) return null;
+408	    return {
+409	      ...preparation,
+410	      checks,
+411	      blockers,
+412	      state: blockers.length > 0 ? 'blocked' : 'ready',
+413	    };
+414	  }
+415	
+416	  function updateProjectExecutionMode(projectId, executionMode, { updatedBy = 'human', now = Date.now() } = {}) {
+417	    const project = projects.get(projectId);
+418	    if (!project) return { ok: false, error: 'project_not_found' };
+419	    if (!isValidProjectExecutionMode(executionMode)) return { ok: false, error: 'invalid_execution_mode' };
+420	    const normalized = normalizeProjectExecutionMode(executionMode);
+421	    project.executionMode = normalized;
+422	    project.executionModeUpdatedAt = now;
+423	    project.executionModeUpdatedBy = updatedBy;
+424	    project.updatedAt = now;
+425	    eventLog.emit('project.execution_mode.updated', {
+426	      projectId,
+427	      executionMode: normalized,
+428	      updatedBy,
+429	    });
+430	    recordHumanAction('update_project_execution_mode', { projectId, executionMode: normalized, updatedBy });
+431	    return { ok: true, project };
+432	  }
+433	
+434	  function selectionForTask(project, task) {
+435	    const assignedAgent = normalizeAgentId(task?.assignedAgent);
+436	    if (!project?.agentSelection || !assignedAgent) return { agentId: assignedAgent, source: 'system_migration' };
+437	    if (normalizeAgentId(project.agentSelection.poAgent?.agentId) === assignedAgent) {
+438	      return { agentId: assignedAgent, source: project.agentSelection.poAgent?.source || 'system_migration' };
+439	    }
+440	    const member = (Array.isArray(project.agentSelection.members) ? project.agentSelection.members : [])
+441	      .find(item => normalizeAgentId(item?.agentId || item?.id || item) === assignedAgent);
+442	    return {
+443	      agentId: assignedAgent,
+444	      source: member?.source || 'system_migration',
+445	    };
+446	  }
+447	
+448	  function sendAssignPo(project, effectivePlanningGuidance) {
+449	    if (bridge) {
+450	      bridge.send({
+451	        type: 'intent', kind: 'assign_po',
+452	        projectId: project.id, toParticipantId: project.poAgent,
+453	        payload: {
+454	          name: project.name,
+455	          goal: project.goal,
+456	          requirements: project.requirements || '',
+457	          planningGuidance: effectivePlanningGuidance ?? appendQualityPlanningGuidance(project.planningGuidance || '', project.qualityPlanningGuidance || ''),
+458	        },
+459	      });
+460	    }
+461	
+462	    eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
+463	  }
+464	
+465	  // ─── Human actions ─────────────────────────────────────────────────
+466	
+467	  /**
+468	   * Human 审批计划 → project becomes active
+469	   */
+470	  function handleApprove(projectId) {
+471	    const project = projects.get(projectId);
+472	    if (!project) return { ok: false, error: 'project_not_found' };
+473	
+474	    // Idempotency: already active → no-op success (don't re-trigger events)
+475	    if (project.status === 'active') {
+476	      return { ok: true, alreadyActive: true };
+477	    }
+478	
+479	    // Guard: plan or tasks must exist before approval
+480	    const board = boards.get(projectId);
+481	    if (!project.plan && board && board.getAllTasks().length === 0) {
+482	      return { ok: false, error: 'no_plan_or_tasks' };
+483	    }
+484	
+485	    project.status = 'active';
+486	    eventLog.emit('project.approved', { projectId });
+487	    recordHumanAction('approve_plan', { projectId, projectName: project.name });
+488	
+489	    if (bridge) {
+490	      bridge.send({
+491	        type: 'intent', kind: 'plan_approved',
+492	        projectId, toParticipantId: project.poAgent,
+493	        payload: {},
+494	      });
+495	    }
+496	    return { ok: true };
+497	  }
+498	
+499	  /**
+500	   * 重新触发 PO 制定计划 — 用于计划卡住或失败后重试
+501	   */
+502	  function handleRetryPlan(projectId) {
+503	    const project = projects.get(projectId);
+504	    if (!project) return { ok: false, error: 'project_not_found' };

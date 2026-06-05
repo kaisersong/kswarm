@@ -6,6 +6,7 @@ export function createBrokerTaskRequest({
   workspace,
   task,
   targetAgent,
+  targetParticipantId,
 } = {}) {
   if (!handoffRoot) return { ok: false, error: 'handoff_root_required' };
   if (!project?.id) return { ok: false, error: 'project_required' };
@@ -43,6 +44,7 @@ export function createBrokerTaskRequest({
         workFolder: workspace?.path || project.workFolder || '',
         handoffPath: handoff.handoffPath,
         handoffKind: 'kswarm_task_handoff_v1',
+        ...(targetParticipantId && targetParticipantId !== targetAgent ? { targetAgentId: targetAgent } : {}),
       },
     },
   };

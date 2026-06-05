@@ -24,6 +24,10 @@ export function deriveProjectIntervention({
   // Failed/blocked tasks still need an intervention candidate.
   const QUIET_TERMINAL_STATUSES = new Set(['done', 'cancelled']);
   if (normalizedTasks.length > 0 && normalizedTasks.every(t => QUIET_TERMINAL_STATUSES.has(t.status))) {
+    const hasDeliverableWork = normalizedTasks.some(t => t.status === 'done');
+    if (hasDeliverableWork) {
+      return buildReadyToDeliverIntervention({ project, secondaryAction });
+    }
     return noIntervention({ project, secondaryAction, reason: 'all_tasks_terminal' });
   }
 
@@ -82,6 +86,28 @@ function noIntervention({ project, secondaryAction, reason }) {
     downstreamBlockedCount: 0,
     primaryFailure: null,
     primaryAction: null,
+    secondaryAction,
+  };
+}
+
+function buildReadyToDeliverIntervention({ project, secondaryAction }) {
+  return {
+    required: true,
+    severity: 'action_required',
+    projectId: project?.id || null,
+    reason: 'ready_to_deliver',
+    primaryTaskId: null,
+    primaryTaskTitle: null,
+    lastEventAt: null,
+    downstreamBlockedCount: 0,
+    primaryFailure: null,
+    headline: '可以交付',
+    message: '全部任务已完成，请确认交付以生成交付物。',
+    primaryAction: {
+      id: 'confirm_delivery',
+      label: '确认交付',
+      strategy: 'confirm_delivery',
+    },
     secondaryAction,
   };
 }

@@ -43,6 +43,60 @@ test('hub rejects markdown-only submission for an explicit pptx task before PO r
   assert.equal(board.getTask('deck').rejectedSubmissions.length, 1);
 });
 
+function setupDeliverableProject() {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-d', name: 'Deliver', goal: 'goal', poAgent: 'po', members: ['worker'] });
+  hub.handleCreateTasks('proj-d', [{ id: 'item-1', title: 'Work', assignedAgent: 'worker' }], 'po');
+  hub.handleApprove('proj-d');
+  const board = hub.getBoard('proj-d');
+  return { hub, board };
+}
+
+function driveTaskToDone(hub, board) {
+  hub.handleRequestDispatch('proj-d', 'po');
+  const task = board.getTask('item-1');
+  const runId = task.activeRunId;
+  hub.handleAcceptTask('proj-d', 'item-1', 'worker', runId);
+  hub.handleProgress('proj-d', 'item-1', 'started', 'worker', runId);
+  board.transition('item-1', 'submitted', { result: { summary: 'done' }, runId });
+  board.transition('item-1', 'done');
+}
+
+test('handleDeliver refuses when validateDelivery fails and keeps project active', () => {
+  const { hub, board } = setupDeliverableProject();
+  driveTaskToDone(hub, board);
+
+  const result = hub.handleDeliver('proj-d', { summary: 's' }, 'po', {
+    validateDelivery: () => ({ ok: false, error: 'delivery_empty' }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'delivery_empty');
+  assert.equal(hub.getProject('proj-d').status, 'active');
+});
+
+test('handleDeliver is idempotent and does not re-stamp deliveredAt', () => {
+  const { hub, board } = setupDeliverableProject();
+  driveTaskToDone(hub, board);
+
+  const first = hub.handleDeliver('proj-d', { summary: 's' }, 'po', { validateDelivery: () => ({ ok: true }) });
+  assert.equal(first.ok, true);
+  const deliveredAt = hub.getProject('proj-d').deliveredAt;
+  assert.equal(typeof deliveredAt, 'number');
+
+  const second = hub.handleDeliver('proj-d', { summary: 's2' }, 'po');
+  assert.equal(second.ok, true);
+  assert.equal(second.alreadyDelivered, true);
+  assert.equal(hub.getProject('proj-d').deliveredAt, deliveredAt);
+});
+
+test('handleDeliver is gated by tasks_not_all_done', () => {
+  const { hub } = setupDeliverableProject();
+  const result = hub.handleDeliver('proj-d', { summary: 's' }, 'po');
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'tasks_not_all_done');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

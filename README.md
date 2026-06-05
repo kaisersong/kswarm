@@ -240,6 +240,8 @@ npm run test:e2e-p0   # P0 integration scenarios
 
 ## Version History
 
+**v0.9.0** — Parallel dispatch and interruption recovery: desktop worker concurrency unlocked from 1 to configurable max (default 3, range 1-10 via `KSWARM_MAX_WORKER_INSTANCES` env or desktop config); `suspendedAt` task marker for graceful sleep/shutdown with automatic lease-refresh resume; `defer_recovery` action with 20s grace period for agents not yet online; `systemSuspended` flag suppresses watchdog and recovery during host sleep; atomic state persistence via temp-file-and-rename; stalled-run watchdog defaults bumped to 5-minute heartbeat timeout and 20-minute max run time; `/runtime/suspend` and `/runtime/resume` endpoints for Electron powerMonitor integration; SIGTERM graceful shutdown marks active tasks suspended before exit.
+
 **v0.8.0** — Swarm execution boundary and evidence release: Xiaok Desktop seed agents are routed to the full Desktop agent runtime instead of local auto-worker execution; task handoff packages move large context and artifact contracts into files; source/evidence contracts calibrate recent and monthly research review; artifact-first completion prevents empty summary-only results; final deliverables use formal filenames and delivery aliases; failed/blocked historical retry children no longer hold project delivery hostage.
 
 **v0.7.0** — Reliable execution hardening: runtime probes and health cooldowns, capability-aware dispatch/retry routing, stalled-run watchdogs with heartbeat/stdout/stderr telemetry, strict deliverable contracts for PPTX/HTML/Markdown tasks, deterministic local executor fallback for explicit PPTX presentation tasks, restart recovery for active runs, and retryable planning when the PO planning phase is interrupted.

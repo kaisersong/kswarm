@@ -77,6 +77,25 @@ test('progress telemetry is stored on active task run', () => {
   assert.equal(board.getTask('item-1').runTelemetry.lastStdoutAt, 1779050000000);
 });
 
+test('progress heartbeat slides the run lease expiry forward (sliding renewal)', () => {
+  const board = setupBoard();
+  board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-lease-1', leaseTimeoutMs: 120_000 });
+  board.transition('item-1', 'accepted', { assignedAgent: 'worker', leaseTimeoutMs: 120_000 });
+  board.transition('item-1', 'in_progress', { leaseTimeoutMs: 120_000 });
+
+  const before = board.getTask('item-1').runLease.leaseExpiresAt;
+  assert.equal(typeof before, 'number');
+
+  const heartbeatAt = Date.now() + 60_000;
+  const result = board.updateRunTelemetry('item-1', { lastHeartbeatAt: heartbeatAt });
+  assert.equal(result.ok, true);
+
+  const after = board.getTask('item-1').runLease.leaseExpiresAt;
+  assert.equal(board.getTask('item-1').runLease.lastHeartbeatAt, heartbeatAt);
+  assert.ok(after > before, `expected lease to slide forward (before=${before}, after=${after})`);
+  assert.equal(after, heartbeatAt + 120_000);
+});
+
 test('submit moves the active lease to lastRunLease and rejects stale later submits', () => {
   const board = setupBoard();
   board.transition('item-1', 'dispatched', { assignedAgent: 'worker', runId: 'run-lease-1' });

@@ -13,6 +13,7 @@ const desktopPo = {
   roles: ['project_owner'],
   runtimeType: 'xiaok',
   runtimeSource: 'desktop-agent-runtime',
+  execution: { mode: 'hosted', hostParticipantId: 'xiaok-desktop' },
   runtimeHealth: {
     state: 'healthy',
     taskCapabilities: ['planning', 'research'],
@@ -25,6 +26,7 @@ const desktopWorker = {
   roles: ['worker'],
   runtimeType: 'xiaok',
   runtimeSource: 'desktop-agent-runtime',
+  execution: { mode: 'hosted', hostParticipantId: 'xiaok-desktop' },
   runtimeHealth: {
     state: 'healthy',
     taskCapabilities: ['research', 'analysis'],
@@ -35,12 +37,13 @@ const desktopWorker = {
 {
   const readiness = classifyAgentReadiness(desktopPo, {
     role: 'project_owner',
-    participants: [{ participantId: 'xiaok-po', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-po': { ok: true, checkedAt: now } },
     now,
   });
   assert.equal(readiness.ready, true);
   assert.equal(readiness.reason, null);
+  assert.equal(readiness.participantId, 'xiaok-desktop');
 }
 
 {
@@ -65,7 +68,7 @@ const desktopWorker = {
   }, {
     role: 'worker',
     requiredOutputs: [{ type: 'markdown', enforcement: 'hard' }],
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
     now,
   });
@@ -84,7 +87,7 @@ const desktopWorker = {
   }, {
     role: 'worker',
     requiredOutputs: [{ type: 'markdown', enforcement: 'hard' }],
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
     now,
   });
@@ -96,7 +99,7 @@ const desktopWorker = {
   const readiness = classifyAgentReadiness(desktopWorker, {
     role: 'worker',
     requiredOutputs: [{ type: 'html_report', enforcement: 'hard' }],
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
     now,
   });
@@ -107,7 +110,7 @@ const desktopWorker = {
 {
   const readiness = classifyAgentReadiness(desktopWorker, {
     role: 'worker',
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: false, reason: 'model_config_missing', checkedAt: now } },
     now,
   });
@@ -118,7 +121,7 @@ const desktopWorker = {
 {
   const readiness = classifyAgentReadiness(desktopPo, {
     role: 'project_owner',
-    participants: [{ participantId: 'xiaok-po', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-po': { ok: false, reason: 'readiness_probe_timeout', checkedAt: now } },
     now,
   });
@@ -130,7 +133,7 @@ const desktopWorker = {
 {
   const readiness = classifyAgentReadiness(desktopWorker, {
     role: 'worker',
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: false, reason: 'readiness_probe_timeout', checkedAt: now } },
     now,
   });
@@ -152,8 +155,7 @@ const desktopWorker = {
     project,
     agents: [desktopPo, desktopWorker],
     participants: [
-      { participantId: 'xiaok-po', lastSeenAt: now },
-      { participantId: 'xiaok-worker', lastSeenAt: now },
+      { participantId: 'xiaok-desktop', lastSeenAt: now },
     ],
     probeResults: {
       'xiaok-po': { ok: true, checkedAt: now },
@@ -182,7 +184,7 @@ const desktopWorker = {
   const prep = deriveProjectPreparation({
     project,
     agents: [desktopWorker],
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
     now,
   });
@@ -224,8 +226,7 @@ const desktopWorker = {
     project,
     agents: [desktopPo, cooldownWorker('cli-xiaok'), cooldownWorker('xiaok'), desktopWorker],
     participants: [
-      { participantId: 'xiaok-po', lastSeenAt: now },
-      { participantId: 'xiaok-worker', lastSeenAt: now },
+      { participantId: 'xiaok-desktop', lastSeenAt: now },
     ],
     probeResults: {
       'xiaok-po': { ok: true, checkedAt: now },
@@ -239,8 +240,7 @@ const desktopWorker = {
     preparation: prep,
     agents: [desktopPo, cooldownWorker('cli-xiaok'), cooldownWorker('xiaok'), desktopWorker],
     participants: [
-      { participantId: 'xiaok-po', lastSeenAt: now },
-      { participantId: 'xiaok-worker', lastSeenAt: now },
+      { participantId: 'xiaok-desktop', lastSeenAt: now },
     ],
     probeResults: {
       'xiaok-po': { ok: true, checkedAt: now },
@@ -268,8 +268,7 @@ const desktopWorker = {
     project,
     agents: [desktopPo, { id: 'cli-qoder', roles: ['worker'], runtimeHealth: { state: 'cooldown' } }, desktopWorker],
     participants: [
-      { participantId: 'xiaok-po', lastSeenAt: now },
-      { participantId: 'xiaok-worker', lastSeenAt: now },
+      { participantId: 'xiaok-desktop', lastSeenAt: now },
     ],
     probeResults: {
       'xiaok-po': { ok: true, checkedAt: now },
@@ -282,7 +281,7 @@ const desktopWorker = {
     project,
     preparation: prep,
     agents: [desktopPo, desktopWorker],
-    participants: [{ participantId: 'xiaok-worker', lastSeenAt: now }],
+    participants: [{ participantId: 'xiaok-desktop', lastSeenAt: now }],
     probeResults: { 'xiaok-worker': { ok: true, checkedAt: now } },
     now,
   }), null);

@@ -4,14 +4,18 @@ export function planStalledRunActions({
   projectId,
   tasks = [],
   now = Date.now(),
-  heartbeatTimeoutMs = 120_000,
+  heartbeatTimeoutMs = 300_000,
   noOutputWarningMs = 180_000,
-  maxRunMs = 900_000,
+  maxRunMs = 1_200_000,
+  systemSuspended = false,
 } = {}) {
   const actions = [];
 
+  if (systemSuspended) return actions;
+
   for (const task of tasks) {
     if (!ACTIVE_STATUSES.has(task.status)) continue;
+    if (task.suspendedAt) continue;
     if (isWorkflowOwnedTask(task)) continue;
     const runId = task.activeRunId || task.runLease?.runId;
     if (!runId) continue;

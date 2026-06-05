@@ -9,7 +9,7 @@ import { getEffectiveAgentConcurrency } from '../src/core/effective-agent-concur
     ],
   });
 
-  assert.deepEqual(concurrency, { 'xiaok-worker': 1 });
+  assert.deepEqual(concurrency, { 'xiaok-worker': 3 });
 }
 
 {

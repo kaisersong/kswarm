@@ -99,6 +99,87 @@ test('resume_task action re-sends the current task request without mutating task
   assert.equal(board.getTask('item-1').status, 'in_progress');
 });
 
+test('resume_task refreshes the lease and clears any suspend marker', async () => {
+  const { hub, board } = setupHub();
+  const task = board.getTask('item-1');
+  task.suspendedAt = 1_000;
+  task.runLease.lastHeartbeatAt = 1_000;
+  task.runLease.leaseExpiresAt = 2_000;
+
+  const result = await executeRecoveryAction({
+    type: 'resume_task',
+    projectId: 'proj-exec',
+    taskId: 'proj-exec__item-1',
+    runId: 'run-exec-1',
+    agentId: 'worker',
+    reason: 'resume_after_suspend',
+  }, {
+    hub,
+    sendReviewSubmission: async () => {},
+    sendRequestTask: async () => {},
+  });
+
+  assert.equal(result.ok, true);
+  const refreshed = board.getTask('item-1');
+  assert.equal(refreshed.status, 'in_progress');
+  assert.equal(refreshed.suspendedAt, undefined);
+  assert.ok(refreshed.runLease.lastHeartbeatAt > 1_000);
+  assert.ok(refreshed.runLease.leaseExpiresAt > 2_000);
+});
+
+test('defer_recovery action defers without mutating task state or re-sending the task', async () => {
+  const { hub, board } = setupHub();
+  const requests = [];
+  const result = await executeRecoveryAction({
+    type: 'defer_recovery',
+    projectId: 'proj-exec',
+    taskId: 'proj-exec__item-1',
+    runId: 'run-exec-1',
+    agentId: 'worker',
+    reason: 'agent_not_yet_online',
+  }, {
+    hub,
+    sendReviewSubmission: async () => {},
+    sendRequestTask: async (projectId, taskId) => requests.push({ projectId, taskId }),
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.deferred, true);
+  assert.deepEqual(requests, []);
+  assert.equal(board.getTask('item-1').status, 'in_progress');
+});
+
+test('notify_po_review without a review sender is not reported as success', async () => {
+  const { hub } = setupHub();
+  const result = await executeRecoveryAction({
+    type: 'notify_po_review',
+    projectId: 'proj-exec',
+    taskId: 'proj-exec__item-1',
+    agentId: 'worker',
+    result: { summary: 'done' },
+  }, { hub });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'review_delivery_unavailable');
+});
+
+test('recover_submission without a review sender does not report success', async () => {
+  const { hub, board } = setupHub();
+  const result = await executeRecoveryAction({
+    type: 'recover_submission',
+    projectId: 'proj-exec',
+    taskId: 'proj-exec__item-1',
+    runId: 'run-exec-1',
+    agentId: 'worker',
+    reason: 'journal_artifact_written',
+    artifacts: [{ filename: 'result.md', mimeType: 'text/markdown' }],
+  }, { hub });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'review_delivery_unavailable');
+  assert.equal(board.getTask('item-1').status, 'submitted');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

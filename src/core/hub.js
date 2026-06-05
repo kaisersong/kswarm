@@ -52,6 +52,10 @@ import {
   createProjectDiagnoseWorkflowSpec,
 } from './workflow-builtins.js';
 import {
+  hashWorkflowScript as hashWorkflowScriptSource,
+  normalizeWorkflowScript as normalizeWorkflowScriptSource,
+} from './workflow-script-source.js';
+import {
   sanitizeWorkflowGateDecision,
   sanitizeWorkflowNodeOutput,
   validateWorkflowSpec,
@@ -1222,14 +1226,27 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
    * PO 提交项目交付物（但不关闭项目！只有 Human 能关闭）
    * 前置条件：所有任务必须已完成
    */
-  function handleDeliver(projectId, deliverable, fromAgent) {
+  function handleDeliver(projectId, deliverable, fromAgent, options = {}) {
     const project = projects.get(projectId);
     if (!project || project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
+
+    // Idempotent: a delivered project is not re-delivered.
+    if (project.status === 'delivered') {
+      return { ok: true, alreadyDelivered: true, deliveredAt: project.deliveredAt };
+    }
 
     // Gate: all tasks must be done
     const board = boards.get(projectId);
     if (board && !board.isAllDone()) {
       return { ok: false, error: 'tasks_not_all_done' };
+    }
+
+    // Gate: delivery package must be valid before we mark the project delivered.
+    if (typeof options.validateDelivery === 'function') {
+      const validation = options.validateDelivery();
+      if (!validation || validation.ok === false) {
+        return { ok: false, error: validation?.error || 'delivery_package_invalid' };
+      }
     }
 
     project.deliverable = deliverable;
@@ -1511,6 +1528,50 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return result;
   }
 
+  function handleResumeTaskForRecovery(projectId, taskId, { leaseTimeoutMs = 600_000 } = {}) {
+    const board = boards.get(projectId);
+    if (!board) return { ok: false, error: 'project_not_found' };
+    const task = board.getTask(taskId);
+    if (!task) return { ok: false, error: 'task_not_found' };
+    const result = board.refreshLeaseForResume(task.id, { leaseTimeoutMs });
+    if (result.ok) {
+      eventLog.emit('task.recovery_resumed', {
+        projectId,
+        taskId: task.id,
+        taskTitle: task.title,
+      });
+    }
+    return result;
+  }
+
+  function handleSuspendActiveRuns(now = Date.now()) {
+    let suspended = 0;
+    for (const [projectId, board] of boards) {
+      const project = projects.get(projectId);
+      if (project && project.status !== 'active') continue;
+      for (const task of board.getAllTasks()) {
+        if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) continue;
+        const result = board.markRunSuspended(task.id, now);
+        if (result.ok) suspended++;
+      }
+    }
+    persistState();
+    return { ok: true, suspended };
+  }
+
+  function handleResumeSuspendedRuns({ sleptMs = 0, leaseTimeoutMs = 600_000 } = {}) {
+    let resumed = 0;
+    for (const board of boards.values()) {
+      for (const task of board.getAllTasks()) {
+        if (!task.suspendedAt) continue;
+        const result = board.refreshLeaseForResume(task.id, { leaseTimeoutMs });
+        if (result.ok) resumed++;
+      }
+    }
+    persistState();
+    return { ok: true, resumed, sleptMs };
+  }
+
   // ─── Plan-Do methods ────────────────────────────────────────────────
 
   /**
@@ -1738,12 +1799,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const board = boards.get(projectId);
     if (!project || !board) return null;
     const dispatchPlan = buildDispatchPlan(projectId);
-    return deriveProjectIntervention({
+    const taskIntervention = deriveProjectIntervention({
       project,
       tasks: board.getAllTasks(),
       agents: getProjectAgentProfiles(project),
       dispatchPlan,
     });
+    // Task-board intervention always takes priority. Only when there is no
+    // actionable task intervention do we fall back to a resumable dynamic
+    // (script_generated) workflow so the conversational "让小K帮忙" entry can
+    // drive its recovery.
+    if (taskIntervention && taskIntervention.required) return taskIntervention;
+    const scriptIntervention = deriveScriptWorkflowIntervention(projectId);
+    if (scriptIntervention) return scriptIntervention;
+    return taskIntervention;
   }
   function createWorkflowProposal(projectId, workflowId, { requestedBy = 'human', policy = null, taskId = null, now = Date.now() } = {}) {
     const project = projects.get(projectId);
@@ -1861,7 +1930,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowProposal: cancelled };
   }
 
-  function createScriptWorkflowProposal(projectId, preview, { requestedBy = 'human', now = Date.now() } = {}) {
+  function createScriptWorkflowProposal(projectId, preview, { requestedBy = 'human', now = Date.now(), scriptSource = null } = {}) {
     const project = projects.get(projectId);
     const board = boards.get(projectId);
     if (!project || !board) return { ok: false, error: 'project_not_found' };
@@ -1869,6 +1938,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const validation = validateScriptWorkflowPreview(projectId, preview);
     if (!validation.ok) return validation;
     const normalized = validation.preview;
+
+    let persistedScriptSource = null;
+    if (scriptSource != null) {
+      const sourceValidation = validateScriptSource(scriptSource, normalized.scriptHash);
+      if (!sourceValidation.ok) return sourceValidation;
+      persistedScriptSource = sourceValidation.scriptSource;
+    }
 
     const workflowProposal = {
       id: `wfp-${projectId}-${normalized.workflowId}-${now}`,
@@ -1886,6 +1962,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       createdAt: now,
       updatedAt: now,
       scriptHash: normalized.scriptHash,
+      scriptSource: persistedScriptSource,
       scriptPreview: normalized,
       scriptMeta: normalized.meta,
       scriptAnalysis: normalized.analysis,
@@ -2122,6 +2199,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       ...workflowRun,
       workflowProposalId: approvedProposal.id,
       scriptHash: approvedProposal.scriptHash,
+      scriptSource: approvedProposal.scriptSource ?? null,
       scriptPreview: approvedProposal.scriptPreview,
       scriptMeta: approvedProposal.scriptMeta,
       scriptAnalysis: approvedProposal.scriptAnalysis,
@@ -2689,11 +2767,73 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true, workflowRun: cancelled, taskReset };
   }
 
+  function isScriptWorkflowRunResumable(workflowRun) {
+    if (!workflowRun || workflowRun.source !== 'script_generated') return false;
+    if (workflowRun.status === 'running') return true;
+    if (workflowRun.status !== 'blocked') return false;
+    return workflowRun.recovery?.nextAction === 'resume_workflow';
+  }
+
+  function listResumableScriptWorkflowRuns(projectId = null) {
+    return [...workflowRuns.values()]
+      .filter(run => isScriptWorkflowRunResumable(run))
+      .filter(run => (projectId ? run.projectId === projectId : true))
+      .filter(run => typeof run.scriptSource === 'string' && run.scriptSource.length > 0)
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .map(run => ({
+        projectId: run.projectId,
+        workflowRunId: run.id,
+        workflowId: run.workflowId,
+        scriptHash: run.scriptHash || null,
+        status: run.status,
+        scriptSource: run.scriptSource,
+        createdAt: run.createdAt || 0,
+      }));
+  }
+
+  function deriveScriptWorkflowIntervention(projectId) {
+    const resumable = listResumableScriptWorkflowRuns(projectId);
+    const candidate = resumable[0];
+    if (!candidate) return null;
+    return {
+      required: true,
+      severity: 'action_required',
+      kind: 'script_workflow',
+      projectId,
+      workflowRunId: candidate.workflowRunId,
+      workflowId: candidate.workflowId,
+      scriptHash: candidate.scriptHash,
+      primaryAction: {
+        id: 'resume_dynamic_workflow',
+        strategy: 'resume_workflow',
+        toolName: 'run_dynamic_workflow_script',
+        params: { projectId, resumeWorkflowRunId: candidate.workflowRunId },
+      },
+    };
+  }
+
   function recoverInterruptedTaskWorkflows({ reason = 'workflow_runtime_interrupted', now = Date.now() } = {}) {
     const recovered = [];
     const skipped = [];
+    const resumableScriptRuns = [];
     for (const workflowRun of workflowRuns.values()) {
-      if (!workflowRun || workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) continue;
+      if (!workflowRun) continue;
+      // Dynamic (script_generated) runs have no task lease; never cancel them.
+      // Collect resumable ones so the desktop runtime can rebuild their jobs.
+      if (workflowRun.source === 'script_generated') {
+        if (isScriptWorkflowRunResumable(workflowRun)) {
+          resumableScriptRuns.push({
+            projectId: workflowRun.projectId,
+            workflowRunId: workflowRun.id,
+            workflowId: workflowRun.workflowId,
+            scriptHash: workflowRun.scriptHash || null,
+            status: workflowRun.status,
+            hasScriptSource: typeof workflowRun.scriptSource === 'string' && workflowRun.scriptSource.length > 0,
+          });
+        }
+        continue;
+      }
+      if (workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) continue;
       if (workflowRun.status !== 'running') continue;
       const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
       const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
@@ -2720,7 +2860,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         });
       }
     }
-    return { ok: true, recovered, skipped };
+    return { ok: true, recovered, skipped, resumableScriptRuns };
   }
 
   function maybeReleaseCancelledTaskWorkflow(workflowRun, { reason = 'workflow_cancelled' } = {}) {
@@ -2881,6 +3021,27 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       },
       updatedAt: now,
     };
+  }
+  const MAX_SCRIPT_SOURCE_BYTES = 20_000;
+  function validateScriptSource(scriptSource, expectedHash) {
+    if (typeof scriptSource !== 'string' || !scriptSource.trim()) {
+      return { ok: false, error: 'workflow_script_source_required' };
+    }
+    let normalized;
+    try {
+      normalized = normalizeWorkflowScriptSource(scriptSource);
+    } catch (error) {
+      return { ok: false, error: error?.code || 'workflow_script_source_invalid' };
+    }
+    const byteLength = Buffer.byteLength(normalized, 'utf8');
+    if (byteLength > MAX_SCRIPT_SOURCE_BYTES) {
+      return { ok: false, error: 'workflow_script_source_size_exceeded', limit: MAX_SCRIPT_SOURCE_BYTES, actual: byteLength };
+    }
+    const actualHash = hashWorkflowScriptSource(normalized);
+    if (expectedHash && actualHash !== expectedHash) {
+      return { ok: false, error: 'workflow_script_source_hash_mismatch', expected: expectedHash, actual: actualHash };
+    }
+    return { ok: true, scriptSource: normalized, scriptHash: actualHash };
   }
   function validateScriptWorkflowPreview(projectId, preview) {
     if (!preview || typeof preview !== 'object' || Array.isArray(preview)) return { ok: false, error: 'workflow_script_preview_required' };
@@ -3818,6 +3979,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleSubmitResult,
     handleRecoverSubmission,
     handleResetTaskForRecovery,
+    handleResumeTaskForRecovery,
+    handleSuspendActiveRuns,
+    handleResumeSuspendedRuns,
     handleTaskFail,
     handleContinueProject,
     handleResolveProjectIntervention,
@@ -3859,6 +4023,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getDispatchPlan,
     getProjectHealth,
     getProjectIntervention,
+    listResumableScriptWorkflowRuns,
+    deriveScriptWorkflowIntervention,
     createWorkflowProposal: persisted.createWorkflowProposal,
     cancelWorkflowProposal: persisted.cancelWorkflowProposal,
     createScriptWorkflowProposal: persisted.createScriptWorkflowProposal,

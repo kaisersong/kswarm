@@ -136,24 +136,23 @@ test('continue skips stale healthy agent when broker presence says offline', () 
   assert.equal(task.assignedAgent, 'cli-xiaok');
 });
 
-test('runtime offline retry budget allows recovery when an online replacement exists', () => {
+test('runtime offline auto-recovers via worker replacement when an online replacement exists', () => {
   const hub = createTestHub([
     { id: 'cli-codex', status: 'idle', brokerOnline: false, runtimeHealth: { state: 'healthy' } },
     { id: 'cli-xiaok', status: 'idle', brokerOnline: true, runtimeHealth: { state: 'healthy' } },
   ]);
   setupProject(hub);
-  const failed = failRootTask(hub, 'runtime_offline', 'delivery failed');
-  failed.continueRecoveryHistory = [{ strategy: 'retry_best_agent', result: 'started', at: Date.now() - 1000 }];
+  // Under the unified role policy, role-less agents are valid worker
+  // replacement candidates, so a runtime_offline failure is auto-recovered
+  // by replacing the offline agent with the online one at fail-time.
+  const failResult = hub.handleTaskFail('proj-continue', 'item-1', 'runtime_offline', 'delivery failed');
 
-  const result = hub.handleContinueProject('proj-continue', {
-    expectedPrimaryTaskId: failed.id,
-    expectedTaskUpdatedAt: failed.updatedAt,
-    idempotencyKey: 'continue-runtime-offline-replacement',
-  });
+  assert.equal(failResult.ok, true);
+  assert.equal(failResult.replaced, true);
+  assert.equal(failResult.toAgentId, 'cli-xiaok');
+  assert.equal(failResult.replacementDispatched, true);
 
   const task = getTask(hub);
-  assert.equal(result.ok, true);
-  assert.equal(result.strategy, 'retry_best_agent');
   assert.equal(task.status, 'dispatched');
   assert.equal(task.assignedAgent, 'cli-xiaok');
 });

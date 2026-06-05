@@ -101,12 +101,63 @@ test('resumes an unexpired in-progress task when the assigned agent is online', 
   assert.equal(result.actions[0].runId, 'run-active');
 });
 
+test('resumes via runtime instance liveness when the logical agent id is not in the online set', () => {
+  const task = makeTask({
+    assignedRuntimeInstance: 'worker#inst-7',
+    updatedAt: 25_000,
+    runLease: { ...makeTask().runLease, assignedRuntimeInstance: 'worker#inst-7', lastHeartbeatAt: 25_000, leaseExpiresAt: 35_000 },
+  });
+  const result = plan({ tasks: [task], onlineAgents: ['worker#inst-7'], now: 30_000 });
+
+  assert.deepEqual(result.actions.map(a => a.type), ['resume_task']);
+  assert.equal(result.actions[0].taskId, task.id);
+});
+
+test('treats a recent heartbeat as alive even when the fixed lease timestamp has elapsed', () => {
+  const task = makeTask({
+    updatedAt: 29_000,
+    runLease: { ...makeTask().runLease, lastHeartbeatAt: 29_000, leaseExpiresAt: 11_000 },
+  });
+  const result = plan({ tasks: [task], onlineAgents: ['worker'], now: 30_000, leaseTimeoutMs: 120_000 });
+
+  assert.deepEqual(result.actions.map(a => a.type), ['resume_task']);
+  assert.equal(result.actions[0].taskId, task.id);
+});
+
 test('resets expired active runs with no durable artifact to pending', () => {
   const task = makeTask();
   const result = plan({ tasks: [task], journals: [], onlineAgents: [], now: 30_000 });
 
   assert.deepEqual(result.actions.map(a => a.type), ['reset_pending']);
   assert.equal(result.actions[0].reason, 'lease_expired');
+});
+
+test('resumes a suspended task when the assigned agent is online', () => {
+  const task = makeTask({ suspendedAt: 5_000 });
+  const result = plan({ tasks: [task], onlineAgents: ['worker'], now: 30_000 });
+
+  assert.deepEqual(result.actions.map(a => a.type), ['resume_task']);
+  assert.equal(result.actions[0].reason, 'resume_after_suspend');
+});
+
+test('resumes a suspended task even when the assigned agent is not yet online', () => {
+  const task = makeTask({ suspendedAt: 5_000 });
+  const result = plan({ tasks: [task], onlineAgents: [], now: 30_000 });
+
+  assert.deepEqual(result.actions.map(a => a.type), ['resume_task']);
+  assert.equal(result.actions[0].reason, 'resume_after_suspend');
+});
+
+test('defers recovery for an unexpired task whose agent is not yet online (no suspend marker)', () => {
+  const task = makeTask({
+    updatedAt: 25_000,
+    runLease: { ...makeTask().runLease, lastHeartbeatAt: 25_000, leaseExpiresAt: 35_000 },
+  });
+  const result = plan({ tasks: [task], onlineAgents: [], now: 30_000 });
+
+  assert.deepEqual(result.actions.map(a => a.type), ['defer_recovery']);
+  assert.equal(result.actions[0].reason, 'agent_not_yet_online');
+  assert.equal(result.actions[0].taskId, task.id);
 });
 
 test('does not recover workflow-owned source tasks through normal task recovery', () => {

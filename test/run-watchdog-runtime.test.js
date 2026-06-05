@@ -162,6 +162,71 @@ test('workflow-owned task is not marked stalled by runtime watchdog', () => {
   assert.deepEqual(actions, []);
 });
 
+test('suspended task is exempt from stalled detection despite overdue heartbeat', () => {
+  const actions = planStalledRunActions({
+    projectId: 'proj',
+    tasks: [{
+      id: 'item-1',
+      status: 'in_progress',
+      assignedAgent: 'agent-a',
+      activeRunId: 'run-1',
+      suspendedAt: now - 600_000,
+      runLease: {
+        runId: 'run-1',
+        lastHeartbeatAt: now - 600_000,
+        createdAt: now - 700_000,
+      },
+    }],
+    now,
+    heartbeatTimeoutMs: 60_000,
+  });
+
+  assert.deepEqual(actions, []);
+});
+
+test('systemSuspended suppresses all stalled actions for overdue tasks', () => {
+  const actions = planStalledRunActions({
+    projectId: 'proj',
+    tasks: [{
+      id: 'item-1',
+      status: 'in_progress',
+      assignedAgent: 'agent-a',
+      activeRunId: 'run-1',
+      runLease: {
+        runId: 'run-1',
+        lastHeartbeatAt: now - 600_000,
+        createdAt: now - 700_000,
+      },
+    }],
+    now,
+    heartbeatTimeoutMs: 60_000,
+    systemSuspended: true,
+  });
+
+  assert.deepEqual(actions, []);
+});
+
+test('default heartbeat threshold tolerates a 4-minute gap (LLM inference)', () => {
+  const actions = planStalledRunActions({
+    projectId: 'proj',
+    tasks: [{
+      id: 'item-1',
+      status: 'in_progress',
+      assignedAgent: 'agent-a',
+      activeRunId: 'run-1',
+      runLease: {
+        runId: 'run-1',
+        lastHeartbeatAt: now - 240_000,
+        createdAt: now - 300_000,
+      },
+      runTelemetry: { lastStdoutAt: now - 10_000 },
+    }],
+    now,
+  });
+
+  assert.deepEqual(actions, []);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

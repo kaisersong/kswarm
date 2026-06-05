@@ -240,6 +240,8 @@ npm run test:e2e-p0   # P0 集成场景
 
 ## 版本历史
 
+**v0.9.0** — 并行调度与中断恢复：桌面 worker 并发数从 1 解锁为可配置上限（默认 3，范围 1-10，通过 `KSWARM_MAX_WORKER_INSTANCES` 环境变量或桌面端配置）；`suspendedAt` 任务标记实现优雅休眠/关机，唤醒后自动刷新 lease 恢复执行；`defer_recovery` 动作为尚未上线的 agent 提供 20 秒重连宽限；`systemSuspended` 标志在宿主休眠期间抑制 watchdog 与恢复逻辑；通过临时文件+重命名实现崩溃安全的原子状态持久化；卡住运行 watchdog 默认值提升至 5 分钟心跳超时和 20 分钟最大运行时间；新增 `/runtime/suspend` 和 `/runtime/resume` 端点供 Electron powerMonitor 集成；SIGTERM 优雅关机时标记所有活跃任务为 suspended 再退出。
+
 **v0.8.0** — Swarm 执行边界与证据版本：Xiaok Desktop 种子 agent 任务改派到完整 Desktop agent runtime，不再由本地 auto-worker 执行；任务 handoff package 把大上下文和产物合同文件化；来源/证据合同校准本月、最近类调研验收；artifact-first 完成规则避免空产物摘要；最终交付物使用正式文件名和 delivery alias；失败/阻塞的历史 retry 子任务不再拖住项目交付。
 
 **v0.7.0** — 可靠执行加固：runtime 探测与健康冷却、基于能力的派发/重试路由、带 heartbeat/stdout/stderr telemetry 的卡住运行 watchdog、PPTX/HTML/Markdown 强交付物合同、显式 PPTX 演示任务的确定性本地执行器兜底、active run 重启恢复，以及 PO 制定计划中断后的重试入口。

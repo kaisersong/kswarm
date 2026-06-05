@@ -1,4 +1,5 @@
 import { appendQualityPlanningGuidance } from './quality-rules.js';
+import { isProjectOwnerEligible } from './roles.js';
 
 const PRE_APPROVAL_STATUSES = new Set(['draft', 'created', 'planning']);
 const FINAL_STATUSES = new Set(['delivered', 'closed']);
@@ -19,12 +20,8 @@ function isArchived(agent) {
   return agent?.archivedAt != null;
 }
 
-function hasRole(agent, role) {
-  return Array.isArray(agent?.roles) && agent.roles.includes(role);
-}
-
 function isProjectOwner(agent) {
-  return hasRole(agent, 'project_owner');
+  return isProjectOwnerEligible(agent);
 }
 
 function isXiaokRuntime(agent) {

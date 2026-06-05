@@ -51,6 +51,18 @@ test('server wires script node retry endpoint with workflow update broadcast and
   assert.match(routeBlock, /sendWorkflowNodeHandoffs/);
 });
 
+test('server forwards scriptSource into script-generated proposal and exposes runs via GET', () => {
+  const routeStart = source.indexOf('scriptWorkflowProposalMatch');
+  assert.ok(routeStart > -1);
+  const routeBlock = source.slice(routeStart, routeStart + 800);
+  assert.match(routeBlock, /scriptSource: body\?\.scriptSource/);
+  // GET single workflow run endpoint returns the run object verbatim so the
+  // persisted scriptSource travels to the desktop runtime for recovery.
+  assert.ok(source.includes('projectWorkflowRunMatch'));
+  assert.match(source, /hub\.getWorkflowRun\(/);
+  assert.match(source, /json\(res, \{ workflowRun \}\)/);
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

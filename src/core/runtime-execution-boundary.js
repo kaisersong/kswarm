@@ -1,7 +1,10 @@
+import { isHostedAgent } from './agent-execution.js';
+
 const DESKTOP_SEED_IDS = new Set(['xiaok-po', 'xiaok-worker']);
 
 export function classifyExecutionBoundary(agent = {}) {
   if (
+    isHostedAgent(agent) ||
     agent.runtimeSource === 'desktop-agent-runtime' ||
     (agent.runtimeType === 'xiaok' && DESKTOP_SEED_IDS.has(agent.id) && !agent.runtimePath)
   ) {

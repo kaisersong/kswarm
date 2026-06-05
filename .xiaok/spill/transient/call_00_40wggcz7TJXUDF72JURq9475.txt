@@ -1,0 +1,335 @@
+1	/**
+2	 * useKSwarm — React hook for connecting to the KSwarm API Server.
+3	 *
+4	 * Unified version: merges xiaok's feature set (taskFailed, heartbeat, liveness,
+5	 * runtimes, model catalog) into the standalone kswarm web app.
+6	 *
+7	 * Role model:
+8	 * - Human: create projects, approve, add tasks, close
+9	 * - PO Agent: plan, dispatch, confirm
+10	 * - Worker Agent: execute, submit artifacts
+11	 */
+12	
+13	import { useState, useEffect, useRef, useCallback } from 'react';
+14	
+15	const API_BASE = '/api';
+16	const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`;
+17	const RECONNECT_DELAY = 3000;
+18	const MAX_RECONNECT_DELAY = 60000;
+19	const PARTICIPANT_POLL_INTERVAL = 8000;
+20	
+21	export function useKSwarm() {
+22	  const [connected, setConnected] = useState(false);
+23	  const [brokerConnected, setBrokerConnected] = useState(false);
+24	  const [projects, setProjects] = useState([]);
+25	  const [agents, setAgents] = useState([]);
+26	  const [participants, setParticipants] = useState([]);
+27	  const [logs, setLogs] = useState([]);
+28	  const [lastTaskEvent, setLastTaskEvent] = useState(null);
+29	
+30	  const wsRef = useRef(null);
+31	  const reconnectTimer = useRef(null);
+32	  const reconnectAttempts = useRef(0);
+33	  const connectedRef = useRef(false);
+34	  const pollTimer = useRef(null);
+35	
+36	  // ─── WebSocket ──────────────────────────────────────────────────
+37	
+38	  const connect = useCallback(() => {
+39	    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+40	
+41	    try {
+42	      const ws = new WebSocket(WS_URL);
+43	      wsRef.current = ws;
+44	
+45	      ws.onopen = () => {
+46	        setConnected(true);
+47	        connectedRef.current = true;
+48	        reconnectAttempts.current = 0;
+49	        fetchProjects();
+50	        fetchAgents();
+51	        fetchParticipants();
+52	      };
+53	
+54	      ws.onmessage = (event) => {
+55	        try {
+56	          const msg = JSON.parse(event.data);
+57	          handleWsMessage(msg);
+58	        } catch {}
+59	      };
+60	
+61	      ws.onclose = () => {
+62	        setConnected(false);
+63	        connectedRef.current = false;
+64	        wsRef.current = null;
+65	        scheduleReconnect();
+66	      };
+67	
+68	      ws.onerror = () => {
+69	        ws.close();
+70	      };
+71	    } catch {
+72	      scheduleReconnect();
+73	    }
+74	  }, []);
+75	
+76	  function scheduleReconnect() {
+77	    if (reconnectTimer.current) return;
+78	    const delay = Math.min(RECONNECT_DELAY * Math.pow(2, reconnectAttempts.current), MAX_RECONNECT_DELAY);
+79	    reconnectAttempts.current++;
+80	    reconnectTimer.current = setTimeout(() => {
+81	      reconnectTimer.current = null;
+82	      connect();
+83	    }, delay);
+84	  }
+85	
+86	  function handleWsMessage(msg) {
+87	    switch (msg.type) {
+88	      case 'init':
+89	        setProjects(msg.projects || []);
+90	        setAgents(msg.agents || []);
+91	        setBrokerConnected(msg.brokerConnected);
+92	        setLogs(msg.logs || []);
+93	        break;
+94	      case 'broker_status':
+95	        setBrokerConnected(msg.connected);
+96	        break;
+97	      case 'project_created':
+98	        setProjects(prev => [...prev, msg.project]);
+99	        break;
+100	      case 'project_approved':
+101	        setProjects(prev => prev.map(p => p.id === msg.projectId ? { ...p, status: 'active' } : p));
+102	        break;
+103	      case 'project_closed':
+104	        setProjects(prev => prev.map(p => p.id === msg.projectId ? { ...p, status: 'closed' } : p));
+105	        break;
+106	      case 'tasks_created':
+107	      case 'tasks_dispatched':
+108	      case 'task_update':
+109	      case 'task_done':
+110	      case 'task_failed':
+111	      case 'task_retry':
+112	      case 'project_deliverable':
+113	        fetchProjects();
+114	        setLastTaskEvent({ type: msg.type, projectId: msg.projectId, taskId: msg.taskId, ts: Date.now() });
+115	        break;
+116	      case 'task_intent_error':
+117	        setLogs(prev => [...prev, {
+118	          ts: new Date().toISOString(),
+119	          level: 'warn',
+120	          msg: `Task intent error: ${msg.kind || 'unknown'}`,
+121	          data: {
+122	            projectId: msg.projectId,
+123	            taskId: msg.taskId,
+124	            worker: msg.worker,
+125	            error: msg.error,
+126	            matches: msg.matches || [],
+127	          },
+128	        }].slice(-200));
+129	        setLastTaskEvent({ type: msg.type, projectId: msg.projectId, taskId: msg.taskId, ts: Date.now() });
+130	        break;
+131	      case 'agents_offline':
+132	        setAgents(prev => prev.map(a =>
+133	          msg.agentIds?.includes(a.id) ? { ...a, status: 'offline' } : a
+134	        ));
+135	        break;
+136	      // Agent events
+137	      case 'agent_created':
+138	        setAgents(prev => [...prev, msg.agent]);
+139	        break;
+140	      case 'agent_updated':
+141	        setAgents(prev => prev.map(a => a.id === msg.agent.id ? msg.agent : a));
+142	        break;
+143	      case 'agent_archived':
+144	        setAgents(prev => prev.filter(a => a.id !== msg.agentId));
+145	        break;
+146	      case 'agent_restored':
+147	        setAgents(prev => [...prev, msg.agent]);
+148	        break;
+149	      case 'agent_started':
+150	        setAgents(prev => prev.map(a => a.id === msg.agentId ? { ...a, status: 'idle', runtimeId: msg.runtimeId } : a));
+151	        break;
+152	      case 'agent_stopped':
+153	        setAgents(prev => prev.map(a => a.id === msg.agentId ? { ...a, status: 'offline', runtimeId: null } : a));
+154	        break;
+155	      case 'log':
+156	        setLogs(prev => [...prev, msg].slice(-200));
+157	        break;
+158	    }
+159	  }
+160	
+161	  useEffect(() => {
+162	    connect();
+163	    pollTimer.current = setInterval(() => {
+164	      if (connectedRef.current) fetchParticipants();
+165	    }, PARTICIPANT_POLL_INTERVAL);
+166	
+167	    return () => {
+168	      if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
+169	      if (reconnectTimer.current) { clearTimeout(reconnectTimer.current); reconnectTimer.current = null; }
+170	      if (pollTimer.current) { clearInterval(pollTimer.current); pollTimer.current = null; }
+171	    };
+172	  }, [connect]);
+173	
+174	  // ─── HTTP helpers ───────────────────────────────────────────────
+175	
+176	  async function httpGet(path) {
+177	    try {
+178	      const resp = await fetch(`${API_BASE}${path}`);
+179	      if (!resp.ok) return null;
+180	      return resp.json();
+181	    } catch {
+182	      return null;
+183	    }
+184	  }
+185	
+186	  async function httpPost(path, body) {
+187	    try {
+188	      const resp = await fetch(`${API_BASE}${path}`, {
+189	        method: 'POST',
+190	        headers: { 'Content-Type': 'application/json' },
+191	        body: body ? JSON.stringify(body) : undefined,
+192	      });
+193	      if (!resp.ok) return null;
+194	      return resp.json();
+195	    } catch {
+196	      return null;
+197	    }
+198	  }
+199	
+200	  async function httpPut(path, body) {
+201	    try {
+202	      const resp = await fetch(`${API_BASE}${path}`, {
+203	        method: 'PUT',
+204	        headers: { 'Content-Type': 'application/json' },
+205	        body: body ? JSON.stringify(body) : undefined,
+206	      });
+207	      if (!resp.ok) return null;
+208	      return resp.json();
+209	    } catch {
+210	      return null;
+211	    }
+212	  }
+213	
+214	  async function httpDelete(path) {
+215	    try {
+216	      const resp = await fetch(`${API_BASE}${path}`, { method: 'DELETE' });
+217	      return resp.ok;
+218	    } catch {
+219	      return false;
+220	    }
+221	  }
+222	
+223	  // ─── Project Actions ──────────────────────────────────────────
+224	
+225	  const fetchProjects = useCallback(async () => {
+226	    const data = await httpGet('/projects');
+227	    if (data?.projects) setProjects(data.projects);
+228	    return data?.projects || [];
+229	  }, []);
+230	
+231	  const getProjectDetail = useCallback(async (projectId) => {
+232	    return httpGet(`/projects/${projectId}`);
+233	  }, []);
+234	
+235	  const getProjectFullDetail = useCallback(async (projectId) => {
+236	    return httpGet(`/projects/${projectId}`);
+237	  }, []);
+238	
+239	  const createProject = useCallback(async (input) => {
+240	    const result = await httpPost('/projects', input);
+241	    if (result) fetchProjects();
+242	    return result;
+243	  }, [fetchProjects]);
+244	
+245	  const approveProject = useCallback(async (projectId) => {
+246	    const result = await httpPost(`/projects/${projectId}/approve`, {});
+247	    if (result?.ok) fetchProjects();
+248	    return !!result?.ok;
+249	  }, [fetchProjects]);
+250	
+251	  const retryPlan = useCallback(async (projectId) => {
+252	    return httpPost(`/projects/${projectId}/retry-plan`, {});
+253	  }, []);
+254	
+255	  const closeProject = useCallback(async (projectId, summary) => {
+256	    const result = await httpPost(`/projects/${projectId}/close`, { summary: summary || '' });
+257	    if (result?.ok) fetchProjects();
+258	    return !!result?.ok;
+259	  }, [fetchProjects]);
+260	
+261	  const deliverProject = useCallback(async (projectId, fromAgent, deliverable) => {
+262	    const result = await httpPost(`/projects/${projectId}/deliver`, {
+263	      fromAgent,
+264	      deliverable: deliverable || { summary: 'Project deliverable submitted' },
+265	    });
+266	    if (result?.ok) fetchProjects();
+267	    return !!result?.ok;
+268	  }, [fetchProjects]);
+269	
+270	  const humanAddTasks = useCallback(async (projectId, tasks) => {
+271	    const result = await httpPost(`/projects/${projectId}/tasks/human`, { tasks });
+272	    return !!result?.ok;
+273	  }, []);
+274	
+275	  const createTasks = useCallback(async (projectId, tasks, fromAgent) => {
+276	    const result = await httpPost(`/projects/${projectId}/tasks`, { tasks, fromAgent });
+277	    return !!result?.ok;
+278	  }, []);
+279	
+280	  const dispatchTasks = useCallback(async (projectId, fromAgent) => {
+281	    return httpPost(`/projects/${projectId}/dispatch`, { fromAgent });
+282	  }, []);
+283	
+284	  const markTaskDone = useCallback(async (projectId, taskId, fromAgent) => {
+285	    const res = await httpPost(`/projects/${projectId}/tasks/${taskId}/done`, { fromAgent });
+286	    return !!res?.ok;
+287	  }, []);
+288	
+289	  const cancelTask = useCallback(async (projectId, taskId) => {
+290	    const res = await httpPost(`/projects/${projectId}/tasks/${taskId}/cancel`, {});
+291	    return !!res?.ok;
+292	  }, []);
+293	
+294	  const taskFailed = useCallback(async (projectId, taskId, failureReason, errorMessage) => {
+295	    return httpPost(`/projects/${projectId}/tasks/${taskId}/fail`, { failureReason, errorMessage });
+296	  }, []);
+297	
+298	  // ─── Agent Actions ────────────────────────────────────────────
+299	
+300	  const fetchAgents = useCallback(async () => {
+301	    const data = await httpGet('/agents');
+302	    if (data?.agents) setAgents(data.agents);
+303	    return data?.agents || [];
+304	  }, []);
+305	
+306	  const fetchParticipants = useCallback(async () => {
+307	    const data = await httpGet('/participants');
+308	    if (data?.participants) setParticipants(data.participants);
+309	    return data?.participants || [];
+310	  }, []);
+311	
+312	  const createAgent = useCallback(async (input) => {
+313	    const result = await httpPost('/agents', input);
+314	    if (result) fetchAgents();
+315	    return result;
+316	  }, [fetchAgents]);
+317	
+318	  const updateAgent = useCallback(async (agentId, patch) => {
+319	    const result = await httpPut(`/agents/${agentId}`, patch);
+320	    if (result) fetchAgents();
+321	    return result;
+322	  }, [fetchAgents]);
+323	
+324	  const archiveAgent = useCallback(async (agentId) => {
+325	    const ok = await httpDelete(`/agents/${agentId}`);
+326	    if (ok) fetchAgents();
+327	    return ok;
+328	  }, [fetchAgents]);
+329	
+330	  const startAgent = useCallback(async (agentId) => {
+331	    const result = await httpPost(`/agents/${agentId}/start`, {});
+332	    if (result?.ok) fetchAgents();
+333	    return !!result?.ok;
+334	  }, [fetchAgents]);
+...(已截断)

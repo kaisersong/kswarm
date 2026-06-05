@@ -1,0 +1,266 @@
+1	# KSwarm MVP 设计
+2	
+3	## 一句话定义
+4	
+5	KSwarm 是一个 project-scoped agent swarm **hub**：维护任务看板、路由消息、执行规则（审批门控/依赖检查/状态机）。所有业务决策（分解、分配、验收）由 Project Owner Agent 完成，KSwarm 本身不做业务。
+6	
+7	---
+8	
+9	## 核心原则
+10	
+11	```
+12	KSwarm 是邮局，不是写信的人。
+13	```
+14	
+15	| 角色 | 职责 | 不做 |
+16	|------|------|------|
+17	| **Human** | 提目标、指定 PO、审批 | 不管执行细节 |
+18	| **KSwarm (Hub)** | 看板状态机、路由、门控、事件 | 不分解、不分配、不判断质量 |
+19	| **PO Agent** | 分解目标、指定 worker、review、交付 | 不管路由和协议 |
+20	| **Worker Agents** | 接任务、执行、提交结果 | 不看全局 |
+21	
+22	---
+23	
+24	## MVP 场景
+25	
+26	**场景：一个人在 IM 里说"帮我做 XX 技术方案"，PO Agent 分解任务分配给 Workers，Workers 执行并提交，PO 验收后交付。**
+27	
+28	具体流程：
+29	1. 人在 IM 发消息：`@kswarm 做一个实时协作白板的技术方案，PO=@xiaok`
+30	2. Hub 创建项目，通知 @xiaok 被指定为 PO
+31	3. @xiaok（PO）分解为 3-5 个子任务，指定每个任务的 worker，提交给 Hub
+32	4. Hub 通知人审批（展示计划）
+33	5. 人 `/approve`，Hub 状态切 active，通知 PO
+34	6. PO 请求 Hub 派发 → Hub 检查依赖，把满足条件的任务路由给对应 worker
+35	7. Worker 执行、提交结果 → Hub 路由给 PO
+36	8. PO review，满意则 mark_done，不满意则要求返工
+37	9. 所有任务 done 后，PO 提交最终交付 → Hub 通知人
+38	
+39	**不做**：不做持续运营、不做代码部署、不做团队协作。就一个人 + 一个 PO + N 个 worker 出一份交付物。
+40	
+41	---
+42	
+43	## MVP 边界
+44	
+45	### 做
+46	
+47	| 模块 | 范围 |
+48	|------|------|
+49	| **TaskBoard** | 任务状态机（pending→dispatched→accepted→in_progress→submitted→done） |
+50	| **Hub Engine** | 接收 intent、校验权限、状态流转、路由转发 |
+51	| **Gate** | 审批门控（未 approve 不能派发）、交付门控（未全完成不能交付） |
+52	| **Bridge** | WebSocket 连 intent-broker，收发 intent |
+53	| **Event Log** | NDJSON 事件流，全生命周期可追溯 |
+54	| **CLI** | `kswarm new "目标" --po @xiaok` / `kswarm status` / `kswarm approve` |
+55	
+56	### 不做（v0.1 不碰）
+57	
+58	| 不做 | 原因 |
+59	|------|------|
+60	| 任务分解 | 那是 PO Agent 的事，不是 Hub 的事 |
+61	| Agent 选择 | 那是 PO Agent 的事，Hub 只按 PO 指定路由 |
+62	| 质量判断 | 那是 PO Agent 的事，Hub 只做状态流转 |
+63	| 多项目并行 | 单项目先验证闭环 |
+64	| IM Bot 实现 | 走 broker 的 yunzhijia adapter |
+65	| 持久化 | broker 已有 SQLite，Hub 状态存内存 |
+66	| UI | 无 UI，纯 CLI + Event Log + IM |
+67	
+68	---
+69	
+70	## 系统交互图
+71	
+72	```
+73	Human            KSwarm(Hub)         PO Agent            Workers
+74	  │                  │                  │                   │
+75	  │─"做XX,PO=@xiaok"▶│                  │                   │
+76	  │                  │── assign_po ────▶│                   │
+77	  │                  │                  │                   │
+78	  │                  │◀─ create_tasks ──│ (PO分解+分配)      │
+79	  │                  │                  │                   │
+80	  │◀─"计划已生成,     │                  │                   │
+81	  │  请审批(5个任务)"─│                  │                   │
+82	  │                  │                  │                   │
+83	  │── /approve ─────▶│── plan_approved ▶│                   │
+84	  │                  │                  │                   │
+85	  │                  │◀─request_dispatch│                   │
+86	  │                  │                  │                   │
+87	  │                  │─── request_task (按PO指定路由) ──────▶│
+88	  │                  │                  │                   │
+89	  │                  │◀───────────────── accept_task ───────│
+90	  │                  │── task_accepted ▶│                   │
+91	  │                  │                  │                   │
+92	  │                  │◀───────────────── submit_result ────│
+93	  │                  │── result_submitted▶│                  │
+94	  │                  │                  │── review ────────▶│
+95	  │                  │                  │                   │
+96	  │                  │◀─ mark_done ─────│ (PO确认质量)       │
+97	  │                  │                  │                   │
+98	  │                  │◀─ deliver ───────│ (全部完成)         │
+99	  │◀─"方案完成,       │                  │                   │
+100	  │  5份文档已就绪"───│                  │                   │
+101	```
+102	
+103	关键：Hub 全程只做 **路由** 和 **状态更新**，不做任何 "分解/分配/判断" 的业务。
+104	
+105	---
+106	
+107	## CLI 设计
+108	
+109	```bash
+110	# 创建项目并指定 PO
+111	kswarm new "做一个实时协作白板技术方案" --po @xiaok
+112	
+113	# 查看状态（终端看板）
+114	kswarm status
+115	
+116	# 批准 PO 提交的计划
+117	kswarm approve
+118	
+119	# 查看事件日志
+120	kswarm log
+121	```
+122	
+123	MVP 阶段 CLI 只需这 4 个命令。Human 通过 CLI/IM 只做两件事：创建项目 + 审批。
+124	
+125	---
+126	
+127	## 文件结构（v2 架构）
+128	
+129	```
+130	kswarm/
+131	├── src/
+132	│   ├── core/
+133	│   │   ├── hub.js             # Hub 引擎（路由 + 门控 + 状态机）
+134	│   │   ├── task-board.js      # TaskBoard（纯状态机）
+135	│   │   ├── event-log.js       # NDJSON 事件流
+136	│   │   └── roles.js           # 角色定义 + intent 路由表
+137	│   ├── bridge/
+138	│   │   └── broker-bridge.js   # WebSocket client → intent-broker
+139	│   ├── cli/
+140	│   │   ├── status.js          # 终端富输出（看板渲染）
+141	│   │   └── demo.js            # Standalone demo
+142	│   └── types.js               # JSDoc type definitions
+143	├── test/
+144	│   ├── e2e.test.js            # 端到端断言测试
+145	│   ├── scenarios.test.js      # v1 场景（旧，兼容）
+146	│   └── scenarios-v2.test.js   # v2 场景（新架构验证）
+147	├── package.json
+148	├── README.md
+149	└── MVP.md                     # 本文档
+150	```
+151	
+152	注意：没有 `planner/` 和 `dispatch/` 目录了——那些逻辑属于 PO Agent，不属于 Hub。
+153	
+154	---
+155	
+156	## 验收标准
+157	
+158	MVP 完成的标志（全部满足才算 done）：
+159	
+160	1. [ ] Human 创建项目并指定 PO → Hub 通知 PO 被指派
+161	2. [ ] PO 提交任务列表 → Hub 正确写入 Board
+162	3. [ ] Human approve → Hub 状态切 active，通知 PO
+163	4. [ ] PO 请求派发 → Hub 检查依赖后路由给 PO 指定的 worker
+164	5. [ ] Worker submit_result → Hub 路由给 PO review
+165	6. [ ] PO mark_done → Hub 更新状态
+166	7. [ ] PO deliver → Hub 检查全 done 后标记 delivered，通知 Human
+167	8. [ ] 非 PO 不能执行管理操作（权限隔离）
+168	9. [ ] 非法状态流转被拒绝（状态机保护）
+169	
+170	---
+171	
+172	## 依赖关系
+173	
+174	```
+175	kswarm (本项目)
+176	  └── depends on: intent-broker (must be running)
+177	        └── already has: SQLite, WebSocket, presence, yunzhijia adapter
+178	              └── already connects: xiaok, cc, codex (via adapters)
+179	```
+180	
+181	**KSwarm 不重复造轮子**。Broker 有的能力直接用。
+182	
+183	---
+184	
+185	## v0.1 → v0.2 升级路径
+186	
+187	做完 MVP 之后，最值得加的能力按优先级：
+188	
+189	1. **PO Agent 实现** — 用 LLM 驱动 PO 的分解/分配/review 决策
+190	2. **IM 交互** — 通过 broker 的 yzj adapter 实现 IM 里直接 `@kswarm 做XX`
+191	3. **结果聚合** — PO 把多个 worker 产出物合并为最终文档
+192	4. **重试/容错** — PO 发现 worker 失败后重新分配
+193	
+194	---
+195	
+196	## 验证策略（无 UI 验证）
+197	
+198	不做 UI 不等于不可观测。三层验证：
+199	
+200	### 1. 自动化断言 — `node test/e2e.test.js`
+201	
+202	```bash
+203	node test/e2e.test.js
+204	```
+205	
+206	测试脚本覆盖 6 条验收标准，每条有明确 pass/fail。无需人工判断。
+207	
+208	| 验收标准 | 断言内容 |
+209	|---------|---------|
+210	| AC1 | project 创建 + 任务分解 3~8 个 |
+211	| AC2 | approve 后 broker 收到 request_task |
+212	| AC3 | agent 能 accept 并开始工作 |
+213	| AC4 | submit_result 后状态正确更新 |
+214	| AC5 | 全 done → project.delivered |
+215	| AC6 | 无人工路由（< 10 次迭代） |
+216	
+217	### 2. 终端富输出 — `kswarm status`
+218	
+219	ANSI 色彩渲染的终端看板：
+220	
+221	```
+222	┌─────────────────────────────────────────────────────────────┐
+223	│ 实时协作白板技术方案                                           │
+224	├─────────────────────────────────────────────────────────────┤
+225	│ ████████████████████████████████████████ 100% (6/6)         │
+226	├─────────────────────────────────────────────────────────────┤
+227	│  ✓ DONE  Research & Analysis       @xiaok                   │
+228	│  ✓ DONE  Technical Architecture    @claude                  │
+229	│  ● WORKING  Quality Assurance      @codex                   │
+230	│  ○ PENDING  Delivery                                        │
+231	├─────────────────────────────────────────────────────────────┤
+232	│ Agents: ● @xiaok  ● @claude  ● @codex  ● @qoder            │
+233	│ Status: ACTIVE  updated 3s ago                              │
+234	└─────────────────────────────────────────────────────────────┘
+235	```
+236	
+237	### 3. 事件日志 — NDJSON 文件
+238	
+239	所有生命周期事件以 NDJSON 写入 `logs/kswarm-{ts}.ndjson`：
+240	
+241	```json
+242	{"ts":"...","seq":0,"type":"project.created","projectId":"abc","projectName":"白板方案"}
+243	{"ts":"...","seq":1,"type":"task.dispatched","taskId":"t1","title":"Research","agent":"@xiaok"}
+244	{"ts":"...","seq":2,"type":"task.accepted","taskId":"t1","agent":"@xiaok"}
+245	{"ts":"...","seq":3,"type":"task.done","taskId":"t1","title":"Research"}
+246	{"ts":"...","seq":4,"type":"project.delivered","projectName":"白板方案"}
+247	```
+248	
+249	用途：`cat logs/*.ndjson | jq` 看全流程，未来对接 HexDeck 消费此日志流。
+250	
+251	### 4. IM 一行摘要
+252	
+253	每次状态变更推送给人：`✅ 白板方案 — DELIVERED (6/6 tasks)`
+254	
+255	### 验证运行命令
+256	
+257	```bash
+258	# v2 架构场景测试（推荐，验证 Hub/PO/Worker 职责分离）
+259	node test/scenarios-v2.test.js
+260	
+261	# 端到端断言测试（兼容旧流程）
+262	node test/e2e.test.js
+263	
+264	# 只看 demo 流程
+265	node src/cli/demo.js
+266	```

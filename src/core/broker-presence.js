@@ -1,15 +1,19 @@
+import { getBrokerPresenceParticipantId, isHostedAgent } from './agent-execution.js';
+
 const DESKTOP_RUNTIME_SOURCE = 'desktop-agent-runtime';
 const DESKTOP_SEED_AGENT_IDS = new Set(['xiaok-po', 'xiaok-worker']);
 
 export function applyBrokerPresenceToAgentProfiles(agents = [], onlineAgentIds = null) {
   if (!(onlineAgentIds instanceof Set)) return Array.isArray(agents) ? agents : [];
   return (Array.isArray(agents) ? agents : []).map(agent => {
-    const brokerOnline = onlineAgentIds.has(agent?.id);
+    const brokerParticipantId = getBrokerPresenceParticipantId(agent);
+    const brokerOnline = Boolean(brokerParticipantId && onlineAgentIds.has(brokerParticipantId));
     if (!isDesktopRuntimeAgent(agent)) return { ...agent, brokerOnline };
 
     if (!brokerOnline) {
       return {
         ...agent,
+        brokerParticipantId,
         status: 'offline',
         brokerOnline: false,
         runtimeHealth: {
@@ -21,6 +25,7 @@ export function applyBrokerPresenceToAgentProfiles(agents = [], onlineAgentIds =
 
     return {
       ...agent,
+      brokerParticipantId,
       status: agent.status === 'offline' ? 'idle' : agent.status,
       brokerOnline: true,
       runtimeHealth: {
@@ -36,6 +41,6 @@ export function applyBrokerPresenceToAgentProfiles(agents = [], onlineAgentIds =
 function isDesktopRuntimeAgent(agent) {
   return Boolean(
     agent &&
-    (agent.runtimeSource === DESKTOP_RUNTIME_SOURCE || DESKTOP_SEED_AGENT_IDS.has(agent.id))
+    (isHostedAgent(agent) || agent.runtimeSource === DESKTOP_RUNTIME_SOURCE || DESKTOP_SEED_AGENT_IDS.has(agent.id))
   );
 }

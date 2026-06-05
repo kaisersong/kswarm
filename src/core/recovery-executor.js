@@ -66,6 +66,8 @@ export async function executeRecoveryAction(action, {
         fromWorker: action.agentId || 'recovery',
         result: resultPayload,
       });
+    } else if (result.ok && !sendReviewSubmission) {
+      return { ...result, ok: false, error: 'review_delivery_unavailable' };
     }
     return result;
   }
@@ -75,19 +77,27 @@ export async function executeRecoveryAction(action, {
   }
 
   if (action.type === 'resume_task') {
+    if (typeof hub?.handleResumeTaskForRecovery === 'function') {
+      hub.handleResumeTaskForRecovery(action.projectId, action.taskId);
+    }
     if (sendRequestTask) await sendRequestTask(action.projectId, action.taskId);
     return { ok: true, action: 'resume_task', projectId: action.projectId, taskId: action.taskId };
   }
 
+  if (action.type === 'defer_recovery') {
+    return { ok: true, deferred: true, action: 'defer_recovery', projectId: action.projectId, taskId: action.taskId };
+  }
+
   if (action.type === 'notify_po_review') {
-    if (sendReviewSubmission) {
-      await sendReviewSubmission({
-        projectId: action.projectId,
-        taskId: action.taskId,
-        fromWorker: action.agentId || 'recovery',
-        result: action.result,
-      });
+    if (!sendReviewSubmission) {
+      return { ok: false, error: 'review_delivery_unavailable', action: 'notify_po_review', projectId: action.projectId, taskId: action.taskId };
     }
+    await sendReviewSubmission({
+      projectId: action.projectId,
+      taskId: action.taskId,
+      fromWorker: action.agentId || 'recovery',
+      result: action.result,
+    });
     return { ok: true, action: 'notify_po_review', projectId: action.projectId, taskId: action.taskId };
   }
 
