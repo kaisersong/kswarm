@@ -119,6 +119,10 @@ export function deriveAgentStatuses({
       return withStatus(base, 'done', { detail: '已完成分配任务' });
     }
 
+    if (assignedTasks.length === 0 && (project.status === 'closed' || project.status === 'delivered')) {
+      return withStatus(base, 'done', { detail: '项目已交付' });
+    }
+
     if (!online) {
       return withStatus(base, 'offline', { detail: '未连接' });
     }
