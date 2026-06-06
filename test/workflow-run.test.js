@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
   applyWorkflowEvent,
   createWorkflowRun,
+  refreshWorkflowRunState,
   summarizeWorkflowRun,
   validateWorkflowRunInput,
 } from '../src/core/workflow-run.js';
@@ -115,6 +116,83 @@ test('cancelled workflow cancels unfinished nodes and preserves completed output
   assert.equal(run.nodes.find(n => n.id === 'collect').status, 'completed');
   assert.equal(run.nodes.find(n => n.id === 'recommend').status, 'cancelled');
   assert.equal(summarizeWorkflowRun(run).completed, 1);
+});
+
+test('gate_completed with conditional-pass completes the run', () => {
+  let run = createWorkflowRun({
+    id: 'wf-4',
+    projectId: 'proj-1',
+    workflowId: 'kualityforge-review',
+    title: 'KF review',
+    phases: [{ id: 'review', title: '评审' }],
+    nodes: [
+      { id: 'agent-1', phaseId: 'review', title: '评审', kind: 'agent_task' },
+      { id: 'gate', phaseId: 'review', title: 'Gate', kind: 'gate', dependsOn: ['agent-1'] },
+    ],
+    now: 1770000000000,
+  });
+
+  run = applyWorkflowEvent(run, { type: 'node_started', nodeId: 'agent-1' }, { now: 1770000001000 });
+  run = applyWorkflowEvent(run, { type: 'node_completed', nodeId: 'agent-1', output: { findings: 5 } }, { now: 1770000002000 });
+  run = applyWorkflowEvent(run, {
+    type: 'gate_completed',
+    nodeId: 'gate',
+    decision: { status: 'conditional-pass', reasons: ['no blockers'] },
+  }, { now: 1770000003000 });
+
+  assert.equal(run.status, 'completed');
+  assert.equal(run.gateDecision.status, 'conditional-pass');
+  assert.equal(run.summary.completed, 2);
+  assert.equal(run.summary.primaryMessage, 'Review gate conditional pass');
+});
+
+test('gate_completed with blocked gate blocks the run', () => {
+  let run = createWorkflowRun({
+    id: 'wf-5',
+    projectId: 'proj-1',
+    workflowId: 'kualityforge-review',
+    title: 'KF review',
+    phases: [{ id: 'review', title: '评审' }],
+    nodes: [
+      { id: 'agent-1', phaseId: 'review', title: '评审', kind: 'agent_task' },
+      { id: 'gate', phaseId: 'review', title: 'Gate', kind: 'gate', dependsOn: ['agent-1'] },
+    ],
+    now: 1770000000000,
+  });
+
+  run = applyWorkflowEvent(run, { type: 'node_started', nodeId: 'agent-1' }, { now: 1770000001000 });
+  run = applyWorkflowEvent(run, { type: 'node_completed', nodeId: 'agent-1', output: { findings: 5 } }, { now: 1770000002000 });
+  run = applyWorkflowEvent(run, {
+    type: 'gate_completed',
+    nodeId: 'gate',
+    decision: { status: 'blocked', reason: 'blocker_found' },
+  }, { now: 1770000003000 });
+
+  assert.equal(run.status, 'blocked');
+  assert.equal(run.gateDecision.status, 'blocked');
+});
+
+test('refreshWorkflowRunState recognizes conditional-pass in gateDecision after all nodes complete', () => {
+  let run = createWorkflowRun({
+    id: 'wf-6',
+    projectId: 'proj-1',
+    workflowId: 'kf-review',
+    title: 'KF review',
+    phases: [{ id: 'review', title: '评审' }],
+    nodes: [
+      { id: 'agent-1', phaseId: 'review', title: '评审', kind: 'agent_task' },
+    ],
+    now: 1770000000000,
+  });
+
+  run = applyWorkflowEvent(run, { type: 'node_started', nodeId: 'agent-1' }, { now: 1770000001000 });
+  run = applyWorkflowEvent(run, { type: 'node_completed', nodeId: 'agent-1' }, { now: 1770000002000 });
+
+  const refreshed = refreshWorkflowRunState({
+    ...run,
+    gateDecision: { status: 'conditional-pass', reasons: ['no blockers'] },
+  });
+  assert.equal(refreshed.status, 'completed');
 });
 
 let passed = 0;

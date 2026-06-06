@@ -9,6 +9,7 @@ import { createHash } from 'node:crypto';
 
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_NODE_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled']);
+const PASSING_GATE_STATUSES = new Set(['passed', 'conditional-pass']);
 
 export function validateWorkflowRunInput(input = {}) {
   if (!input.projectId) return { ok: false, error: 'project_id_required' };
@@ -206,7 +207,7 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.output = { decision: clonePlainValue(event.decision) };
     node.cache = buildNodeCache(next, node, { now });
     next.gateDecision = clonePlainValue(event.decision);
-    next.status = event.decision?.status === 'passed' ? 'completed' : 'blocked';
+    next.status = PASSING_GATE_STATUSES.has(event.decision?.status) ? 'completed' : 'blocked';
     next.completedAt = now;
     if (event.decision?.status === 'needs_replanning') {
       next.revisedProposalRequest = {
@@ -384,7 +385,7 @@ function refreshSummary(run) {
   const summary = summarizeWorkflowRun(withCheckpoints);
   let status = withCheckpoints.status;
   if (!TERMINAL_RUN_STATUSES.has(status) && status !== 'awaiting_approval') {
-    if (withGroups.gateDecision?.status && withGroups.gateDecision.status !== 'passed') status = 'blocked';
+    if (withGroups.gateDecision?.status && !PASSING_GATE_STATUSES.has(withGroups.gateDecision.status)) status = 'blocked';
     else if (summary.failed > 0) status = 'failed';
     else if (summary.blocked > 0) status = 'blocked';
     else if (summary.total > 0 && summary.completed === summary.total) status = 'completed';
@@ -548,6 +549,7 @@ function clonePlainValue(value) {
 function formatGateDecisionMessage(decision) {
   if (!decision?.status) return null;
   if (decision.status === 'passed') return 'Review gate passed';
+  if (decision.status === 'conditional-pass') return 'Review gate conditional pass';
   if (decision.status === 'needs_rework') return 'Review gate needs rework';
   if (decision.status === 'needs_replanning') return 'Review gate needs replanning';
   if (decision.status === 'needs_rubric_clarification') return 'Review gate needs rubric clarification';

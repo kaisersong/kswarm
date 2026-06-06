@@ -3651,10 +3651,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const workspaceRealPath = safeWorkflowRealPath(workspacePath);
     if (!workspaceRealPath) return { ok: false, error: 'worker_artifact_invalid' };
 
+    const workspaceArtifacts = [];
     for (const artifact of artifacts) {
       const checked = validateWorkflowProjectArtifactPath(artifact, { workspaceRealPath });
-      if (!checked.ok) return checked;
+      if (checked.ok) {
+        workspaceArtifacts.push(artifact);
+      }
     }
+    if (workspaceArtifacts.length === 0) return { ok: false, error: 'worker_artifact_invalid' };
     const outputValidation = validateWorkflowProjectRequiredOutputs({ board, deliverable, workspacePath: workspaceRealPath });
     if (!outputValidation.ok) return outputValidation;
     return { ok: true };
