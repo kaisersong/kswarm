@@ -1,0 +1,50 @@
+import { z } from 'zod';
+import type { KSwarmHttpClient } from '../client/http-client.js';
+export declare const createNodeSchema: {
+    projectId: z.ZodString;
+    workflowRunId: z.ZodString;
+    phaseTitle: z.ZodString;
+    label: z.ZodOptional<z.ZodString>;
+    prompt: z.ZodString;
+    assignedAgent: z.ZodOptional<z.ZodString>;
+    parallelGroupId: z.ZodOptional<z.ZodString>;
+    fanoutItemKey: z.ZodOptional<z.ZodString>;
+    required: z.ZodDefault<z.ZodBoolean>;
+    options: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+};
+declare const schema: z.ZodObject<{
+    projectId: z.ZodString;
+    workflowRunId: z.ZodString;
+    phaseTitle: z.ZodString;
+    label: z.ZodOptional<z.ZodString>;
+    prompt: z.ZodString;
+    assignedAgent: z.ZodOptional<z.ZodString>;
+    parallelGroupId: z.ZodOptional<z.ZodString>;
+    fanoutItemKey: z.ZodOptional<z.ZodString>;
+    required: z.ZodDefault<z.ZodBoolean>;
+    options: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+}, "strip", z.ZodTypeAny, {
+    workflowRunId: string;
+    projectId: string;
+    required: boolean;
+    prompt: string;
+    phaseTitle: string;
+    options?: Record<string, unknown> | undefined;
+    label?: string | undefined;
+    assignedAgent?: string | undefined;
+    parallelGroupId?: string | undefined;
+    fanoutItemKey?: string | undefined;
+}, {
+    workflowRunId: string;
+    projectId: string;
+    prompt: string;
+    phaseTitle: string;
+    required?: boolean | undefined;
+    options?: Record<string, unknown> | undefined;
+    label?: string | undefined;
+    assignedAgent?: string | undefined;
+    parallelGroupId?: string | undefined;
+    fanoutItemKey?: string | undefined;
+}>;
+export declare function handleCreateNode(httpClient: KSwarmHttpClient, args: z.infer<typeof schema>): Promise<string>;
+export {};

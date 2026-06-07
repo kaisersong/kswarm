@@ -1,0 +1,21 @@
+{
+  "name": "kswarm-workflow",
+  "version": "0.1.0",
+  "interface": {
+    "display_name": "KSwarm Workflow Engine",
+    "short_description": "Multi-agent dynamic workflow orchestration via MCP",
+    "category": "orchestration",
+    "capabilities": ["multi-agent-review", "parallel-workflow", "dynamic-orchestration"]
+  },
+  "mcpServers": [
+    {
+      "name": "kswarm-workflow",
+      "type": "stdio",
+      "command": "node",
+      "args": ["mcp-server/dist/server.bundle.js"],
+      "env": {
+        "KSWARM_URL": "http://127.0.0.1:4400"
+      }
+    }
+  ]
+}
