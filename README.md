@@ -15,6 +15,7 @@ English | [简体中文](README.zh-CN.md)
 - **Script Terminal Decisions** — trusted script runtimes can finish normally or block a run with structured `blocked`, `needs_replanning`, or `needs_rubric_clarification` terminal decisions instead of forcing every script to appear completed.
 - **HTTP Contract for Parallel Scripts** — the server exposes `/script/parallel-groups`, forwards branch metadata through `/script/nodes`, and accepts structured terminal data on `/script/complete`.
 - **Workflow Test Coverage** — `npm run test:workflow` now includes durable parallel group coverage in addition to script-generated workflow control-plane and API contract tests.
+- **Surfaced in Desktop v1.4.3 Kanban** — Xiaok Desktop v1.4.3 consumes these `parallelGroups`, branch metadata, and script checkpoints directly on each project task card (a slim multi-segment progress bar fed by `summary.completed/running/failed`) and a right-side `TaskDetailDrawer` (full node list grouped by phase, with parallel groups, fan-out labels, failure policy, and per-node status / agent / error). No KSwarm protocol or data model change is needed.
 
 ## What's New in v0.8.1
 

@@ -15,6 +15,7 @@
 - **脚本终态决策**：可信 script runtime 可以正常完成，也可以用结构化 `blocked`、`needs_replanning` 或 `needs_rubric_clarification` 终态阻塞 run，而不是把所有脚本都伪装成 completed。
 - **并行脚本 HTTP 契约**：server 新增 `/script/parallel-groups`，`/script/nodes` 会透传分支元数据，`/script/complete` 支持结构化 terminal 数据。
 - **Workflow 测试覆盖**：`npm run test:workflow` 已包含 durable parallel group 测试，同时保留 script-generated workflow 控制面和 API contract 测试。
+- **Desktop v1.4.3 看板呈现**：Xiaok Desktop v1.4.3 直接消费这些 `parallelGroups`、分支元数据和脚本 checkpoint —— 在每张项目任务卡片上显示细分段进度条（来自 `summary.completed/running/failed`），并新增右侧 `TaskDetailDrawer`，按阶段展示完整节点列表（含并行分组、fan-out 标签、失败策略、单节点状态 / Agent / 错误）。KSwarm 协议和数据模型未变。
 
 ## v0.8.1 新特性
 
