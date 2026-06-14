@@ -8,6 +8,14 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
+## Xiaok Desktop v1.4.4 Integration Baseline
+
+- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.4. Desktop owns service startup, health/version probing, and user-facing diagnostics; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
+- Completion evidence is now consumed by Xiaok's loop evidence diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records are the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
+- When a desktop run reports "task completed without artifact evidence", treat it as a cross-layer evidence problem: inspect KSwarm project deliverables, task artifact manifests, workflow node provenance, and the Xiaok loop diagnostics record before retrying the model.
+- The canonical service smoke test is still `node src/server/index.js` plus `GET /health` on port `4400`. If Desktop reports a version or port conflict while manual startup succeeds, the failure is in the Desktop service lifecycle/probing path rather than KSwarm core execution.
+- No KSwarm API or data model migration is required for the Xiaok v1.4.4 README baseline; the existing v0.8.2 durable parallel workflow contracts remain the active protocol surface.
+
 ## What's New in v0.8.2
 
 - **Durable Parallel Workflow Groups** — script-generated workflow runs can now create KSwarm-owned `parallelGroups` before branch dispatch. Group status, completion counters, failure policy, and timestamps are persisted with the workflow run.

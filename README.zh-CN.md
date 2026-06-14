@@ -8,6 +8,14 @@
 
 ---
 
+## Xiaok Desktop v1.4.4 集成基线
+
+- KSwarm 仍是 Xiaok Desktop v1.4.4 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测和用户可见诊断；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
+- Completion evidence 现在会进入 Xiaok 的 loop evidence diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 是 Desktop 验证“项目已完成且有可检查产物证据”的源数据。
+- 如果桌面端报告 “task completed without artifact evidence”，应按跨层 evidence 问题排查：先看 KSwarm 项目交付物、任务 artifact manifest、workflow node provenance，再看 Xiaok loop diagnostics 记录，最后才重试模型。
+- 标准服务 smoke test 仍是 `node src/server/index.js` 加端口 `4400` 的 `GET /health`。如果 Desktop 报版本或端口冲突，但手动启动成功，问题更可能在 Desktop service lifecycle / probing 链路，而不是 KSwarm 核心执行。
+- 本次 Xiaok v1.4.4 README 基线不要求 KSwarm API 或数据模型迁移；现有 v0.8.2 持久化并行 workflow contract 仍是当前协议面。
+
 ## v0.8.2 新特性
 
 - **持久化并行 Workflow Group**：script-generated workflow run 现在可以在分支派发前创建由 KSwarm 管控的 `parallelGroups`。分组状态、完成计数、失败策略和时间戳都会随 workflow run 持久化。
