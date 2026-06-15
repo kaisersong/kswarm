@@ -3511,11 +3511,6 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
-    project.status = 'closed';
-    project.closedAt = now;
-    project.closedBy = 'script_workflow';
-    eventLog.emit('project.closed', { projectId: workflowRun.projectId, projectName: project.name, summary: 'Script workflow delivered and auto-closed' });
-
     return {
       workflowRun: {
         ...workflowRun,
