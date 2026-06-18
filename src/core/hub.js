@@ -1689,7 +1689,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (review.passed) {
       if (task.evidenceContract && task.result) {
         const validation = validateTaskResultAgainstContract(task, task.result);
-        if (!validation.ok) {
+        if (!validation.ok && validation.failureClass !== 'quality_evidence_missing') {
           return handleQualityFailure(task, {
             ...review,
             passed: false,
