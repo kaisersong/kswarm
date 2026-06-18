@@ -8,14 +8,19 @@
 
 ---
 
-## Xiaok Desktop v1.4.8 集成基线
+## Xiaok Desktop v1.4.9 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.4.8 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断和自动化界面；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
+- KSwarm 仍是 Xiaok Desktop v1.4.9 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断和自动化界面；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
 - Xiaok 自动化现在把定时任务、用户 loop 和诊断放到同一个产品入口。KSwarm 继续为项目型 loop 提供 project/workflow 事实，Desktop 负责记录 schedule 与 loop run 的关联以及用户 loop 输出。
-- Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证“项目已完成且有可检查产物证据”的源数据。
+- Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
 - 如果桌面端报告 “task completed without artifact evidence”，应按跨层 evidence 问题排查：先看 KSwarm 项目交付物、任务 artifact manifest、workflow node provenance，再看 Xiaok loop diagnostics 记录，最后才重试模型。不要在 Xiaok UI 层粉饰任务结果。
-- 标准服务 smoke test 仍是 `node src/server/index.js` 加端口 `4400` 的 `GET /health`。如果 Desktop 报版本或端口冲突，但手动启动成功，应优先检查 Desktop service lifecycle / probing 日志；v1.4.8 启动时可以替换旧版或不匹配的 KSwarm 进程。
-- 本次 Xiaok v1.4.8 README 基线不要求 KSwarm API 或数据模型迁移。当前随包 sidecar 仍是 KSwarm `0.9.0`，包含 suspend/resume 恢复和持久化并行 workflow contract。
+- 标准服务 smoke test 仍是 `node src/server/index.js` 加端口 `4400` 的 `GET /health`。如果 Desktop 报版本或端口冲突，但手动启动成功，应优先检查 Desktop service lifecycle / probing 日志；v1.4.9 启动时可以替换旧版或不匹配的 KSwarm 进程。
+- 本次 Xiaok v1.4.9 README 基线不要求 KSwarm API 或数据模型迁移。当前随包 sidecar 为 KSwarm `0.9.1`，包含 suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
+
+## v0.9.1 新特性
+
+- **PO Review Verdict 容错**：当 PO 明确通过验收时，缺失 evidence 格式（verdict 字段）不再阻断任务。review gate 现在把没有结构化 verdict 的显式通过视为有效批准，而不是拒绝提交。
+- **Resume Workflow 策略**：`handleContinueProject` 现在支持对 blocked script-generated workflow 使用 `resume_workflow` 策略。被阻塞的 workflow 可以被解除阻塞并恢复执行，无需从头重跑。
 
 ## v0.8.2 新特性
 
@@ -249,6 +254,8 @@ npm run test:e2e-p0   # P0 集成场景
 ---
 
 ## 版本历史
+
+**v0.9.1** — PO review 与 workflow 恢复修复：PO 明确通过验收时，缺失 evidence 格式（verdict 字段）不再阻断任务；`handleContinueProject` 支持对 blocked script-generated workflow 使用 `resume_workflow` 策略，允许被阻塞的 workflow 解除阻塞并恢复执行，无需从头重跑。
 
 **v0.9.0** — 并行调度与中断恢复：桌面 worker 并发数从 1 解锁为可配置上限（默认 3，范围 1-10，通过 `KSWARM_MAX_WORKER_INSTANCES` 环境变量或桌面端配置）；`suspendedAt` 任务标记实现优雅休眠/关机，唤醒后自动刷新 lease 恢复执行；`defer_recovery` 动作为尚未上线的 agent 提供 20 秒重连宽限；`systemSuspended` 标志在宿主休眠期间抑制 watchdog 与恢复逻辑；通过临时文件+重命名实现崩溃安全的原子状态持久化；卡住运行 watchdog 默认值提升至 5 分钟心跳超时和 20 分钟最大运行时间；新增 `/runtime/suspend` 和 `/runtime/resume` 端点供 Electron powerMonitor 集成；SIGTERM 优雅关机时标记所有活跃任务为 suspended 再退出。
 

@@ -8,14 +8,19 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Xiaok Desktop v1.4.8 Integration Baseline
+## Xiaok Desktop v1.4.9 Integration Baseline
 
-- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.8. Desktop owns service startup, health/version probing, user-facing diagnostics, and the Automations UI; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
+- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.9. Desktop owns service startup, health/version probing, user-facing diagnostics, and the Automations UI; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
 - Xiaok Automations can now put scheduled tasks, user loops, and diagnostics in one product surface. KSwarm still supplies project/workflow facts for project-backed loops, while Desktop records the schedule/loop run linkage and user-loop outputs.
 - Completion evidence is consumed by Xiaok loop diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records remain the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
 - When a desktop run reports "task completed without artifact evidence", treat it as a cross-layer evidence problem: inspect KSwarm project deliverables, task artifact manifests, workflow node provenance, and the Xiaok loop diagnostics record before retrying the model. Do not paper over the task result in the Xiaok UI.
-- The canonical service smoke test is still `node src/server/index.js` plus `GET /health` on port `4400`. If Desktop reports a version or port conflict while manual startup succeeds, first inspect Desktop service lifecycle/probing logs; v1.4.8 can replace stale or mismatched KSwarm processes during startup.
-- No KSwarm API or data model migration is required for the Xiaok v1.4.8 README baseline. The active packaged sidecar remains KSwarm `0.9.0`, including suspend/resume recovery and durable parallel workflow contracts.
+- The canonical service smoke test is still `node src/server/index.js` plus `GET /health` on port `4400`. If Desktop reports a version or port conflict while manual startup succeeds, first inspect Desktop service lifecycle/probing logs; v1.4.9 can replace stale or mismatched KSwarm processes during startup.
+- No KSwarm API or data model migration is required for the Xiaok v1.4.9 README baseline. The active packaged sidecar is KSwarm `0.9.1`, including suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
+
+## What's New in v0.9.1
+
+- **PO Review Verdict Tolerance** — When PO explicitly passes a review, missing evidence format (verdict field) no longer blocks the task. The review gate now treats an explicit pass without a structured verdict as a valid approval instead of rejecting the submission.
+- **Resume Workflow Strategy** — `handleContinueProject` now supports the `resume_workflow` strategy for blocked script-generated workflows. Previously blocked workflows can be unblocked and resumed without restarting from scratch.
 
 ## What's New in v0.8.2
 
@@ -249,6 +254,8 @@ npm run test:e2e-p0   # P0 integration scenarios
 ---
 
 ## Version History
+
+**v0.9.1** — PO review and workflow resume fix: when PO explicitly passes a review, missing evidence format (verdict field) no longer blocks the task; `handleContinueProject` supports `resume_workflow` strategy for blocked script-generated workflows, allowing them to be unblocked and resumed without restarting from scratch.
 
 **v0.9.0** — Parallel dispatch and interruption recovery: desktop worker concurrency unlocked from 1 to configurable max (default 3, range 1-10 via `KSWARM_MAX_WORKER_INSTANCES` env or desktop config); `suspendedAt` task marker for graceful sleep/shutdown with automatic lease-refresh resume; `defer_recovery` action with 20s grace period for agents not yet online; `systemSuspended` flag suppresses watchdog and recovery during host sleep; atomic state persistence via temp-file-and-rename; stalled-run watchdog defaults bumped to 5-minute heartbeat timeout and 20-minute max run time; `/runtime/suspend` and `/runtime/resume` endpoints for Electron powerMonitor integration; SIGTERM graceful shutdown marks active tasks suspended before exit.
 
