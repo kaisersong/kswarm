@@ -2611,6 +2611,8 @@ async function doTask(taskId, payload) {
     title,
     artifactContent: selectSemanticOutputSourceContent(taskContract, artifactContent, dependencyArtifacts),
     requiredOutputs: taskContract.requiredOutputs,
+    projectId,
+    projectName,
   });
   const shouldWriteMarkdownArtifact = !hasReferencedArtifactManifest && (
     semanticOutputArtifacts.length === 0 ||

@@ -114,6 +114,105 @@ test('cleans internal review and revision markers from user-facing report HTML',
   assert.ok(!html.includes('不采纳：'));
 });
 
+// ─── v2.1 JSON-LD embed tests (#9-#12) ───────────────────────────
+
+test('#9 HTML 注入点：<head> 内含 <script type="application/ld+json">', () => {
+  const html = buildReportHtmlFromMarkdown({
+    title: 'JSON-LD Test',
+    markdown: '## hi',
+    generatedAt: '2026-06-17T10:00:00.000Z',
+    taskId: 'task-001',
+    projectId: 'proj-abc',
+    projectName: 'Test Project',
+  });
+  // script tag must exist
+  assert.ok(html.includes('<script type="application/ld+json">'), 'must contain ld+json script tag');
+  // must be inside <head>
+  const headStart = html.indexOf('<head>');
+  const headEnd = html.indexOf('</head>');
+  const scriptIdx = html.indexOf('<script type="application/ld+json">');
+  assert.ok(headStart >= 0 && headEnd > headStart, 'must have <head>...</head>');
+  assert.ok(scriptIdx > headStart && scriptIdx < headEnd, 'JSON-LD script must be inside <head>');
+});
+
+test('#10 HTML round-trip: 提取 script 内容 → 反转 <\\/ → JSON.parse 字段正确', () => {
+  const html = buildReportHtmlFromMarkdown({
+    title: 'Round Trip',
+    markdown: '## hi',
+    generatedAt: '2026-06-17T10:00:00.000Z',
+    taskId: 'task-001',
+    projectId: 'proj-abc',
+    projectName: 'P',
+  });
+  const m = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  assert.ok(m, 'must match script tag content');
+  // reverse the </ -> <\/ escape
+  const unescaped = m[1].replace(/<\\\//g, '</');
+  const obj = JSON.parse(unescaped);
+  assert.equal(obj['@context'], 'http://schema.org/');
+  assert.equal(obj['@type'], 'Report');
+  assert.equal(obj.name, 'Round Trip');
+  assert.equal(obj.dateCreated, '2026-06-17T10:00:00.000Z');
+  assert.equal(obj['@id'], 'https://xiaok.app/id/project/proj-abc/task/task-001/report');
+  assert.equal(obj.isPartOf.name, 'P');
+});
+
+test('#11 向后兼容：不传新参数（taskId/projectId/projectName）时仍生成合法 HTML', () => {
+  const html = buildReportHtmlFromMarkdown({
+    title: 'Legacy Caller',
+    markdown: '## hi',
+    generatedAt: '2026-06-17T10:00:00.000Z',
+  });
+  // body still rendered
+  assert.ok(html.includes('<h1>Legacy Caller</h1>') || html.includes('<h2>hi</h2>'));
+  // JSON-LD should still be injected (with minimal fields)
+  assert.ok(html.includes('<script type="application/ld+json">'));
+  const m = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  const unescaped = m[1].replace(/<\\\//g, '</');
+  const obj = JSON.parse(unescaped);
+  assert.equal(obj.name, 'Legacy Caller');
+  assert.equal(obj['@id'], undefined, '缺 projectId+taskId 时 @id 应省略');
+  assert.equal(obj.isPartOf, undefined, '缺 projectId 时 isPartOf 应省略');
+  assert.equal(obj.creator['@type'], 'Organization');
+});
+
+test('#12 buildSemanticOutputArtifacts 集成：传 projectId/projectName 后 HTML 含 isPartOf', () => {
+  const artifacts = buildSemanticOutputArtifacts({
+    taskId: 'proj-1__item-1',
+    title: '集成测试报告',
+    artifactContent: '# 集成测试报告\n\n## 说明\n这是 v2.1 集成测试。',
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    generatedAt: '2026-06-17T12:00:00.000Z',
+    projectId: 'proj-1',
+    projectName: 'Integration Test Project',
+  });
+  assert.equal(artifacts.length, 1);
+  const html = artifacts[0].content;
+  const m = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  assert.ok(m, 'JSON-LD script tag must exist');
+  const obj = JSON.parse(m[1].replace(/<\\\//g, '</'));
+  assert.equal(obj.isPartOf['@id'], 'https://xiaok.app/id/project/proj-1');
+  assert.equal(obj.isPartOf.name, 'Integration Test Project');
+  assert.equal(obj['@id'], 'https://xiaok.app/id/project/proj-1/task/proj-1__item-1/report');
+});
+
+test('#12b buildSemanticOutputArtifacts 不传 projectId/projectName：JSON-LD 退化为 minimal', () => {
+  const artifacts = buildSemanticOutputArtifacts({
+    taskId: 'proj-2__item-1',
+    title: '无 project 信息报告',
+    artifactContent: '# 无 project 信息报告',
+    requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
+    generatedAt: '2026-06-17T12:00:00.000Z',
+  });
+  assert.equal(artifacts.length, 1);
+  const html = artifacts[0].content;
+  const m = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+  const obj = JSON.parse(m[1].replace(/<\\\//g, '</'));
+  assert.equal(obj.isPartOf, undefined);
+  assert.equal(obj['@id'], undefined);
+  assert.equal(obj.name, '无 project 信息报告');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

@@ -1,4 +1,5 @@
 import { canonicalizeOutputType } from './output-types.js';
+import { buildReportJsonLd, escapeJsonLdForHtml } from './artifact-jsonld.js';
 
 const REPORT_TEMPLATE_MARKER = 'data-template="kai-report-creator"';
 
@@ -14,12 +15,14 @@ export function buildSemanticOutputArtifacts({
   artifactContent = '',
   requiredOutputs = [],
   generatedAt = new Date().toISOString(),
+  projectId,
+  projectName,
 } = {}) {
   const artifacts = [];
   if (hasRequiredOutputType(requiredOutputs, 'report_html')) {
     artifacts.push({
       filename: `${taskId}-report.html`,
-      content: buildReportHtmlFromMarkdown({ title, markdown: artifactContent, generatedAt }),
+      content: buildReportHtmlFromMarkdown({ title, markdown: artifactContent, generatedAt, taskId, projectId, projectName }),
       previewable: true,
       mimeType: 'text/html',
       semanticOutput: 'report_html',
@@ -28,10 +31,25 @@ export function buildSemanticOutputArtifacts({
   return artifacts;
 }
 
-export function buildReportHtmlFromMarkdown({ title = 'Report', markdown = '', generatedAt = new Date().toISOString() } = {}) {
+export function buildReportHtmlFromMarkdown({
+  title = 'Report',
+  markdown = '',
+  generatedAt = new Date().toISOString(),
+  taskId,
+  projectId,
+  projectName,
+} = {}) {
   const cleanTitle = sanitizeUserFacingDeliverableTitle(title);
   const cleanMarkdown = sanitizeUserFacingDeliverableMarkdown(markdown);
   const body = renderMarkdownSubset(cleanMarkdown);
+  const jsonLd = buildReportJsonLd({
+    taskId,
+    title: cleanTitle,
+    generatedAt,
+    projectId,
+    projectName,
+  });
+  const jsonLdTag = `    <script type="application/ld+json">${escapeJsonLdForHtml(jsonLd)}</script>`;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -53,6 +71,7 @@ export function buildReportHtmlFromMarkdown({ title = 'Report', markdown = '', g
     th { background: #f0f3f7; }
     code { background: #eef2f6; padding: 2px 5px; border-radius: 4px; }
   </style>
+${jsonLdTag}
 </head>
 <body>
   <main ${REPORT_TEMPLATE_MARKER}>
