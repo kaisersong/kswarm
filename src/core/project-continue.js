@@ -45,6 +45,22 @@ export function handleContinueProjectCore({
     });
   }
 
+  const strategy = intervention.primaryAction?.strategy || 'needs_conversation';
+
+  if (strategy === 'resume_workflow') {
+    const resumeResult = {
+      ok: true,
+      action: 'continue_project',
+      strategy: 'resume_workflow',
+      workflowRunId: intervention.workflowRunId || intervention.primaryAction?.params?.resumeWorkflowRunId || null,
+      resumed: true,
+    };
+    return remember(project, idempotencyKey, {
+      ...resumeResult,
+      ...outcomeFields('advanced', { projectChanged: true }),
+    });
+  }
+
   const task = board.getTask(intervention.primaryTaskId);
   if (!task) {
     return withOutcome({ ok: false, error: 'task_not_found', status: 404 }, 'not_advanced');
@@ -53,7 +69,6 @@ export function handleContinueProjectCore({
   const stale = validateExpectedState(task, request, intervention);
   if (!stale.ok) return withOutcome(stale, 'not_advanced');
 
-  const strategy = intervention.primaryAction?.strategy || 'needs_conversation';
   if (strategy === 'needs_conversation') {
     return remember(project, idempotencyKey, {
       ok: false,
