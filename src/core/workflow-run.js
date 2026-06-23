@@ -162,7 +162,9 @@ export function applyWorkflowEvent(run, event = {}, { now = Date.now() } = {}) {
     node.startedAt = node.startedAt || now;
     node.assignedAgent = event.assignedAgent || node.assignedAgent || null;
     node.attempt = Number.isFinite(Number(event.attempt)) ? Number(event.attempt) : ((node.attempt || 0) + 1);
-    node.input = clonePlainValue(event.input || node.input || null);
+    const persistInput = event.input ? { ...event.input } : (node.input || null);
+    if (persistInput) delete persistInput.upstreamOutputs;
+    node.input = clonePlainValue(persistInput);
     node.runtime = {
       ...(node.runtime || {}),
       handoffId: event.handoffId || node.runtime?.handoffId || null,

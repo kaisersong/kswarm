@@ -2,7 +2,7 @@ const ALLOWED_NODE_KINDS = new Set(['agent', 'review', 'reduce', 'artifact_check
 const ALLOWED_CHECK_KINDS = new Set(['schema', 'file_exists', 'test_command', 'renderer_metadata', 'budget', 'permission', 'artifact_path']);
 const ALLOWED_DISAGREEMENT_POLICIES = new Set(['block', 'adversarial_review', 'human_review']);
 const ALLOWED_GATE_STATUSES = new Set(['passed', 'needs_rework', 'needs_replanning', 'needs_rubric_clarification', 'blocked']);
-const NODE_MUTATION_KEYS = ['taskMutations', 'workflowGraphMutation', 'projectStatus'];
+const NODE_MUTATION_KEYS = ['taskMutations', 'workflowGraphMutation', 'projectStatus', 'upstreamOutputs'];
 const DECISION_MUTATION_KEYS = ['taskStatus', 'artifactStatus', 'suggestedTaskMutations'];
 
 export function validateWorkflowSpec(spec = {}, { policy = null, capabilities = [] } = {}) {

@@ -2324,6 +2324,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     required = true,
     outputSchema = null,
     evidenceRequired = false,
+    dependsOn = [],
     now = Date.now(),
   } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
@@ -2343,13 +2344,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const phase = phaseState.phase;
     const nodeId = allocateScriptAgentNodeId(workflowRun);
     const title = readWorkflowString(label) || `动态任务 ${nodeId.replace(/^script-agent-/, '')}`;
+    const resolvedDepsOn = Array.isArray(dependsOn) ? dependsOn : [];
+    const allDepsCompleted = resolvedDepsOn.length > 0
+      ? resolvedDepsOn.every(depId => {
+          const dep = workflowRun.nodes.find(n => n.id === depId);
+          return dep && dep.status === 'completed';
+        })
+      : true;
     const node = {
       id: nodeId,
       phaseId: phase.id,
       title,
-      status: 'ready',
+      status: resolvedDepsOn.length === 0 || allDepsCompleted ? 'ready' : 'pending',
       kind: 'agent_task',
-      dependsOn: [],
+      dependsOn: resolvedDepsOn,
       assignedAgent: workerAgent,
       attempt: 0,
       input: {
@@ -2410,23 +2418,38 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         lastNodeCreatedAt: now,
       },
     };
-    const dispatched = dispatchWorkflowNode(withNode, nodeId, {
-      assignedAgent: workerAgent,
-      input: node.input,
-      now,
-    });
-    workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+    // Only dispatch immediately if node is ready (no pending dependencies)
+    if (node.status === 'ready') {
+      const dispatched = dispatchWorkflowNode(withNode, nodeId, {
+        assignedAgent: workerAgent,
+        input: node.input,
+        now,
+      });
+      workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+      eventLog.emit('workflow.script.node.created', {
+        projectId: dispatched.workflowRun.projectId,
+        workflowRunId,
+        workflowId: dispatched.workflowRun.workflowId,
+        nodeId,
+        phaseId: phase.id,
+        phaseTitle: phase.title,
+        assignedAgent: workerAgent,
+      });
+      emitWorkflowDispatchEvents(dispatched.workflowRun.projectId, dispatched.dispatches);
+      return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
+    }
+    // Node is pending (has unmet dependsOn) — persist but don't dispatch yet
+    workflowRuns.set(withNode.id, withNode);
     eventLog.emit('workflow.script.node.created', {
-      projectId: dispatched.workflowRun.projectId,
+      projectId: withNode.projectId,
       workflowRunId,
-      workflowId: dispatched.workflowRun.workflowId,
+      workflowId: withNode.workflowId,
       nodeId,
       phaseId: phase.id,
       phaseTitle: phase.title,
       assignedAgent: workerAgent,
     });
-    emitWorkflowDispatchEvents(dispatched.workflowRun.projectId, dispatched.dispatches);
-    return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
+    return { ok: true, workflowRun: withNode, nodeId, dispatches: [] };
   }
 
   function retryWorkflowScriptAgentNode(workflowRunId, { nodeId, assignedAgent = null, now = Date.now() } = {}) {
@@ -2939,7 +2962,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (!node || !['ready', 'pending'].includes(node.status)) return { workflowRun, dispatches: [] };
     const attempt = (node.attempt || 0) + 1;
     const handoffId = `wfhd-${workflowRun.id}-${nodeId}-${attempt}`;
-    const nodeInput = enrichWorkflowNodeInput(workflowRun, input || node.input || null);
+    const nodeInput = enrichWorkflowNodeInput(workflowRun, input || node.input || null, { nodeId });
     const next = applyWorkflowEvent(workflowRun, {
       type: 'node_dispatched',
       nodeId,
@@ -2961,12 +2984,102 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         targetParticipantId: updatedNode?.assignedAgent || assignedAgent || null,
         attempt,
         handoffId,
-        input: updatedNode?.input || null,
+        input: nodeInput,
       }],
     };
   }
-  function enrichWorkflowNodeInput(workflowRun, input = null) {
+  const INLINE_MAX_CHARS = 2000;
+  const MAX_PER_NODE_COMPACT_CHARS = 4000;
+  const MAX_TOTAL_UPSTREAM_CHARS = 10000;
+  const COMPACT_EXCLUDE_KEYS = new Set(['summary', 'artifacts', 'artifactManifest', 'producerAgent', 'producedAt', 'upstreamOutputs']);
+  const MIN_USEFUL_SUMMARY_LENGTH = 10;
+
+  function compactNodeOutput(node) {
+    try {
+      const output = node?.output;
+      if (!output || typeof output !== 'object' || Array.isArray(output)) return null;
+
+      const compact = { nodeId: node.id, nodeTitle: node.title || node.id };
+
+      if (typeof output.summary === 'string' && output.summary.trim().length >= MIN_USEFUL_SUMMARY_LENGTH) {
+        compact.summary = output.summary;
+      }
+
+      const paths = [];
+      if (Array.isArray(output.artifacts)) {
+        for (const a of output.artifacts) {
+          const p = a?.path || a?.relativePath;
+          if (p) paths.push(p);
+        }
+      }
+      if (Array.isArray(output.artifactManifest)) {
+        for (const a of output.artifactManifest) {
+          const p = a?.path || a?.relativePath;
+          if (p) paths.push(p);
+        }
+      }
+      const uniquePaths = [...new Set(paths)];
+      if (uniquePaths.length > 0) compact.artifactPaths = uniquePaths;
+
+      let inlineChars = 0;
+      for (const [key, val] of Object.entries(output)) {
+        if (COMPACT_EXCLUDE_KEYS.has(key)) continue;
+        if (inlineChars >= MAX_PER_NODE_COMPACT_CHARS) break;
+        try {
+          const serialized = JSON.stringify(val);
+          if (serialized === undefined) continue;
+          if (serialized.length > INLINE_MAX_CHARS) continue;
+          if (inlineChars + serialized.length > MAX_PER_NODE_COMPACT_CHARS) break;
+          compact[key] = val;
+          inlineChars += serialized.length;
+        } catch { continue; }
+      }
+
+      if (!compact.summary && !compact.artifactPaths && inlineChars === 0) return null;
+      return compact;
+    } catch { return null; }
+  }
+
+  function enrichWorkflowNodeInput(workflowRun, input = null, { nodeId = null } = {}) {
     const base = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : { value: input };
+
+    let upstreamOutputs = null;
+    try {
+      if (nodeId) {
+        const node = workflowRun.nodes.find(n => n.id === nodeId);
+        const deps = node?.dependsOn;
+        if (Array.isArray(deps) && deps.length > 0) {
+          const sortedDeps = deps.length > 3 ? [...deps].sort() : deps;
+          const collected = {};
+          let totalChars = 0;
+          for (const depId of sortedDeps) {
+            const depNode = workflowRun.nodes.find(n => n.id === depId);
+            if (!depNode || depNode.status !== 'completed' || !depNode.output) continue;
+            const compact = compactNodeOutput(depNode);
+            if (!compact) continue;
+            try {
+              const size = JSON.stringify(compact).length;
+              if (totalChars + size > MAX_TOTAL_UPSTREAM_CHARS) {
+                collected[depId] = {
+                  nodeId: depNode.id,
+                  nodeTitle: depNode.title || depNode.id,
+                  summary: typeof depNode.output.summary === 'string' ? depNode.output.summary : null,
+                  artifactPaths: compact.artifactPaths || null,
+                  _truncated: true,
+                };
+              } else {
+                collected[depId] = compact;
+                totalChars += size;
+              }
+            } catch {
+              collected[depId] = { nodeId: depNode.id, nodeTitle: depNode.title || depNode.id, _truncated: true };
+            }
+          }
+          if (Object.keys(collected).length > 0) upstreamOutputs = collected;
+        }
+      }
+    } catch { upstreamOutputs = null; }
+
     return {
       ...base,
       workflowRunId: workflowRun.id,
@@ -2977,6 +3090,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
         taskId: workflowRun.scope?.taskId || null,
       },
       sourceTask: base.sourceTask || workflowRun.sourceTask || null,
+      ...(upstreamOutputs ? { upstreamOutputs } : {}),
     };
   }
   function validateWorkflowNodeHandoff({ workflowRunId, nodeId, attempt, handoffId, allowRunningOnly = true } = {}) {
