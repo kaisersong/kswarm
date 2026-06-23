@@ -3032,12 +3032,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
           if (inlineChars + serialized.length > MAX_PER_NODE_COMPACT_CHARS) break;
           compact[key] = val;
           inlineChars += serialized.length;
-        } catch { continue; }
+        } catch (fieldErr) {
+          if (!silent) console.warn(`[hub] compactNodeOutput: skipping field "${key}" on node ${node.id}:`, fieldErr?.message || fieldErr);
+          continue;
+        }
       }
 
       if (!compact.summary && !compact.artifactPaths && inlineChars === 0) return null;
       return compact;
-    } catch { return null; }
+    } catch (err) {
+      if (!silent) console.warn(`[hub] compactNodeOutput failed for node ${node?.id}:`, err?.message || err);
+      return null;
+    }
   }
 
   function enrichWorkflowNodeInput(workflowRun, input = null, { nodeId = null } = {}) {
@@ -3071,14 +3077,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
                 collected[depId] = compact;
                 totalChars += size;
               }
-            } catch {
+            } catch (compactErr) {
+              if (!silent) console.warn(`[hub] enrichWorkflowNodeInput: compact size check failed for dep ${depId}:`, compactErr?.message || compactErr);
               collected[depId] = { nodeId: depNode.id, nodeTitle: depNode.title || depNode.id, _truncated: true };
             }
           }
           if (Object.keys(collected).length > 0) upstreamOutputs = collected;
         }
       }
-    } catch { upstreamOutputs = null; }
+    } catch (err) {
+      if (!silent) console.warn('[hub] enrichWorkflowNodeInput: upstream collection failed, skipping:', err?.message || err);
+      upstreamOutputs = null;
+    }
 
     return {
       ...base,
