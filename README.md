@@ -8,14 +8,18 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Xiaok Desktop v1.4.11 Integration Baseline
+## Xiaok Desktop v1.4.14 Integration Baseline
 
-- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.11. Desktop owns service startup, health/version probing, user-facing diagnostics, and the Automations UI; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
-- Xiaok Automations can now put scheduled tasks, user loops, and diagnostics in one product surface. KSwarm still supplies project/workflow facts for project-backed loops, while Desktop records the schedule/loop run linkage and user-loop outputs.
+- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.14. Desktop owns service startup, health/version probing, user-facing diagnostics, and the Automations UI; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
+- **Workflow nodes can now automatically receive upstream output**: `enrichWorkflowNodeInput` collects completed upstream node outputs via `dependsOn` edges and injects them into the dispatched input. Desktop `buildKSwarmWorkflowNodePrompt` renders these as a structured "upstream reference" section. All new logic follows degradation-first: any failure skips injection silently (never blocks dispatch).
 - Completion evidence is consumed by Xiaok loop diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records remain the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
-- When a desktop run reports "task completed without artifact evidence", treat it as a cross-layer evidence problem: inspect KSwarm project deliverables, task artifact manifests, workflow node provenance, and the Xiaok loop diagnostics record before retrying the model. Do not paper over the task result in the Xiaok UI.
-- The canonical service smoke test is still `node src/server/index.js` plus `GET /health` on port `4400`. If Desktop reports a version or port conflict while manual startup succeeds, first inspect Desktop service lifecycle/probing logs; v1.4.11 can replace stale or mismatched KSwarm processes during startup.
-- No KSwarm API or data model migration is required for the Xiaok v1.4.11 README baseline. The active packaged sidecar is KSwarm `0.9.1`, including suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
+- The active packaged sidecar is KSwarm `0.9.2`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
+
+## What's New in v0.9.2
+
+- **Workflow Node Upstream Output Handoff** — `compactNodeOutput(node)` extracts a structured compact of a completed node's output: summary, artifact paths, and small inline fields (capped per-field 2KB, per-node 4KB). `enrichWorkflowNodeInput(workflowRun, input, { nodeId })` collects all completed `dependsOn` upstream outputs (10KB total cap, graceful summary-only fallback on overflow). `dispatchWorkflowNode` passes the enriched input to broker/desktop but strips `upstreamOutputs` before persisting to node state (derived data, not stored). `dispatchWorkflowScriptAgentNode` gains an optional `{ dependsOn }` parameter for script-created nodes.
+- **Sanitize upstreamOutputs** — `NODE_MUTATION_KEYS` now includes `upstreamOutputs` so agents cannot echo upstream data back as their own output mutation.
+- **Degradation Logging** — All `compactNodeOutput` and `enrichWorkflowNodeInput` catch blocks now emit `console.warn` (gated by silent flag) for observability.
 
 ## What's New in v0.9.1
 

@@ -8,14 +8,18 @@
 
 ---
 
-## Xiaok Desktop v1.4.11 集成基线
+## Xiaok Desktop v1.4.14 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.4.11 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断和自动化界面；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
-- Xiaok 自动化现在把定时任务、用户 loop 和诊断放到同一个产品入口。KSwarm 继续为项目型 loop 提供 project/workflow 事实，Desktop 负责记录 schedule 与 loop run 的关联以及用户 loop 输出。
+- KSwarm 仍是 Xiaok Desktop v1.4.14 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断和自动化界面；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
+- **Workflow 节点现在可以自动接收上游产出**：`enrichWorkflowNodeInput` 通过 `dependsOn` 边收集已完成上游节点的 output 并注入到 dispatched input。Desktop `buildKSwarmWorkflowNodePrompt` 将其渲染为结构化”上游参考”段。所有新逻辑遵循降级优先：任何失败都静默跳过注入（不阻塞 dispatch）。
 - Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
-- 如果桌面端报告 “task completed without artifact evidence”，应按跨层 evidence 问题排查：先看 KSwarm 项目交付物、任务 artifact manifest、workflow node provenance，再看 Xiaok loop diagnostics 记录，最后才重试模型。不要在 Xiaok UI 层粉饰任务结果。
-- 标准服务 smoke test 仍是 `node src/server/index.js` 加端口 `4400` 的 `GET /health`。如果 Desktop 报版本或端口冲突，但手动启动成功，应优先检查 Desktop service lifecycle / probing 日志；v1.4.11 启动时可以替换旧版或不匹配的 KSwarm 进程。
-- 本次 Xiaok v1.4.11 README 基线不要求 KSwarm API 或数据模型迁移。当前随包 sidecar 为 KSwarm `0.9.1`，包含 suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
+- 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
+
+## v0.9.2 新特性
+
+- **Workflow 节点间上游 Output 传递**：`compactNodeOutput(node)` 提取已完成节点的结构化 compact（摘要 + 产物路径 + 小字段，单字段 ≤2KB，单节点 ≤4KB）。`enrichWorkflowNodeInput(workflowRun, input, { nodeId })` 收集所有已完成 `dependsOn` 上游（总量 10KB cap，溢出优雅降级为 summary-only）。`dispatchWorkflowNode` 把含 `upstreamOutputs` 的 enriched input 传给 broker/desktop，但持久化前 strip 掉（派生数据不落盘）。`dispatchWorkflowScriptAgentNode` 新增可选 `{ dependsOn }` 参数。
+- **Sanitize upstreamOutputs**：`NODE_MUTATION_KEYS` 增加 `upstreamOutputs`，agent 不能把上游数据 echo 回自己的 output mutation。
+- **降级日志**：`compactNodeOutput` 和 `enrichWorkflowNodeInput` 的所有 catch 块现在输出 `console.warn`（由 silent 标志控制）。
 
 ## v0.9.1 新特性
 
