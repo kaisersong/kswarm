@@ -182,6 +182,8 @@ test('script-generated project workflow delivers project state from artifact evi
 
     const deliveredProject = hub.getProject('proj-script-delivery');
     assert.equal(deliveredProject.status, 'delivered');
+    assert.equal(deliveredProject.closedAt, null);
+    assert.equal(deliveredProject.closedBy, null);
     assert.equal(deliveredProject.deliverable.summary, '动态 workflow 已生成验证报告。');
     assert.equal(deliveredProject.deliverable.artifacts[0].path, 'artifacts/verification-report.md');
     assert.equal(deliveredProject.deliverable.provenance.runtimeSource, 'kswarm-script-workflow');
@@ -192,6 +194,7 @@ test('script-generated project workflow delivers project state from artifact evi
     assert.equal(tasks[0].result.artifacts[0].path, 'artifacts/verification-report.md');
     assert.equal(tasks[0].result.provenance.runtimeSource, 'kswarm-script-workflow');
     assert.equal(tasks[0].completedBy, 'script_workflow');
+    assert.equal(hub.getEventLog().getEvents().some(event => event.type === 'project.closed'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

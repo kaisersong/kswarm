@@ -11,13 +11,15 @@
  */
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { createBrokerClient } from '../net/broker-client.js';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
-import { basename, join, extname } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { basename, join, extname, dirname, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
 import { createHeartbeatManager } from '../core/heartbeat-manager.js';
@@ -74,6 +76,7 @@ const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const RUNTIME_TOKEN = process.env.KSWARM_RUNTIME_TOKEN || '';
 const MAX_SUSPEND_MS = 300_000;
+const SERVICE_ENTRY_PATH = resolve(fileURLToPath(import.meta.url));
 const SERVICE_FEATURES = [
   'dynamic_workflows',
   'workflow_proposals',
@@ -83,9 +86,51 @@ const SERVICE_FEATURES = [
   'workflow_budget_cache_recovery',
   'workflow_script_generated_runs',
 ];
+const WORKFLOW_CAPABILITIES = {
+  schemaVersion: 'kswarm_workflow_patterns_v1',
+  compiledContract: true,
+  patternPublicView: true,
+};
 const runtimeInstancePool = createRuntimeInstancePool({
   maxWorkerInstances: Math.max(1, Math.min(10, Number(process.env.KSWARM_MAX_WORKER_INSTANCES) || DEFAULT_MAX_WORKER_INSTANCES)),
 });
+let cachedServiceSourceHash;
+
+function computeServiceSourceHash() {
+  if (cachedServiceSourceHash !== undefined) return cachedServiceSourceHash;
+  const sourceRoot = dirname(dirname(SERVICE_ENTRY_PATH));
+  try {
+    const hash = createHash('sha256');
+    const visit = dir => {
+      const entries = readdirSync(dir, { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(path);
+          continue;
+        }
+        if (!entry.isFile() || !/\.(js|json)$/.test(entry.name)) continue;
+        hash.update(relative(sourceRoot, path));
+        hash.update('\0');
+        hash.update(readFileSync(path));
+        hash.update('\0');
+      }
+    };
+    visit(sourceRoot);
+    cachedServiceSourceHash = hash.digest('hex');
+  } catch {
+    cachedServiceSourceHash = null;
+  }
+  return cachedServiceSourceHash;
+}
+
+function getServiceIdentity() {
+  return {
+    entryPath: SERVICE_ENTRY_PATH,
+    sourceHash: computeServiceSourceHash(),
+  };
+}
 
 // Project workspace base — each project gets its own folder
 const KSWARM_HOME = join(homedir(), '.kswarm');
@@ -1587,7 +1632,14 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES });
+      return json(res, {
+        ok: true,
+        brokerConnected,
+        projects: hub.listProjects().length,
+        features: SERVICE_FEATURES,
+        workflowCapabilities: WORKFLOW_CAPABILITIES,
+        service: getServiceIdentity(),
+      });
     }
 
     // ── Runtime power control (localhost only) ──
