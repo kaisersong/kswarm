@@ -16,7 +16,7 @@ import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { createBrokerClient } from '../net/broker-client.js';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
-import { basename, join, extname } from 'node:path';
+import { basename, join, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
@@ -1506,7 +1506,9 @@ async function forceRestartAgent(agentId) {
 // ─── Artifact helpers ─────────────────────────────────────────────
 const MIME_TYPES = {
   '.html': 'text/html',
+  '.htm': 'text/html',
   '.md': 'text/markdown',
+  '.markdown': 'text/markdown',
   '.json': 'application/json',
   '.txt': 'text/plain',
   '.pdf': 'application/pdf',
@@ -1520,7 +1522,45 @@ const MIME_TYPES = {
 };
 
 function getPreviewable(ext) {
-  return ['.html', '.md', '.json', '.txt', '.svg', '.png', '.jpg'].includes(ext);
+  return ['.html', '.htm', '.md', '.markdown', '.json', '.txt', '.svg', '.png', '.jpg'].includes(ext);
+}
+
+const TEXT_EDITABLE_ARTIFACT_EXTENSIONS = new Set(['.html', '.htm', '.md', '.markdown', '.json', '.txt', '.svg']);
+
+function resolveProjectArtifactFile(artifactsDir, rawPath) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(rawPath || '');
+  } catch {
+    return { error: 'invalid_artifact_path' };
+  }
+
+  const normalized = decoded.replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  if (
+    !normalized ||
+    normalized.startsWith('/') ||
+    segments.some(segment => !segment || segment === '.' || segment === '..')
+  ) {
+    return { error: 'invalid_artifact_path' };
+  }
+
+  const baseDir = resolve(artifactsDir);
+  const filePath = resolve(baseDir, normalized);
+  const rel = relative(baseDir, filePath);
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+    return { error: 'invalid_artifact_path' };
+  }
+
+  return {
+    filePath,
+    artifactPath: normalized,
+    filename: basename(normalized),
+  };
+}
+
+function encodeArtifactRoutePath(artifactPath) {
+  return artifactPath.split('/').map(part => encodeURIComponent(part)).join('/');
 }
 
 // ─── Plan rendering helper ───────────────────────────────────────
@@ -2842,11 +2882,12 @@ async function handleRequest(req, res) {
     const projArtifactMatch = path.match(/^\/projects\/([^/]+)\/artifacts\/(.+)$/);
     if (projArtifactMatch && req.method === 'GET') {
       const ws = getProjectWorkspace(projArtifactMatch[1]);
-      const filename = projArtifactMatch[2];
-      const filePath = join(ws.artifacts, filename);
+      const resolvedArtifact = resolveProjectArtifactFile(ws.artifacts, projArtifactMatch[2]);
+      if (resolvedArtifact.error) return json(res, { error: resolvedArtifact.error }, 400);
+      const { filePath, filename, artifactPath } = resolvedArtifact;
       if (!existsSync(filePath)) return json(res, { error: 'not_found' }, 404);
 
-      const ext = extname(filename);
+      const ext = extname(artifactPath);
       const mime = MIME_TYPES[ext] || 'application/octet-stream';
       const content = readFileSync(filePath);
 
@@ -2856,6 +2897,39 @@ async function handleRequest(req, res) {
         'Access-Control-Allow-Origin': '*',
       });
       return res.end(content);
+    }
+
+    // ── Artifacts: update text file (per-project) ──
+    if (projArtifactMatch && req.method === 'PUT') {
+      const projectId = projArtifactMatch[1];
+      const ws = getProjectWorkspace(projectId);
+      const resolvedArtifact = resolveProjectArtifactFile(ws.artifacts, projArtifactMatch[2]);
+      if (resolvedArtifact.error) return json(res, { ok: false, error: resolvedArtifact.error }, 400);
+      const { filePath, artifactPath, filename } = resolvedArtifact;
+      if (!existsSync(filePath)) return json(res, { ok: false, error: 'not_found' }, 404);
+
+      const ext = extname(artifactPath).toLowerCase();
+      if (!TEXT_EDITABLE_ARTIFACT_EXTENSIONS.has(ext)) {
+        return json(res, { ok: false, error: 'unsupported_artifact_type' }, 415);
+      }
+
+      const body = await parseBody(req);
+      if (typeof body.content !== 'string') {
+        return json(res, { ok: false, error: 'content_required' }, 400);
+      }
+
+      writeFileSync(filePath, body.content, 'utf-8');
+      log('info', `Project artifact updated: ${artifactPath}`, { projectId, path: filePath });
+      return json(res, {
+        ok: true,
+        artifact: createArtifactRecord({
+          filename,
+          url: `/projects/${encodeURIComponent(projectId)}/artifacts/${encodeArtifactRoutePath(artifactPath)}`,
+          path: filePath,
+          previewable: getPreviewable(ext),
+          mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+        }),
+      });
     }
 
     // ── Artifacts: serve global file (legacy) ──
