@@ -34,6 +34,20 @@ function createActiveProject(hub, id = 'proj-script') {
   return project;
 }
 
+function approveFirstCandidate(hub, projectId, key) {
+  const candidate = hub.listFinalDeliverables(projectId)[0];
+  assert.ok(candidate, 'expected final deliverable candidate');
+  return hub.approveFinalDeliverable(projectId, candidate.deliverableId, {
+    approvalIdempotencyKey: key,
+    expectedProjectVersion: hub.getProjectLifecycle(projectId).version,
+  }, {
+    requestSource: 'user',
+    actorId: 'desktop-user',
+    actorKind: 'desktop_user',
+    transport: 'desktop_ipc',
+  });
+}
+
 function makePreview(projectId = 'proj-script') {
   return {
     ok: true,
@@ -178,20 +192,26 @@ test('script-generated project workflow delivers project state from artifact evi
     assert.equal(finished.ok, true);
     assert.equal(finished.workflowRun.status, 'completed');
     assert.equal(finished.workflowRun.gateDecision.status, 'passed');
-    assert.equal(finished.workflowRun.projectDelivery.status, 'delivered');
+    assert.equal(finished.workflowRun.projectDelivery.status, 'candidate');
 
     const deliveredProject = hub.getProject('proj-script-delivery');
-    assert.equal(deliveredProject.status, 'delivered');
-    assert.equal(deliveredProject.deliverable.summary, '动态 workflow 已生成验证报告。');
-    assert.equal(deliveredProject.deliverable.artifacts[0].path, 'artifacts/verification-report.md');
-    assert.equal(deliveredProject.deliverable.provenance.runtimeSource, 'kswarm-script-workflow');
-    assert.equal(deliveredProject.deliverable.provenance.workflowRunId, started.workflowRun.id);
+    assert.equal(deliveredProject.status, 'active');
+    assert.equal(hub.getProjectLifecycle('proj-script-delivery').state, 'ready_to_deliver');
+    const candidate = hub.listFinalDeliverables('proj-script-delivery')[0];
+    assert.equal(candidate.status, 'candidate');
+    assert.equal(candidate.source, 'script_workflow');
+    assert.equal(candidate.workflowRunId, started.workflowRun.id);
 
     const tasks = hub.getBoard('proj-script-delivery').getAllTasks();
     assert.deepEqual(tasks.map(task => task.status), ['done']);
     assert.equal(tasks[0].result.artifacts[0].path, 'artifacts/verification-report.md');
     assert.equal(tasks[0].result.provenance.runtimeSource, 'kswarm-script-workflow');
     assert.equal(tasks[0].completedBy, 'script_workflow');
+
+    const approved = approveFirstCandidate(hub, 'proj-script-delivery', 'approve-script-delivery');
+    assert.equal(approved.ok, true);
+    assert.equal(hub.getProject('proj-script-delivery').status, 'delivered');
+    assert.equal(hub.getProject('proj-script-delivery').deliverable.provenance.finalDeliverableId, candidate.deliverableId);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -245,17 +265,22 @@ test('script-generated project workflow can deliver from the final agent node wh
 
     assert.equal(finished.ok, true);
     assert.equal(finished.workflowRun.status, 'completed');
-    assert.equal(finished.workflowRun.projectDelivery.status, 'delivered');
+    assert.equal(finished.workflowRun.projectDelivery.status, 'candidate');
 
     const deliveredProject = hub.getProject('proj-script-agent-delivery');
-    assert.equal(deliveredProject.status, 'delivered');
-    assert.equal(deliveredProject.deliverable.summary, 'HTML 报告已生成。');
-    assert.equal(deliveredProject.deliverable.artifacts[0].path, 'artifacts/agent-final-report.html');
-    assert.equal(deliveredProject.deliverable.provenance.producerNodeId, dispatched.nodeId);
+    assert.equal(deliveredProject.status, 'active');
+    const candidate = hub.listFinalDeliverables('proj-script-agent-delivery')[0];
+    assert.equal(candidate.status, 'candidate');
+    assert.equal(candidate.workflowNodeId, dispatched.nodeId);
 
     const tasks = hub.getBoard('proj-script-agent-delivery').getAllTasks();
     assert.deepEqual(tasks.map(task => task.status), ['done']);
     assert.equal(tasks[0].result.artifacts[0].path, 'artifacts/agent-final-report.html');
+
+    const approved = approveFirstCandidate(hub, 'proj-script-agent-delivery', 'approve-script-agent-delivery');
+    assert.equal(approved.ok, true);
+    assert.equal(hub.getProject('proj-script-agent-delivery').status, 'delivered');
+    assert.equal(hub.getProject('proj-script-agent-delivery').deliverable.provenance.producerNodeId, dispatched.nodeId);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -418,10 +443,14 @@ test('blocked script-generated project workflow can redeliver after runtime supp
 
     assert.equal(delivered.ok, true);
     assert.equal(delivered.workflowRun.status, 'completed');
-    assert.equal(delivered.workflowRun.projectDelivery.status, 'delivered');
-    assert.equal(hub.getProject(projectId).status, 'delivered');
-    assert.equal(hub.getProject(projectId).deliverable.artifacts[0].path, 'artifacts/agent-final-report.html');
+    assert.equal(delivered.workflowRun.projectDelivery.status, 'candidate');
+    assert.equal(hub.getProject(projectId).status, 'active');
+    assert.equal(hub.listFinalDeliverables(projectId)[0].status, 'candidate');
     assert.deepEqual(hub.getBoard(projectId).getAllTasks().map(task => task.status), ['done']);
+    const approved = approveFirstCandidate(hub, projectId, 'approve-required-output');
+    assert.equal(approved.ok, true);
+    assert.equal(hub.getProject(projectId).status, 'delivered');
+    assert.equal(hub.getProject(projectId).deliverable.artifacts[0].relativePath, 'artifacts/agent-final-report.html');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -481,9 +510,11 @@ test('restores historical completed script workflow deliveries on hub startup', 
 
     const restoredHub = createHub({ eventLogDir: join(dir, 'restored-events'), dataDir, silent: true });
     const restoredProject = restoredHub.getProject('proj-script-recovered');
-    assert.equal(restoredProject.status, 'delivered');
-    assert.equal(restoredProject.deliverable.artifacts[0].path, 'artifacts/verification-report.md');
-    assert.equal(restoredHub.getWorkflowRun(started.workflowRun.id).projectDelivery.status, 'delivered');
+    assert.equal(restoredProject.status, 'planning');
+    assert.equal(restoredProject.deliverable, null);
+    assert.equal(restoredHub.getWorkflowRun(started.workflowRun.id).projectDelivery.status, 'candidate');
+    assert.equal(restoredHub.getProjectLifecycle('proj-script-recovered').state, 'legacy_needs_reconciliation');
+    assert.equal(restoredHub.listFinalDeliverables('proj-script-recovered')[0].status, 'candidate');
     assert.deepEqual(restoredHub.getBoard('proj-script-recovered').getAllTasks().map(task => task.status), ['done']);
     await new Promise(resolve => setTimeout(resolve, 650));
   } finally {

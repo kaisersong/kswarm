@@ -73,6 +73,7 @@ import { createProjectInstanceId } from '../core/project-id.js';
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const RUNTIME_TOKEN = process.env.KSWARM_RUNTIME_TOKEN || '';
+const DESKTOP_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
 const MAX_SUSPEND_MS = 300_000;
 const SERVICE_FEATURES = [
   'dynamic_workflows',
@@ -1601,11 +1602,27 @@ function parseBody(req) {
   });
 }
 
+function resolveDesktopMutationContext(req) {
+  const token = String(req.headers['x-kswarm-mutation-token'] || '');
+  if (!DESKTOP_MUTATION_TOKEN || token !== DESKTOP_MUTATION_TOKEN) {
+    return { ok: false, error: 'unauthorized_transport' };
+  }
+  return {
+    ok: true,
+    requestContext: {
+      requestSource: 'user',
+      actorId: 'desktop-main',
+      actorKind: 'desktop_user',
+      transport: 'desktop_ipc',
+    },
+  };
+}
+
 function json(res, data, status = 200) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, x-kswarm-mutation-token',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   });
   res.end(JSON.stringify(data));
@@ -1615,7 +1632,7 @@ async function handleRequest(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, x-kswarm-mutation-token',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     });
     return res.end();
@@ -1672,6 +1689,7 @@ async function handleRequest(req, res) {
           doneCount: done,
           stoppedCount: stopped,
           updatedAt: p.updatedAt || p.createdAt || 0,
+          projectLifecycle: hub.getProjectLifecycle(p.id),
           projectIntervention: hub.getProjectIntervention(p.id),
           latestWorkflowRun: hub.listProjectWorkflowRuns(p.id)[0] || null,
         };
@@ -1682,7 +1700,7 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, autoStartPlanning, clientRequestKey } = body;
+      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, startPolicy, requestedStartPolicy, autoStartPlanning, clientRequestKey } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
       const shouldAutoStartPlanning = autoStartPlanning !== false;
       const resolvedPoAgent = poAgent;
@@ -1711,7 +1729,7 @@ async function handleRequest(req, res) {
         }, 200);
       }
       const id = createProjectInstanceId();
-      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection, executionMode, autoAssignPo: shouldAutoStartPlanning, clientRequestKey });
+      const project = hub.createProject({ id, name, goal: goal || '', requirements: requirements || '', planningGuidance: planningGuidance || '', poAgent: resolvedPoAgent, members: resolvedMembers, enableSummary, agentSelection: normalizedAgentSelection, executionMode, requestedStartPolicy: startPolicy || requestedStartPolicy, autoAssignPo: shouldAutoStartPlanning, clientRequestKey });
       
       // Initialize workspace
       const ws = initProjectWorkspace(id, workFolder);
@@ -1768,8 +1786,14 @@ async function handleRequest(req, res) {
       const projectHealth = hub.getProjectHealth(project.id);
       const projectIntervention = hub.getProjectIntervention(project.id);
       const workflowRuns = hub.listProjectWorkflowRuns(project.id);
+      const projectLifecycle = hub.getProjectLifecycle(project.id);
+      const executionGraph = hub.getExecutionGraph(project.id);
+      const deliverables = hub.listFinalDeliverables(project.id);
+      const reviewGateDecisions = hub.listReviewGateDecisions(project.id);
       return json(res, {
         project: { ...project, workFolder: ws.path },
+        projectLifecycle,
+        executionGraph,
         tasks,
         activities,
         humanActions,
@@ -1780,6 +1804,8 @@ async function handleRequest(req, res) {
         projectHealth,
         projectIntervention,
         workflowRuns,
+        deliverables,
+        reviewGateDecisions,
       });
     }
 
@@ -2058,6 +2084,43 @@ async function handleRequest(req, res) {
       }
       broadcast({ type: 'project_prepared', projectId: project.id, preparation, startedPlanning });
       return json(res, { ok: true, preparation, startedPlanning, planningStart });
+    }
+
+    const activateAndStartMatch = path.match(/^\/projects\/([^/]+)\/activate-and-start$/);
+    if (activateAndStartMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
+      const projectId = activateAndStartMatch[1];
+      await refreshBrokerOnlineAgentIds();
+      const result = hub.activateAndStartProject(projectId, {
+        startPolicy: body.startPolicy || body.requestedStartPolicy,
+        idempotencyKey: body.idempotencyKey || body.activationIdempotencyKey,
+        expectedProjectVersion: body.expectedProjectVersion,
+        fromAgent: body.fromAgent,
+        callerRiskHints: body.callerRiskHints || body.riskHints,
+        requestContext: context.requestContext,
+      });
+      if (result.ok) {
+        log('info', `Activated project start policy for ${projectId}`, {
+          phase: result.phase,
+          effectiveStartPolicy: result.startPolicyDecision?.effectiveStartPolicy,
+          dispatched: result.dispatch?.dispatched || [],
+        });
+        broadcast({
+          type: 'project_activated_and_started',
+          projectId,
+          phase: result.phase,
+          startPolicyDecision: result.startPolicyDecision,
+          dispatched: result.dispatch?.dispatched || [],
+          workflowDispatched: result.dispatch?.workflowDispatched || [],
+        });
+        if (result.dispatch?.ok) {
+          await sendBrokerRequestTasks(projectId, result.dispatch.dispatched || []);
+          await sendWorkflowNodeHandoffs(projectId, result.dispatch.workflowNodeDispatches || []);
+        }
+      }
+      return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 400);
     }
 
     // ── Delete project (Human only) ──
@@ -2770,6 +2833,32 @@ async function handleRequest(req, res) {
         }
       }
       return json(res, result);
+    }
+
+    const finalDeliverablesMatch = path.match(/^\/projects\/([^/]+)\/final-deliverables$/);
+    if (finalDeliverablesMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
+      const projectId = finalDeliverablesMatch[1];
+      const result = hub.registerFinalDeliverable(projectId, body || {}, context.requestContext);
+      if (result.ok) {
+        broadcast({ type: 'project_final_deliverable_candidate', projectId, finalDeliverable: result.finalDeliverable });
+      }
+      return json(res, result, result.ok ? 200 : 400);
+    }
+
+    const finalDeliverableApproveMatch = path.match(/^\/projects\/([^/]+)\/final-deliverables\/([^/]+)\/approve$/);
+    if (finalDeliverableApproveMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
+      const [, projectId, deliverableId] = finalDeliverableApproveMatch;
+      const result = hub.approveFinalDeliverable(projectId, deliverableId, body || {}, context.requestContext);
+      if (result.ok) {
+        broadcast({ type: 'project_final_deliverable_approved', projectId, finalDeliverable: result.finalDeliverable, projectLifecycle: result.projectLifecycle });
+      }
+      return json(res, result, result.ok ? 200 : result.error === 'final_deliverable_not_found' ? 404 : 400);
     }
 
     // ── PO delivers (submits deliverable, but does NOT close project) ──

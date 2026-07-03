@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHub } from '../src/core/hub.js';
@@ -238,15 +238,16 @@ test('passed project workflow delivers the whole project with artifact provenanc
 
   assert.equal(reviewed.ok, true);
   assert.equal(reviewed.workflowRun.status, 'completed');
-  assert.equal(reviewed.workflowRun.projectDelivery.status, 'delivered');
+  assert.equal(reviewed.workflowRun.projectDelivery.status, 'candidate');
 
   const project = hub.getProject('proj-project-workflow-deliver');
-  assert.equal(project.status, 'delivered');
-  assert.equal(project.deliverable.summary, '已生成项目最终报告。');
-  assert.equal(project.deliverable.artifacts[0].path, deliverablePath);
-  assert.deepEqual(project.deliverable.evidenceRefs, [`artifact:${deliverablePath}`]);
-  assert.equal(project.deliverable.provenance.workflowId, 'po-generated-project-workflow');
-  assert.equal(project.deliverable.provenance.workflowRunId, workflowRun.id);
+  assert.equal(project.status, 'active');
+  assert.equal(hub.getProjectLifecycle('proj-project-workflow-deliver').state, 'ready_to_deliver');
+  const candidate = hub.listFinalDeliverables('proj-project-workflow-deliver')[0];
+  assert.equal(candidate.status, 'candidate');
+  assert.equal(candidate.submitted.requestContext.requestSource, 'agent');
+  assert.equal(candidate.workflowRunId, workflowRun.id);
+  assert.equal(candidate.artifactRef.path, realpathSync(deliverablePath));
 
   const tasks = hub.getBoard('proj-project-workflow-deliver').getAllTasks();
   assert.deepEqual(tasks.map(task => task.status), ['done', 'done', 'done']);
@@ -254,6 +255,19 @@ test('passed project workflow delivers the whole project with artifact provenanc
     assert.equal(task.result.provenance.workflowId, 'po-generated-project-workflow');
     assert.equal(task.result.provenance.workflowRunId, workflowRun.id);
   }
+
+  const approved = hub.approveFinalDeliverable('proj-project-workflow-deliver', candidate.deliverableId, {
+    approvalIdempotencyKey: 'approve-project-workflow-deliver',
+    expectedProjectVersion: hub.getProjectLifecycle('proj-project-workflow-deliver').version,
+  }, {
+    requestSource: 'user',
+    actorId: 'desktop-user',
+    actorKind: 'desktop_user',
+    transport: 'desktop_ipc',
+  });
+  assert.equal(approved.ok, true);
+  assert.equal(hub.getProject('proj-project-workflow-deliver').status, 'delivered');
+  assert.equal(hub.getProject('proj-project-workflow-deliver').deliverable.provenance.finalDeliverableId, candidate.deliverableId);
 });
 
 test('workflow preferred single-task override still dispatches task workflow through onlyTaskIds', () => {

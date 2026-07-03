@@ -14,7 +14,7 @@
 
 import { createTaskBoard, restoreTaskBoard } from './task-board.js';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
@@ -35,6 +35,8 @@ import { createTaskHandoffPackage } from './handoff-package.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
 import { applyWorkflowEvent, createWorkflowRun, refreshWorkflowRunState } from './workflow-run.js';
+import { deriveExecutionGraph, deriveProjectLifecycle } from './project-read-model.js';
+import { sanitizeRequestContext } from './mutation-transport.js';
 import {
   AGENT_REVIEW_SMOKE_WORKFLOW_ID,
   PO_GENERATED_PROJECT_WORKFLOW_ID,
@@ -68,6 +70,7 @@ import {
   normalizeProjectExecutionMode,
   selectTaskExecutionStrategy,
 } from './execution-mode.js';
+import { decideProjectStartPolicy } from './project-start-policy.js';
 import {
   appendQualityPlanningGuidance,
   buildQualityPromptExcerpt,
@@ -83,6 +86,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   const boards = new Map();
   const workflowRuns = new Map();
   const workflowProposals = new Map();
+  const finalDeliverables = new Map();
+  const reviewGateDecisions = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const persistence = typeof dataDir === 'string' ? createPersistence(dataDir) : null;
 
@@ -103,6 +108,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       for (const proposal of (saved.workflowProposals || [])) {
         if (proposal?.id) workflowProposals.set(proposal.id, proposal);
       }
+      for (const deliverable of (saved.finalDeliverables || [])) {
+        if (deliverable?.deliverableId) finalDeliverables.set(deliverable.deliverableId, deliverable);
+      }
+      for (const decision of (saved.reviewGateDecisions || [])) {
+        if (decision?.gateId) reviewGateDecisions.set(decision.gateId, decision);
+      }
       if (!silent) console.log(`[hub] Restored ${saved.projects.length} projects from disk`);
     }
   }
@@ -117,6 +128,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       })),
       workflowRuns: [...workflowRuns.values()],
       workflowProposals: [...workflowProposals.values()],
+      finalDeliverables: [...finalDeliverables.values()],
+      reviewGateDecisions: [...reviewGateDecisions.values()],
       humanActions,
     }));
   }
@@ -252,7 +265,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
 
   // ─── Project lifecycle ─────────────────────────────────────────────
 
-  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey }) {
+  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey, requestedStartPolicy }) {
     const createdAt = Date.now();
     const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
     const effectiveName = normalizeProjectNameForDisplay(name);
@@ -283,6 +296,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       executionMode: normalizeProjectExecutionMode(executionMode),
       executionModeUpdatedAt: createdAt,
       executionModeUpdatedBy: 'system_default',
+      requestedStartPolicy: normalizeProjectStartPolicy(requestedStartPolicy),
       status: 'created',  // created → planning → active → closed
       createdAt,
       closedAt: null,
@@ -293,6 +307,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       enableSummary: enableSummary !== false,  // default true, backwards-compatible
       summary: null,        // Project summary section text (set at synthesize)
       summaryScore: null,   // Project score 1-10 (parsed from synthesis)
+      lifecycleVersion: 0,
     };
     if (normalizedClientRequestKey) {
       project.clientRequestKey = normalizedClientRequestKey;
@@ -341,6 +356,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return value.trim().replace(/\s+/g, ' ').slice(0, 240);
   }
 
+  function normalizeProjectStartPolicy(value) {
+    if (typeof value !== 'string') return 'auto_activate_after_plan';
+    const normalized = value.trim();
+    if (normalized === 'auto_dispatch_after_plan') return 'activate_and_dispatch_after_plan';
+    if (
+      normalized === 'plan_only' ||
+      normalized === 'auto_activate_after_plan' ||
+      normalized === 'activate_and_dispatch_after_plan'
+    ) return normalized;
+    return 'auto_activate_after_plan';
+  }
+
   function normalizeAgentIdList(values = []) {
     const result = [];
     for (const value of Array.isArray(values) ? values : []) {
@@ -384,6 +411,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     const normalized = {
       ...project,
       executionMode: normalizeProjectExecutionMode(project?.executionMode),
+      lifecycleVersion: Number(project?.lifecycleVersion || 0),
     };
     reconcileProjectAgentSelectionWithEffectiveAgents(normalized);
     normalized.preparation = normalizeRecoveredProjectPreparation(normalized, normalized.preparation);
@@ -494,6 +522,111 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       });
     }
     return { ok: true };
+  }
+
+  function activateAndStartProject(projectId, request = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    const board = boards.get(projectId);
+    if (!board) return { ok: false, error: 'project_not_found' };
+    const requestContext = sanitizeRequestContext(request.requestContext);
+    if (!requestContext) return { ok: false, error: 'request_context_required' };
+
+    const idempotencyKey = readWorkflowString(request.idempotencyKey || request.activationIdempotencyKey);
+    if (!idempotencyKey) return { ok: false, error: 'idempotency_key_required' };
+    project.autoStartTransactions = Array.isArray(project.autoStartTransactions) ? project.autoStartTransactions : [];
+    const existing = project.autoStartTransactions.find(txn => txn.idempotencyKey === idempotencyKey);
+    if (existing) {
+      return {
+        ok: existing.ok !== false,
+        idempotent: true,
+        ...existing.result,
+      };
+    }
+
+    if (
+      request.expectedProjectVersion !== undefined &&
+      Number(request.expectedProjectVersion) !== Number(project.lifecycleVersion || 0)
+    ) {
+      return { ok: false, error: 'project_version_conflict', currentVersion: Number(project.lifecycleVersion || 0) };
+    }
+
+    const startPolicyDecision = decideProjectStartPolicy({
+      requestedStartPolicy: normalizeProjectStartPolicy(request.startPolicy || request.requestedStartPolicy),
+      requestContext,
+      project,
+      tasks: board.getAllTasks(),
+      workflowRuns: listProjectWorkflowRuns(projectId),
+      agentProfiles: getProjectAgentProfiles(project),
+      callerRiskHints: request.callerRiskHints,
+    });
+    project.startPolicyDecision = startPolicyDecision;
+
+    if (startPolicyDecision.downgraded) {
+      eventLog.emit('project.auto_start.policy_downgraded', {
+        projectId,
+        requestedStartPolicy: startPolicyDecision.requestedStartPolicy,
+        effectiveStartPolicy: startPolicyDecision.effectiveStartPolicy,
+        downgradeReasons: startPolicyDecision.downgradeReasons,
+        requestSource: requestContext.requestSource,
+        actorId: requestContext.actorId,
+      });
+    }
+
+    let phase = 'plan_validated';
+    let activation = null;
+    let dispatch = null;
+    let ok = true;
+    let error = null;
+    const fromAgent = normalizeAgentId(request.fromAgent) || project.poAgent;
+
+    if (startPolicyDecision.effectiveStartPolicy === 'plan_only') {
+      eventLog.emit('project.auto_start.plan_only', { projectId, actorId: requestContext.actorId });
+    } else {
+      activation = handleApprove(projectId);
+      if (!activation.ok) {
+        ok = false;
+        error = activation.error || 'activation_failed';
+        phase = 'activation_failed';
+        eventLog.emit('project.auto_start.activation_failed', { projectId, error, actorId: requestContext.actorId });
+      } else if (startPolicyDecision.effectiveStartPolicy === 'auto_activate_after_plan') {
+        phase = 'activated';
+        eventLog.emit('project.auto_start.activated', { projectId, actorId: requestContext.actorId });
+      } else {
+        dispatch = handleRequestDispatch(projectId, fromAgent);
+        if (!dispatch.ok) {
+          ok = false;
+          error = dispatch.error || 'dispatch_failed';
+          phase = 'dispatch_failed';
+          eventLog.emit('project.auto_start.dispatch_failed', { projectId, error, actorId: requestContext.actorId });
+        } else {
+          phase = 'dispatch_started';
+          eventLog.emit('project.auto_start.dispatch_started', {
+            projectId,
+            actorId: requestContext.actorId,
+            dispatched: dispatch.dispatched || [],
+            workflowDispatched: dispatch.workflowDispatched || [],
+          });
+        }
+      }
+    }
+
+    bumpProjectLifecycleVersion(project);
+    const result = {
+      phase,
+      startPolicyDecision,
+      activation,
+      dispatch,
+      projectLifecycle: getProjectLifecycle(projectId),
+      ...(error ? { error } : {}),
+    };
+    project.autoStartTransactions.push({
+      idempotencyKey,
+      ok,
+      result,
+      createdAt: new Date().toISOString(),
+    });
+    return { ok, ...result };
   }
 
   /**
@@ -1259,6 +1392,163 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     return { ok: true };
   }
 
+  function registerFinalDeliverable(projectId, payload = {}, requestContextInput = null, { now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    const requestContext = sanitizeRequestContext(requestContextInput);
+    if (!requestContext) return { ok: false, error: 'request_context_required' };
+
+    const claimedRequestSource = payload.claimedRequestSource || payload.requestSource || null;
+    if (claimedRequestSource && claimedRequestSource !== requestContext.requestSource && requestContext.requestSource !== 'user') {
+      eventLog.emit('request_source_claim_mismatch', {
+        projectId,
+        actual: requestContext.requestSource,
+        claimed: claimedRequestSource,
+        actorId: requestContext.actorId,
+        mutation: 'register_final_deliverable',
+      });
+      return { ok: false, error: 'request_source_forgery_detected' };
+    }
+    if (requestContext.requestSource === 'scheduler') {
+      return { ok: false, error: 'scheduler_cannot_register_final_deliverable' };
+    }
+
+    const submissionIdempotencyKey = readWorkflowString(payload.submissionIdempotencyKey || payload.idempotencyKey);
+    if (!submissionIdempotencyKey) return { ok: false, error: 'idempotency_key_required' };
+    const existing = listFinalDeliverables(projectId)
+      .find(item => item.submissionIdempotencyKey === submissionIdempotencyKey);
+    if (existing) return { ok: true, finalDeliverable: existing, idempotent: true };
+
+    const kind = payload.kind === 'none' ? 'none' : 'file';
+    const expectedFormat = normalizeFinalDeliverableFormat(payload.expectedFormat);
+    const artifactResult = kind === 'file'
+      ? prepareFinalDeliverableArtifact({ project, artifactRef: payload.artifactRef, expectedFormat, clientClaimedHash: payload.clientClaimedHash, workspacePath: payload.workFolder || payload.workspacePath })
+      : { ok: true, artifactRef: null, serviceComputedHash: null };
+    if (!artifactResult.ok) return artifactResult;
+
+    const createdAt = new Date(now).toISOString();
+    const deliverableId = payload.deliverableId || `fd-${createHash('sha1').update(`${projectId}\0${submissionIdempotencyKey}`).digest('hex').slice(0, 16)}`;
+    const finalDeliverable = {
+      deliverableId,
+      projectId,
+      executionNodeId: payload.executionNodeId || null,
+      ...(payload.taskId ? { taskId: payload.taskId } : {}),
+      ...(payload.workflowRunId ? { workflowRunId: payload.workflowRunId } : {}),
+      ...(payload.workflowNodeId ? { workflowNodeId: payload.workflowNodeId } : {}),
+      ...(payload.unboundReason ? { unboundReason: payload.unboundReason } : {}),
+      kind,
+      expectedFormat,
+      ...(artifactResult.artifactRef ? { artifactRef: artifactResult.artifactRef } : {}),
+      ...(artifactResult.serviceComputedHash ? { serviceComputedHash: artifactResult.serviceComputedHash } : {}),
+      ...(payload.clientClaimedHash ? { clientClaimedHash: payload.clientClaimedHash } : {}),
+      source: normalizeFinalDeliverableSource(payload.source),
+      submittedBy: readWorkflowString(payload.submittedBy) || requestContext.actorId,
+      requiresReview: payload.requiresReview !== false || requestContext.requestSource !== 'user',
+      submissionIdempotencyKey,
+      status: 'candidate',
+      submitted: {
+        requestContext,
+        submittedAt: createdAt,
+      },
+      createdAt,
+      updatedAt: createdAt,
+    };
+
+    finalDeliverables.set(deliverableId, finalDeliverable);
+    bumpProjectLifecycleVersion(project, now);
+    eventLog.emit('final_deliverable.candidate_registered', {
+      projectId,
+      deliverableId,
+      source: finalDeliverable.source,
+      requestSource: requestContext.requestSource,
+      submittedBy: finalDeliverable.submittedBy,
+    });
+    return { ok: true, finalDeliverable };
+  }
+
+  function approveFinalDeliverable(projectId, deliverableId, payload = {}, requestContextInput = null, { now = Date.now() } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    const requestContext = sanitizeRequestContext(requestContextInput);
+    if (!requestContext) return { ok: false, error: 'request_context_required' };
+    if (requestContext.requestSource !== 'user') {
+      return { ok: false, error: 'final_deliverable_approve_requires_user' };
+    }
+
+    const finalDeliverable = finalDeliverables.get(deliverableId);
+    if (!finalDeliverable || finalDeliverable.projectId !== projectId) return { ok: false, error: 'final_deliverable_not_found' };
+    const approvalIdempotencyKey = readWorkflowString(payload.approvalIdempotencyKey || payload.idempotencyKey);
+    if (!approvalIdempotencyKey) return { ok: false, error: 'idempotency_key_required' };
+    if (
+      payload.expectedProjectVersion !== undefined &&
+      Number(payload.expectedProjectVersion) !== Number(project.lifecycleVersion || 0) &&
+      finalDeliverable.approval?.approvalIdempotencyKey !== approvalIdempotencyKey
+    ) {
+      return { ok: false, error: 'project_version_conflict', currentVersion: Number(project.lifecycleVersion || 0) };
+    }
+    if (finalDeliverable.status === 'approved' && finalDeliverable.approval?.approvalIdempotencyKey === approvalIdempotencyKey) {
+      const decision = selectReviewGateDecisionForDeliverable(projectId, deliverableId);
+      return { ok: true, finalDeliverable, reviewGateDecision: decision, idempotent: true };
+    }
+    const deterministic = rerunFinalDeliverableChecks(finalDeliverable);
+    if (!deterministic.ok) return deterministic;
+
+    const approvedAt = new Date(now).toISOString();
+    const gateId = `gate-${createHash('sha1').update(`${projectId}\0${deliverableId}\0${approvalIdempotencyKey}`).digest('hex').slice(0, 16)}`;
+    for (const candidate of listFinalDeliverables(projectId)) {
+      if (candidate.deliverableId === deliverableId) continue;
+      if (['candidate', 'under_review'].includes(candidate.status)) {
+        candidate.status = 'superseded';
+        candidate.supersededBy = deliverableId;
+        candidate.updatedAt = approvedAt;
+      }
+    }
+
+    finalDeliverable.status = 'approved';
+    finalDeliverable.approval = {
+      requestContext,
+      approvedAt,
+      gateId,
+      approvalIdempotencyKey,
+    };
+    finalDeliverable.updatedAt = approvedAt;
+    reviewGateDecisions.set(gateId, {
+      gateId,
+      projectId,
+      finalDeliverableId: deliverableId,
+      decision: 'passed',
+      autoCloseAllowed: true,
+      decidedBy: {
+        requestSource: requestContext.requestSource,
+        actorId: requestContext.actorId,
+      },
+      evidenceRefs: finalDeliverable.artifactRef ? [finalDeliverable.artifactRef] : [],
+      decidedAt: approvedAt,
+    });
+
+    bumpProjectLifecycleVersion(project, now);
+    const lifecycle = getProjectLifecycle(projectId);
+    if (lifecycle?.canAutoClose) {
+      project.deliverable = buildLegacyDeliverableFromFinal(finalDeliverable);
+      project.deliveredAt = now;
+      project.status = 'delivered';
+      bumpProjectLifecycleVersion(project, now + 1);
+      eventLog.emit('project.delivered', {
+        projectId,
+        projectName: project.name,
+        by: requestContext.actorId,
+        finalDeliverableId: deliverableId,
+      });
+    }
+    eventLog.emit('final_deliverable.approved', {
+      projectId,
+      deliverableId,
+      gateId,
+      approvedBy: requestContext.actorId,
+    });
+    return { ok: true, finalDeliverable, reviewGateDecision: reviewGateDecisions.get(gateId), projectLifecycle: getProjectLifecycle(projectId) };
+  }
+
   // ─── Worker actions ────────────────────────────────────────────────
 
   function handleAcceptTask(projectId, taskId, workerAgent, runId) {
@@ -1689,7 +1979,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     if (review.passed) {
       if (task.evidenceContract && task.result) {
         const validation = validateTaskResultAgainstContract(task, task.result);
-        if (!validation.ok && validation.failureClass !== 'quality_evidence_missing') {
+        if (!validation.ok) {
           return handleQualityFailure(task, {
             ...review,
             passed: false,
@@ -1783,6 +2073,39 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   function getBoard(projectId) { return boards.get(projectId); }
   function getEventLog() { return eventLog; }
   function listProjects() { return [...projects.values()]; }
+  function listFinalDeliverables(projectId = null) {
+    return [...finalDeliverables.values()]
+      .filter(item => (projectId ? item.projectId === projectId : true))
+      .sort((a, b) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')));
+  }
+  function listReviewGateDecisions(projectId = null) {
+    return [...reviewGateDecisions.values()]
+      .filter(item => (projectId ? item.projectId === projectId : true))
+      .sort((a, b) => String(b.decidedAt || '').localeCompare(String(a.decidedAt || '')));
+  }
+  function getExecutionGraph(projectId) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return null;
+    return deriveExecutionGraph({
+      project,
+      tasks: board.getAllTasks(),
+      workflowRuns: listProjectWorkflowRuns(projectId),
+      finalDeliverables: listFinalDeliverables(projectId),
+    });
+  }
+  function getProjectLifecycle(projectId) {
+    const project = projects.get(projectId);
+    const board = boards.get(projectId);
+    if (!project || !board) return null;
+    return deriveProjectLifecycle({
+      project,
+      tasks: board.getAllTasks(),
+      workflowRuns: listProjectWorkflowRuns(projectId),
+      finalDeliverables: listFinalDeliverables(projectId),
+      reviewGateDecisions: listReviewGateDecisions(projectId),
+    });
+  }
   function getDispatchPlan(projectId) { return buildDispatchPlan(projectId); }
   function getProjectHealth(projectId) {
     const project = projects.get(projectId);
@@ -3535,7 +3858,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
-    const delivery = handleDeliver(workflowRun.projectId, deliverable, project.poAgent);
+    const delivery = registerWorkflowFinalDeliverableCandidate({
+      project,
+      workflowRun,
+      producerNode,
+      deliverable,
+      source: 'project_workflow',
+      runtimeSource: 'agent_runtime',
+      now,
+    });
     if (!delivery.ok) {
       return {
         workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, delivery.error || 'project_delivery_failed', { now }),
@@ -3547,10 +3878,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       workflowRun: {
         ...workflowRun,
         projectDelivery: {
-          status: 'delivered',
-          deliveredAt: now,
+          status: 'candidate',
+          submittedAt: new Date(now).toISOString(),
           projectId: workflowRun.projectId,
           workflowRunId: workflowRun.id,
+          finalDeliverableId: delivery.finalDeliverable.deliverableId,
           taskCount: taskCompletion.completedTaskIds.length,
         },
       },
@@ -3627,7 +3959,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
-    const delivery = handleDeliver(workflowRun.projectId, deliverable, project.poAgent);
+    const delivery = registerWorkflowFinalDeliverableCandidate({
+      project,
+      workflowRun,
+      producerNode,
+      deliverable,
+      source: 'script_workflow',
+      runtimeSource: 'desktop-workflow-runtime',
+      now,
+    });
     if (!delivery.ok) {
       return {
         workflowRun: markWorkflowProjectDeliveryBlocked(workflowRun, delivery.error || 'project_delivery_failed', { now }),
@@ -3635,19 +3975,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       };
     }
 
-    project.status = 'closed';
-    project.closedAt = now;
-    project.closedBy = 'script_workflow';
-    eventLog.emit('project.closed', { projectId: workflowRun.projectId, projectName: project.name, summary: 'Script workflow delivered and auto-closed' });
-
     return {
       workflowRun: {
         ...workflowRun,
         projectDelivery: {
-          status: 'delivered',
-          deliveredAt: now,
+          status: 'candidate',
+          submittedAt: new Date(now).toISOString(),
           projectId: workflowRun.projectId,
           workflowRunId: workflowRun.id,
+          finalDeliverableId: delivery.finalDeliverable.deliverableId,
           taskCount: taskCompletion.completedTaskIds.length,
         },
       },
@@ -4063,6 +4399,183 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       },
     };
   }
+
+  function prepareFinalDeliverableArtifact({ project, artifactRef, expectedFormat, clientClaimedHash, workspacePath = null } = {}) {
+    const artifactPath = readWorkflowArtifactPath(artifactRef);
+    if (!artifactPath) return { ok: false, error: 'artifact_missing' };
+    if (artifactPath.includes('\0')) return { ok: false, error: 'artifact_path_escape' };
+
+    const effectiveWorkspacePath = readWorkflowString(workspacePath) || readWorkflowString(project?.workFolder) || readWorkflowString(project?.workspacePath);
+    const workspaceRealPath = safeWorkflowRealPath(effectiveWorkspacePath);
+    if (!workspaceRealPath) return { ok: false, error: 'artifact_path_escape' };
+
+    const normalized = artifactPath.replace(/^artifact:/, '').replace(/\\/g, '/');
+    const candidate = isAbsolute(normalized) ? resolve(normalized) : resolve(workspaceRealPath, normalized);
+    const realPath = safeWorkflowRealPath(candidate);
+    if (!realPath || !isWorkflowPathInside(workspaceRealPath, realPath)) return { ok: false, error: 'artifact_path_escape' };
+    let stats;
+    try {
+      stats = statSync(realPath);
+    } catch {
+      return { ok: false, error: 'artifact_missing' };
+    }
+    if (!stats.isFile()) return { ok: false, error: 'artifact_not_file' };
+
+    let bytes;
+    try {
+      bytes = readFileSync(realPath);
+    } catch {
+      return { ok: false, error: 'artifact_read_failed' };
+    }
+    const formatCheck = validateFinalDeliverableFormat({ expectedFormat, path: realPath, bytes });
+    if (!formatCheck.ok) return formatCheck;
+
+    const serviceComputedHash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+    if (clientClaimedHash && clientClaimedHash !== serviceComputedHash) {
+      return { ok: false, error: 'artifact_hash_mismatch', serviceComputedHash, clientClaimedHash };
+    }
+    return {
+      ok: true,
+      artifactRef: normalizeFinalArtifactRef(artifactRef, realPath, workspaceRealPath, stats),
+      serviceComputedHash,
+    };
+  }
+
+  function registerWorkflowFinalDeliverableCandidate({ project, workflowRun, producerNode, deliverable, source, runtimeSource, now = Date.now() } = {}) {
+    const artifact = Array.isArray(deliverable?.artifacts) ? deliverable.artifacts[0] : null;
+    const expectedFormat = inferWorkflowFinalExpectedFormat(artifact);
+    return registerFinalDeliverable(workflowRun.projectId, {
+      executionNodeId: producerNode?.id || null,
+      workflowRunId: workflowRun.id,
+      workflowNodeId: producerNode?.id || null,
+      kind: artifact ? 'file' : 'none',
+      expectedFormat,
+      ...(artifact ? { artifactRef: artifact } : {}),
+      ...(deliverable.workFolder ? { workFolder: deliverable.workFolder } : {}),
+      ...(deliverable.workspacePath ? { workspacePath: deliverable.workspacePath } : {}),
+      source,
+      submittedBy: producerNode?.producerAgent || producerNode?.assignedAgent || runtimeSource || 'workflow',
+      requiresReview: true,
+      submissionIdempotencyKey: `workflow-final:${workflowRun.id}:${producerNode?.id || 'runtime'}:${source}`,
+    }, {
+      requestSource: 'agent',
+      actorId: producerNode?.producerAgent || producerNode?.assignedAgent || runtimeSource || 'workflow',
+      actorKind: 'agent_runtime',
+      transport: 'agent_tool',
+      runtimeTaskId: workflowRun.id,
+    }, { now });
+  }
+
+  function inferWorkflowFinalExpectedFormat(artifact) {
+    const kind = String(artifact?.kind || artifact?.type || artifact?.path || artifact?.filename || '').toLowerCase();
+    if (kind.includes('html')) return 'html';
+    if (kind.includes('pdf')) return 'pdf';
+    if (kind.includes('pptx')) return 'pptx';
+    if (kind.includes('json')) return 'json';
+    if (kind.includes('csv')) return 'csv';
+    if (kind.includes('md') || kind.includes('markdown')) return 'markdown';
+    return 'markdown';
+  }
+
+  function validateFinalDeliverableFormat({ expectedFormat, path, bytes }) {
+    if (!bytes || bytes.length === 0) return { ok: false, error: 'artifact_empty' };
+    const lower = String(path || '').toLowerCase();
+    if (expectedFormat === 'markdown') {
+      const text = bytes.toString('utf8').trim();
+      if (!text || /^(todo|tbd)$/i.test(text)) return { ok: false, error: 'artifact_markdown_placeholder' };
+      return { ok: true };
+    }
+    if (expectedFormat === 'html') {
+      const text = bytes.toString('utf8').trim();
+      if (!/<[a-z][\s\S]*>/i.test(text)) return { ok: false, error: 'artifact_html_invalid' };
+      return { ok: true };
+    }
+    if (expectedFormat === 'json') {
+      try {
+        JSON.parse(bytes.toString('utf8'));
+        return { ok: true };
+      } catch {
+        return { ok: false, error: 'artifact_json_invalid' };
+      }
+    }
+    if (expectedFormat === 'csv') {
+      if (!bytes.toString('utf8').split(/\r?\n/).some(line => line.trim())) return { ok: false, error: 'artifact_csv_invalid' };
+      return { ok: true };
+    }
+    if (expectedFormat === 'pdf' && !lower.endsWith('.pdf')) return { ok: false, error: 'artifact_pdf_invalid' };
+    if (expectedFormat === 'pptx' && !lower.endsWith('.pptx')) return { ok: false, error: 'artifact_pptx_invalid' };
+    return { ok: true };
+  }
+
+  function normalizeFinalArtifactRef(artifactRef, realPath, workspaceRealPath, stats) {
+    const relativePath = relative(workspaceRealPath, realPath).replace(/\\/g, '/');
+    return {
+      ...(artifactRef && typeof artifactRef === 'object' && !Array.isArray(artifactRef) ? JSON.parse(JSON.stringify(artifactRef)) : {}),
+      path: realPath,
+      relativePath,
+      workspacePath: workspaceRealPath,
+      size: stats.size,
+    };
+  }
+
+  function normalizeFinalDeliverableFormat(value) {
+    const lower = String(value || '').toLowerCase();
+    if (['markdown', 'html', 'pptx', 'pdf', 'json', 'csv', 'none'].includes(lower)) return lower;
+    if (lower === 'md') return 'markdown';
+    return 'markdown';
+  }
+
+  function normalizeFinalDeliverableSource(value) {
+    const source = String(value || '');
+    if (['task_board', 'script_workflow', 'project_workflow', 'manual_repair', 'timed_monitor'].includes(source)) return source;
+    return 'manual_repair';
+  }
+
+  function rerunFinalDeliverableChecks(finalDeliverable) {
+    if (!finalDeliverable) return { ok: false, error: 'final_deliverable_not_found' };
+    if (finalDeliverable.kind === 'none') return { ok: true };
+    const project = projects.get(finalDeliverable.projectId);
+    const checked = prepareFinalDeliverableArtifact({
+      project,
+      artifactRef: finalDeliverable.artifactRef,
+      expectedFormat: finalDeliverable.expectedFormat,
+      clientClaimedHash: finalDeliverable.clientClaimedHash,
+      workspacePath: finalDeliverable.artifactRef?.workFolder || finalDeliverable.artifactRef?.workspacePath,
+    });
+    if (!checked.ok) return checked;
+    finalDeliverable.artifactRef = checked.artifactRef;
+    finalDeliverable.serviceComputedHash = checked.serviceComputedHash;
+    return { ok: true };
+  }
+
+  function selectReviewGateDecisionForDeliverable(projectId, deliverableId) {
+    return [...reviewGateDecisions.values()]
+      .filter(item => item.projectId === projectId && item.finalDeliverableId === deliverableId)
+      .sort((a, b) => String(b.decidedAt || '').localeCompare(String(a.decidedAt || '')))[0] || null;
+  }
+
+  function buildLegacyDeliverableFromFinal(finalDeliverable) {
+    return {
+      summary: `Final deliverable approved: ${finalDeliverable.expectedFormat}`,
+      artifacts: finalDeliverable.artifactRef ? [finalDeliverable.artifactRef] : [],
+      evidenceRefs: finalDeliverable.artifactRef ? [`artifact:${finalDeliverable.artifactRef.path}`] : [],
+      provenance: {
+        runtimeSource: finalDeliverable.source,
+        workflowRunId: finalDeliverable.workflowRunId || null,
+        workflowId: null,
+        producerNodeId: finalDeliverable.workflowNodeId || finalDeliverable.executionNodeId || null,
+        producingAgent: finalDeliverable.submittedBy || null,
+        finalDeliverableId: finalDeliverable.deliverableId,
+      },
+    };
+  }
+
+  function bumpProjectLifecycleVersion(project, now = Date.now()) {
+    if (!project) return;
+    project.lifecycleVersion = Number(project.lifecycleVersion || 0) + 1;
+    project.updatedAt = now;
+  }
+
   function readWorkflowString(value) {
     return typeof value === 'string' ? value.trim() : '';
   }
@@ -4092,6 +4605,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     createProject,
     updateProjectExecutionMode,
     handleApprove,
+    activateAndStartProject,
     handleRetryPlan,
     handleHumanAddTasks,
     handleCloseProject,
@@ -4103,6 +4617,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     handleMarkDone,
     handleRework,
     handleDeliver,
+    registerFinalDeliverable,
+    approveFinalDeliverable,
     handleSubmitPlan,
     handleRevisePlan,
     handleQualityReview,
@@ -4154,6 +4670,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     listProjects,
     findReusableProjectForCreateRequest,
     getDispatchPlan,
+    getExecutionGraph,
+    getProjectLifecycle,
+    listFinalDeliverables,
+    listReviewGateDecisions,
     getProjectHealth,
     getProjectIntervention,
     listResumableScriptWorkflowRuns,
