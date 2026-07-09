@@ -8,12 +8,14 @@
 
 ---
 
-## Xiaok Desktop v1.4.14 集成基线
+## Xiaok Desktop v1.4.20 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.4.14 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断和自动化界面；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
+- KSwarm 仍是 Xiaok Desktop v1.4.20 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断、loop 结果界面和自动化入口；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
 - **Workflow 节点现在可以自动接收上游产出**：`enrichWorkflowNodeInput` 通过 `dependsOn` 边收集已完成上游节点的 output 并注入到 dispatched input。Desktop `buildKSwarmWorkflowNodePrompt` 将其渲染为结构化”上游参考”段。所有新逻辑遵循降级优先：任何失败都静默跳过注入（不阻塞 dispatch）。
 - Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
+- Xiaok Desktop v1.4.20 在 Desktop 侧新增 loop 结果可见性和 LoopContract 评估，不要求 KSwarm 协议迁移；任务完成、项目交付和 workflow 进度仍沿用现有 project/task/workflow snapshot 合同。
 - 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
+- `desktop-v1.4.20` 的 Desktop release workflow 会在打包前 checkout 本仓库，因此即使 KSwarm sidecar 版本不变，README 集成基线也要跟随 Xiaok Desktop release tag 更新。
 
 ## v0.9.2 新特性
 
