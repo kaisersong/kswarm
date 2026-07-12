@@ -8,15 +8,15 @@
 
 ---
 
-## Xiaok Desktop v1.4.21 集成基线
+## Xiaok Desktop v1.4.22 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.4.21 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断、loop 结果界面和自动化入口；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
+- KSwarm 仍是 Xiaok Desktop v1.4.22 随包发布的项目与工作流控制面。Desktop 负责服务启动、health/version 探测、用户可见诊断、loop 结果界面、自动化入口、AI 录音、ASR 服务商配置和 Computer Use 激活；KSwarm 负责项目状态、任务状态、workflow run、review gate 和交付物元数据。
 - **Workflow 节点现在可以自动接收上游产出**：`enrichWorkflowNodeInput` 通过 `dependsOn` 边收集已完成上游节点的 output 并注入到 dispatched input。Desktop `buildKSwarmWorkflowNodePrompt` 将其渲染为结构化”上游参考”段。所有新逻辑遵循降级优先：任何失败都静默跳过注入（不阻塞 dispatch）。
 - Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
-- Xiaok Desktop v1.4.21 在 Desktop 侧包含 loop 结果可见性、LoopContract 评估和知识库 AI 录音能力，不要求 KSwarm 协议迁移；任务完成、项目交付和 workflow 进度仍沿用现有 project/task/workflow snapshot 合同。
-- Xiaok Desktop 新增的 AI 录音与本地转写流程由 Desktop 知识库栈负责，不属于 KSwarm 控制面。AI 录音保存的会议纪要后续可以作为知识库来源参与项目工作，但 KSwarm 不管理麦克风采集、Whisper 模型下载或转写总结。
+- Xiaok Desktop v1.4.22 在 Desktop 侧完成紧凑 AI 录音悬浮窗、Sherpa-ONNX 本地实时转写、用户自配阿里云与火山引擎流式 ASR、标点恢复、可编辑纪要和随包 CuaDriver 自动恢复，不要求 KSwarm 协议迁移；任务完成、项目交付和 workflow 进度仍沿用现有 project/task/workflow snapshot 合同。
+- AI 录音与转写仍由 Desktop 知识库栈负责，不属于 KSwarm 控制面。保存后的纪要可以作为知识库来源参与项目工作，但 KSwarm 不管理麦克风采集、ASR 凭据、本地模型下载、标点恢复或转写总结。
 - 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
-- `desktop-v1.4.21` 的 Desktop release workflow 会在打包前 checkout 本仓库，因此即使 KSwarm sidecar 版本不变，README 集成基线也要跟随 Xiaok Desktop release tag 更新。
+- `desktop-v1.4.22` 的 Desktop release workflow 会在打包前 checkout 本仓库，因此即使 KSwarm sidecar 版本不变，README 集成基线也要跟随 Xiaok Desktop release tag 更新。
 
 ## v0.9.2 新特性
 

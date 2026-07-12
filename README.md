@@ -8,15 +8,15 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Xiaok Desktop v1.4.21 Integration Baseline
+## Xiaok Desktop v1.4.22 Integration Baseline
 
-- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.21. Desktop owns service startup, health/version probing, user-facing diagnostics, loop result UI, and the Automations surface; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
+- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.22. Desktop owns service startup, health/version probing, user-facing diagnostics, loop result UI, the Automations surface, AI recording, ASR provider configuration, and Computer Use activation; KSwarm owns project state, task state, workflow runs, review gates, and deliverable metadata.
 - **Workflow nodes can now automatically receive upstream output**: `enrichWorkflowNodeInput` collects completed upstream node outputs via `dependsOn` edges and injects them into the dispatched input. Desktop `buildKSwarmWorkflowNodePrompt` renders these as a structured "upstream reference" section. All new logic follows degradation-first: any failure skips injection silently (never blocks dispatch).
 - Completion evidence is consumed by Xiaok loop diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records remain the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
-- Xiaok Desktop v1.4.21 adds loop-result visibility, LoopContract evaluation, and Knowledge Base AI recording on the Desktop side. This does not require a KSwarm protocol migration: task completion, project delivery, and workflow progress still flow through the existing project/task/workflow snapshot contract.
-- Xiaok Desktop's new AI recording and local transcription flow is owned by the Desktop Knowledge Base stack, not by KSwarm. Meeting notes saved from AI Recording can later be used as knowledge sources for project work, but KSwarm does not manage microphone capture, Whisper model downloads, or transcript summarization.
+- Xiaok Desktop v1.4.22 completes the compact AI recording flow, Sherpa-ONNX local real-time transcription, user-configured Alibaba Cloud and Volcengine streaming ASR, punctuation restoration, editable notes, and packaged CuaDriver recovery on the Desktop side. This does not require a KSwarm protocol migration: task completion, project delivery, and workflow progress still flow through the existing project/task/workflow snapshot contract.
+- AI recording and transcription remain owned by the Desktop Knowledge Base stack, not by KSwarm. Saved notes can later become knowledge sources for project work, but KSwarm does not manage microphone capture, ASR credentials, local model downloads, punctuation restoration, or transcript summarization.
 - The active packaged sidecar is KSwarm `0.9.2`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
-- The Desktop release workflow for `desktop-v1.4.21` checks out this repository before packaging, so this README baseline should move with Xiaok Desktop release tags even when the KSwarm sidecar version remains unchanged.
+- The Desktop release workflow for `desktop-v1.4.22` checks out this repository before packaging, so this README baseline should move with Xiaok Desktop release tags even when the KSwarm sidecar version remains unchanged.
 
 ## What's New in v0.9.2
 
