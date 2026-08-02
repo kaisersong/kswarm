@@ -85,7 +85,6 @@ test('workflow runs survive hub restart through persisted state', async () => {
     createActiveProject(first, 'proj-restore');
     const started = first.startProjectDiagnoseWorkflow('proj-restore', { requestedBy: 'human', now: 1770000000000 });
     first.persistState();
-    await new Promise(resolve => setTimeout(resolve, 650));
 
     const second = createHub({ eventLogDir: join(dir, 'events-b'), dataDir, silent: true });
     const restored = second.listProjectWorkflowRuns('proj-restore');

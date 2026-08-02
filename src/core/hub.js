@@ -18,7 +18,9 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
-import { createPersistence } from './persistence.js';
+import { createPersistence, PersistenceCommitError } from './persistence.js';
+import { resolveMutationScope, FULL_SCOPE } from './state-scope.js';
+import { randomUUID } from 'node:crypto';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
 import { getActiveTasksAcrossBoards, isReworkReadyForDispatch, planDispatch } from './dispatch-policy.js';
@@ -81,7 +83,7 @@ import { reconcileProjectAgentSelectionWithEffectiveAgents } from './agent-selec
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const workflowRuns = new Map();
@@ -89,9 +91,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   const finalDeliverables = new Map();
   const reviewGateDecisions = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
-  const persistence = typeof dataDir === 'string' ? createPersistence(dataDir) : null;
+  const persistence = injectedPersistence || (dataDir ? createPersistence(dataDir) : null);
 
-  // Restore state from disk
+  // Human action log — tracks all human decisions. Append-only + durable per-row.
+  const humanActions = [];
+  let humanActionSeq = 0;
+  let persistedHumanActionCount = 0;
+
+  // Restore state from disk. Unrecoverable load/corruption throws (never starts empty).
   if (persistence) {
     const saved = persistence.load();
     if (saved && saved.projects) {
@@ -114,13 +121,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       for (const decision of (saved.reviewGateDecisions || [])) {
         if (decision?.gateId) reviewGateDecisions.set(decision.gateId, decision);
       }
+      for (const action of (saved.humanActions || [])) {
+        if (!action || typeof action !== 'object') continue;
+        humanActions.push(action);
+        if (typeof action.seq === 'number' && action.seq >= humanActionSeq) humanActionSeq = action.seq + 1;
+      }
+      persistedHumanActionCount = humanActions.length;
       if (!silent) console.log(`[hub] Restored ${saved.projects.length} projects from disk`);
     }
   }
 
-  function persistState() {
-    if (!persistence) return;
-    persistence.save(() => ({
+  function buildFullState() {
+    return {
       projects: [...projects.values()],
       boards: [...boards.entries()].map(([projectId, board]) => ({
         projectId,
@@ -131,11 +143,56 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
       finalDeliverables: [...finalDeliverables.values()],
       reviewGateDecisions: [...reviewGateDecisions.values()],
       humanActions,
-    }));
+    };
   }
 
-  // Human action log — tracks all human decisions
-  const humanActions = [];
+  // Scoped persistence accessor: materialize only the entities affected by a
+  // mutation's scope. Never builds the full ~9MB state for a single-project
+  // mutation. The `full` closure is used only by the legacy JSON backend.
+  function buildScopedPersistencePayload(scope = FULL_SCOPE) {
+    const inScope = (projectId) => scope.type === 'full' || projectId === scope.projectId;
+    const entities = [];
+    for (const p of projects.values()) {
+      if (inScope(p.id)) entities.push({ collection: 'project', key: p.id, projectId: p.id, value: p });
+    }
+    for (const [projectId, board] of boards.entries()) {
+      if (inScope(projectId)) entities.push({ collection: 'board', key: projectId, projectId, value: { projectId, tasks: board.getAllTasks() } });
+    }
+    for (const r of workflowRuns.values()) {
+      if (inScope(r.projectId)) entities.push({ collection: 'workflowRun', key: r.id, projectId: r.projectId ?? null, value: r });
+    }
+    for (const pr of workflowProposals.values()) {
+      if (inScope(pr.projectId)) entities.push({ collection: 'workflowProposal', key: pr.id, projectId: pr.projectId ?? null, value: pr });
+    }
+    for (const d of finalDeliverables.values()) {
+      if (inScope(d.projectId)) entities.push({ collection: 'finalDeliverable', key: d.deliverableId, projectId: d.projectId ?? null, value: d });
+    }
+    for (const g of reviewGateDecisions.values()) {
+      if (inScope(g.projectId)) entities.push({ collection: 'reviewGateDecision', key: g.gateId, projectId: g.projectId ?? null, value: g });
+    }
+    const newHumanActions = humanActions.slice(persistedHumanActionCount).map(a => ({
+      collection: 'humanAction', key: a.id, projectId: a.projectId ?? null, value: a,
+    }));
+    return { entities, humanActions: newHumanActions, scope, full: buildFullState };
+  }
+
+  function persistState(scope = FULL_SCOPE) {
+    if (!persistence) return;
+    persistence.save(buildScopedPersistencePayload, scope);
+    // Advance the append pointer only after a successful durable commit.
+    persistedHumanActionCount = humanActions.length;
+  }
+
+  function getPersistenceHealth() {
+    if (!persistence || typeof persistence.getHealth !== 'function') {
+      return { status: 'disabled', backend: 'none', revision: 0 };
+    }
+    return persistence.getHealth();
+  }
+
+  function closePersistence() {
+    if (persistence && typeof persistence.close === 'function') persistence.close();
+  }
 
   if (persistence) {
     const reconciliation = reconcileRecoveredScriptWorkflowProjectDeliveries();
@@ -145,7 +202,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
   }
 
   function recordHumanAction(action, data) {
-    const entry = { ts: new Date().toISOString(), action, ...data };
+    const entry = { id: randomUUID(), seq: humanActionSeq++, ts: new Date().toISOString(), action, ...data };
     humanActions.push(entry);
     return entry;
   }
@@ -4653,11 +4710,28 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     recoverInterruptedTaskWorkflows,
   };
 
+  const persistenceLookups = {
+    getProposalProjectId: (id) => workflowProposals.get(id)?.projectId ?? null,
+    getRunProjectId: (id) => workflowRuns.get(id)?.projectId ?? null,
+  };
+
+  function assertPersistenceHealthy() {
+    if (!persistence || typeof persistence.getHealth !== 'function') return;
+    const health = persistence.getHealth();
+    if (health && health.status === 'failed') {
+      throw new PersistenceCommitError('[hub] persistence is in a failed state; mutation rejected');
+    }
+  }
+
   const persisted = {};
   for (const [name, fn] of Object.entries(mutations)) {
     persisted[name] = (...args) => {
+      // Gate: after a durable-commit failure, reject subsequent mutations before
+      // they run business logic (their in-memory/broker effects would be uncertain).
+      assertPersistenceHealthy();
       const result = fn(...args);
-      persistState();
+      const scope = resolveMutationScope(name, args, persistenceLookups);
+      persistState(scope);
       return result;
     };
   }
@@ -4699,5 +4773,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, getAge
     getWorkflowRun,
     getHumanActions,
     persistState,
+    getPersistenceHealth,
+    closePersistence,
   };
 }

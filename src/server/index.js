@@ -69,6 +69,11 @@ import { getEffectiveAgentConcurrency } from '../core/effective-agent-concurrenc
 import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
 import { resolveBrokerDispatchTarget, resolveIncomingLogicalAgent } from '../core/agent-execution.js';
 import { createProjectInstanceId } from '../core/project-id.js';
+import { assertNodeRuntime } from '../core/runtime-guard.js';
+import { isPersistenceCommitError, isPersistenceLoadError, EXIT_SAVE_FAILED, EXIT_LOAD_UNRECOVERABLE } from '../core/persistence.js';
+
+// Explicit runtime floor probe — the durable SQLite backend needs node:sqlite.
+assertNodeRuntime();
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
@@ -110,23 +115,44 @@ function listAgentProfilesForRouting() {
   return applyBrokerPresenceToAgentProfiles(agents, brokerOnlineAgentIds);
 }
 
-const hub = createHub({
-  eventLogDir: join(KSWARM_HOME, 'events'),
-  silent: false,
-  dataDir: join(KSWARM_HOME, 'state.json'),
-  getAgentProfiles: () => listAgentProfilesForRouting(),
-  getQualityOverlays: () => qualityOverlayStore.listOverlays(),
-  runtimeInstanceAllocator: {
-    getAgentConcurrency: () => getEffectiveAgentConcurrency({
-      baseConcurrency: runtimeInstancePool.getAgentConcurrency(),
-      agents: agentStore?.list({ includeArchived: false }) || [],
-    }),
-    reserveWorkerInstance: reservation => reserveWorkerRuntimeInstance(reservation),
-    markInstanceWorking: (instanceId, meta) => runtimeInstancePool.markInstanceWorking(instanceId, meta),
-    markInstanceIdle: instanceId => runtimeInstancePool.markInstanceIdle(instanceId),
-    markInstanceFailed: (instanceId, reason) => runtimeInstancePool.markInstanceFailed(instanceId, reason),
-  },
-});
+const hub = createHubOrExit();
+
+function createHubOrExit() {
+  try {
+    return createHub({
+      eventLogDir: join(KSWARM_HOME, 'events'),
+      silent: false,
+      // Durable per-entity SQLite backend; migrate the legacy JSON snapshot on
+      // first boot. backend is chosen explicitly (never inferred from extension).
+      dataDir: {
+        backend: 'sqlite',
+        filePath: join(KSWARM_HOME, 'state.sqlite'),
+        legacyJsonPath: join(KSWARM_HOME, 'state.json'),
+        silent: false,
+      },
+      getAgentProfiles: () => listAgentProfilesForRouting(),
+      getQualityOverlays: () => qualityOverlayStore.listOverlays(),
+      runtimeInstanceAllocator: {
+        getAgentConcurrency: () => getEffectiveAgentConcurrency({
+          baseConcurrency: runtimeInstancePool.getAgentConcurrency(),
+          agents: agentStore?.list({ includeArchived: false }) || [],
+        }),
+        reserveWorkerInstance: reservation => reserveWorkerRuntimeInstance(reservation),
+        markInstanceWorking: (instanceId, meta) => runtimeInstancePool.markInstanceWorking(instanceId, meta),
+        markInstanceIdle: instanceId => runtimeInstancePool.markInstanceIdle(instanceId),
+        markInstanceFailed: (instanceId, reason) => runtimeInstancePool.markInstanceFailed(instanceId, reason),
+      },
+    });
+  } catch (err) {
+    if (isPersistenceLoadError(err)) {
+      // Unrecoverable load/corruption/migration failure. Exit with the terminal
+      // degraded code so Desktop stops auto-restarting instead of looping forever.
+      console.error(`[KSwarm] Fatal: unrecoverable durable state load: ${err.message}`);
+      process.exit(EXIT_LOAD_UNRECOVERABLE);
+    }
+    throw err;
+  }
+}
 
 // ─── Agent Store ──────────────────────────────────────────────────
 agentStore = createAgentStore();
@@ -3390,9 +3416,27 @@ async function handleRequest(req, res) {
     return json(res, { error: 'not_found', path }, 404);
 
   } catch (err) {
+    if (isPersistenceCommitError(err)) {
+      // A durable commit failed. The mutation's in-memory/broker/event effects are
+      // now uncertain: return 503 and fail-stop so Desktop restarts from the last
+      // durable revision instead of serving unpersisted state.
+      log('error', `Persistence commit failed: ${err.message}`, { path, method: req.method });
+      try { json(res, { error: 'persistence_commit_failed', uncertain: true }, 503); } catch { /* ignore */ }
+      return failStopOnPersistenceCommit();
+    }
     log('error', `API error: ${err.message}`, { path, method: req.method });
     return json(res, { error: err.message }, 500);
   }
+}
+
+let persistenceFailStopScheduled = false;
+function failStopOnPersistenceCommit() {
+  if (persistenceFailStopScheduled) return;
+  persistenceFailStopScheduled = true;
+  log('error', `Fail-stop: exiting with code ${EXIT_SAVE_FAILED} after persistence commit failure`);
+  try { hub.closePersistence(); } catch { /* ignore */ }
+  const timer = setTimeout(() => process.exit(EXIT_SAVE_FAILED), 250);
+  if (typeof timer.unref === 'function') timer.unref();
 }
 
 // ─── Start ────────────────────────────────────────────────────────
@@ -3544,6 +3588,9 @@ function gracefulShutdown(signal) {
   }
   try { hub.persistState(); } catch (err) {
     log('warn', 'Graceful shutdown persist failed', { error: String(err?.message || err) });
+  }
+  try { hub.closePersistence(); } catch (err) {
+    log('warn', 'Graceful shutdown persistence close failed', { error: String(err?.message || err) });
   }
   try { server.close(() => process.exit(0)); } catch { /* ignore */ }
   const forceExit = setTimeout(() => process.exit(0), 3_000);

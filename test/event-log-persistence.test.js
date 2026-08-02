@@ -384,7 +384,6 @@ test('hub integration: events survive close + re-create cycle', async () => {
       poAgent: 'po-1',
       members: [],
     });
-    await new Promise(r => setTimeout(r, 700));
     hub1.persistState();
     hub1.getEventLog().close();
     await new Promise(r => setTimeout(r, 100));
