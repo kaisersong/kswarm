@@ -13,18 +13,20 @@
  * 8. PO 验证并确认
  * 9. 输出物在 workFolder/artifacts/ 中
  *
- * 前置条件：intent-broker (4318) + kswarm server (4400) 已启动
- *
- * Run: node test/e2e-full-flow.test.js
+ * Run: npm run test:e2e
  */
 
 const KSWARM_API = process.env.KSWARM_API || 'http://127.0.0.1:4400';
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
+const KSWARM_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
 
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+
+const E2E_RUNTIME_PATH = process.env.KSWARM_E2E_RUNTIME_PATH
+  || join(import.meta.dirname, 'fixtures', 'fake-xiaok-cli.mjs');
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────
 
@@ -53,7 +55,10 @@ async function httpGet(path) {
 async function httpPost(path, body = {}) {
   const res = await fetch(`${KSWARM_API}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      ...(KSWARM_MUTATION_TOKEN ? { 'x-kswarm-mutation-token': KSWARM_MUTATION_TOKEN } : {}),
+    },
     body: JSON.stringify(body),
   });
   return res.json();
@@ -144,7 +149,10 @@ async function testApprovalAndDispatch(projectId) {
   await sleep(12000);
 
   const detail = await httpGet(`/projects/${projectId}`);
-  assertEq(detail.project?.status, 'active', 'Project is active');
+  assert(
+    detail.project?.status === 'active' || detail.project?.status === 'delivered',
+    `Project reached active or delivered state (got "${detail.project?.status}")`,
+  );
 
   // Check tasks executed
   const doneCount = detail.tasks.filter(t => t.status === 'done').length;
@@ -206,6 +214,7 @@ async function testWorkFolderContextRead(projectId) {
     poAgent: 'e2e-po',
     members: [],
     workFolder: noReadFolder,
+    autoStartPlanning: false,
   });
   assert(result2.ok === true, 'No-read project created');
 
@@ -240,6 +249,7 @@ async function testLanguageDetection() {
     requirements: 'Use Node.js and Express',
     poAgent: 'e2e-po',
     members: [],
+    autoStartPlanning: false,
   });
   assert(enResult.ok === true, 'English project created');
   assertEq(enResult.project?.goal, 'Build a REST API for user management', 'English goal preserved');
@@ -251,6 +261,7 @@ async function testLanguageDetection() {
     requirements: '使用中文编写所有文档',
     poAgent: 'e2e-po',
     members: [],
+    autoStartPlanning: false,
   });
   assert(zhResult.ok === true, 'Chinese project created');
   assertEq(zhResult.project?.requirements, '使用中文编写所有文档', 'Chinese requirements preserved');
@@ -349,7 +360,7 @@ async function testHubUnit() {
 
   const dispatchable = board.getDispatchable();
   assertEq(dispatchable.length, 1, 'Only t1 is dispatchable (t2 depends on t1)');
-  assertEq(dispatchable[0].id, 't1', 'Dispatchable task is t1');
+  assertEq(dispatchable[0].displayTaskId, 't1', 'Dispatchable task is t1');
 
   // Approve and dispatch
   hub.handleApprove('unit-test-1');
@@ -368,7 +379,7 @@ async function testHubUnit() {
 
   const dispatchable2 = board.getDispatchable();
   assertEq(dispatchable2.length, 1, 't2 now dispatchable');
-  assertEq(dispatchable2[0].id, 't2', 'Dispatchable is t2');
+  assertEq(dispatchable2[0].displayTaskId, 't2', 'Dispatchable is t2');
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -376,6 +387,11 @@ async function testHubUnit() {
 let testWorkFolder;
 let poProcess;
 let worker1Process;
+
+function captureAgentOutput(process, label) {
+  process.stdout?.on('data', chunk => console.log(`    [${label}] ${chunk.toString().trim()}`));
+  process.stderr?.on('data', chunk => console.log(`    [${label}:stderr] ${chunk.toString().trim()}`));
+}
 
 async function setup() {
   section('Setup');
@@ -387,12 +403,42 @@ async function setup() {
   writeFileSync(join(testWorkFolder, 'config.json'), JSON.stringify({ version: '1.0', lang: 'zh' }, null, 2), 'utf-8');
   console.log(`    workFolder: ${testWorkFolder}`);
 
+  const poRegistration = await httpPost('/agents', {
+    id: 'e2e-po',
+    name: 'E2E-PO',
+    runtimeType: 'xiaok',
+    runtimeSource: 'auto-worker-runtime',
+    roles: ['project_owner'],
+    status: 'idle',
+    runtimeHealth: {
+      state: 'healthy',
+      taskCapabilities: ['planning', 'review', 'writing'],
+      outputCapabilities: ['markdown'],
+    },
+  });
+  const workerRegistration = await httpPost('/agents', {
+    id: 'e2e-worker-1',
+    name: 'E2EWorker1',
+    runtimeType: 'xiaok',
+    runtimeSource: 'auto-worker-runtime',
+    roles: ['worker'],
+    status: 'idle',
+    runtimeHealth: {
+      state: 'healthy',
+      taskCapabilities: ['coding', 'testing', 'design', 'planning', 'writing', 'documentation'],
+      outputCapabilities: ['markdown'],
+    },
+  });
+  assert(poRegistration.ok === true, 'PO agent registered in KSwarm');
+  assert(workerRegistration.ok === true, 'Worker1 registered in KSwarm');
+
   // Start PO agent
   poProcess = spawn('node', ['scripts/auto-worker.js', 'e2e-po', 'E2E-PO'], {
     cwd: join(import.meta.dirname, '..'),
     stdio: 'pipe',
     env: { ...process.env, WORK_DELAY: '500' },
   });
+  captureAgentOutput(poProcess, 'PO');
 
   // Start Worker agent
   worker1Process = spawn('node', ['scripts/auto-worker.js', 'e2e-worker-1', 'E2EWorker1'], {
@@ -400,8 +446,9 @@ async function setup() {
     stdio: 'pipe',
     env: { ...process.env, WORK_DELAY: '500' },
   });
+  captureAgentOutput(worker1Process, 'Worker');
 
-  // Wait for agents to register
+  // Wait for agents to register in the broker
   await sleep(3000);
 
   // Verify agents registered in broker

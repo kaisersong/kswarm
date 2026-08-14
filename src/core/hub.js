@@ -365,6 +365,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       summary: null,        // Project summary section text (set at synthesize)
       summaryScore: null,   // Project score 1-10 (parsed from synthesis)
       lifecycleVersion: 0,
+      projectRevision: 1,
+      teamPlan: null,
     };
     if (normalizedClientRequestKey) {
       project.clientRequestKey = normalizedClientRequestKey;
@@ -469,6 +471,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       ...project,
       executionMode: normalizeProjectExecutionMode(project?.executionMode),
       lifecycleVersion: Number(project?.lifecycleVersion || 0),
+      projectRevision: Number.isInteger(project?.projectRevision) && project.projectRevision > 0 ? project.projectRevision : 1,
+      teamPlan: project?.teamPlan || null,
     };
     reconcileProjectAgentSelectionWithEffectiveAgents(normalized);
     normalized.preparation = normalizeRecoveredProjectPreparation(normalized, normalized.preparation);
@@ -514,6 +518,53 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     });
     recordHumanAction('update_project_execution_mode', { projectId, executionMode: normalized, updatedBy });
     return { ok: true, project };
+  }
+
+  function setProjectTeamPlan(projectId, teamPlan) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    if (teamPlan?.projectRevision !== project.projectRevision) return { ok: false, error: 'stale_plan' };
+    project.teamPlan = { ...teamPlan, status: teamPlan.status || 'proposed' };
+    project.updatedAt = Date.now();
+    return { ok: true, project };
+  }
+
+  function attachTeamOperationMembers(projectId, { operationId, agentIds = [] } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { ok: false, error: 'project_not_found' };
+    const additions = normalizeAgentIdList(agentIds).filter(agentId => agentId !== project.poAgent);
+    project.members = [...new Set([...(project.members || []), ...additions])];
+    project.agentSelection = normalizeAgentSelection({
+      poAgent: project.poAgent,
+      members: project.members,
+      agentSelection: project.agentSelection,
+    });
+    project.teamPlan = project.teamPlan ? {
+      ...project.teamPlan,
+      status: 'applied',
+      appliedAt: Date.now(),
+      operationId,
+    } : null;
+    bumpProjectRevision(project, 'team_members');
+    return { ok: true, project };
+  }
+
+  function invalidateTeamPlansForAgent(agentId) {
+    let changed = 0;
+    for (const project of projects.values()) {
+      const memberIds = new Set([project.poAgent, ...(project.members || [])]);
+      const referencedByPlan = (project.teamPlan?.roles || []).some(role => role.preferredExistingAgentId === agentId);
+      if (!memberIds.has(agentId) && !referencedByPlan) continue;
+      if (project.teamPlan && project.teamPlan.status !== 'applied') project.teamPlan = { ...project.teamPlan, status: 'stale' };
+      bumpProjectRevision(project, 'agent_team_input');
+      changed += 1;
+    }
+    return changed;
+  }
+
+  function bumpProjectRevision(project, _reason) {
+    project.projectRevision = Number.isInteger(project.projectRevision) ? project.projectRevision + 1 : 1;
+    project.updatedAt = Date.now();
   }
 
   function selectionForTask(project, task) {
@@ -4660,6 +4711,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   // Wrap mutation methods to auto-persist state
   const mutations = {
     createProject,
+    setProjectTeamPlan,
+    attachTeamOperationMembers,
+    invalidateTeamPlansForAgent,
     updateProjectExecutionMode,
     handleApprove,
     activateAndStartProject,
@@ -4724,12 +4778,29 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   }
 
   const persisted = {};
+  const teamInputMutations = new Set([
+    'updateProjectExecutionMode',
+    'handleHumanAddTasks',
+    'handleCreateTasks',
+    'handleAssignTask',
+    'handleReassignTask',
+    'handleSubmitPlan',
+    'handleRevisePlan',
+  ]);
   for (const [name, fn] of Object.entries(mutations)) {
     persisted[name] = (...args) => {
       // Gate: after a durable-commit failure, reject subsequent mutations before
       // they run business logic (their in-memory/broker effects would be uncertain).
       assertPersistenceHealthy();
       const result = fn(...args);
+      if (teamInputMutations.has(name)) {
+        const projectId = typeof args[0] === 'string' ? args[0] : args[0]?.id;
+        const project = projects.get(projectId);
+        if (project) {
+          if (project.teamPlan && project.teamPlan.status !== 'applied') project.teamPlan = { ...project.teamPlan, status: 'stale' };
+          bumpProjectRevision(project, name);
+        }
+      }
       const scope = resolveMutationScope(name, args, persistenceLookups);
       persistState(scope);
       return result;
@@ -4772,6 +4843,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     listProjectWorkflowRuns,
     getWorkflowRun,
     getHumanActions,
+    setProjectTeamPlan: persisted.setProjectTeamPlan,
+    attachTeamOperationMembers: persisted.attachTeamOperationMembers,
+    invalidateTeamPlansForAgent: persisted.invalidateTeamPlansForAgent,
     persistState,
     getPersistenceHealth,
     closePersistence,

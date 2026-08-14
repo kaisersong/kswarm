@@ -14,6 +14,9 @@ import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
+import { getCapabilityCatalog } from '../core/capability-catalog.js';
+import { createTeamOperationStore } from '../core/team-operation-store.js';
+import { createMutationAuthority, createTeamProvisioningHub } from '../core/persistence-hub.js';
 import { createBrokerClient } from '../net/broker-client.js';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
 import { basename, join, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -61,6 +64,7 @@ import {
   createAutoWorkerSpawnConfig,
   spawnAutoWorkerProcess,
 } from './auto-worker-process.js';
+import { buildAgentChildEnv } from './agent-child-env.js';
 import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
 import { canSpawnAutoWorkerForTask } from '../core/runtime-execution-boundary.js';
 import { createBrokerTaskRequest } from './broker-task-request.js';
@@ -98,6 +102,7 @@ const KSWARM_HOME = join(homedir(), '.kswarm');
 const PROJECTS_DIR = join(KSWARM_HOME, 'projects');
 mkdirSync(PROJECTS_DIR, { recursive: true });
 const qualityOverlayStore = createQualityOverlayStore(join(KSWARM_HOME, 'quality-overlays.json'));
+const mutationAuthority = createMutationAuthority({ token: DESKTOP_MUTATION_TOKEN });
 
 // ─── Hub Instance ─────────────────────────────────────────────────
 let agentStore = null;
@@ -155,7 +160,16 @@ function createHubOrExit() {
 }
 
 // ─── Agent Store ──────────────────────────────────────────────────
-agentStore = createAgentStore();
+agentStore = createAgentStore({
+  onTeamRelevantChange: ({ agentId }) => hub.invalidateTeamPlansForAgent(agentId),
+});
+const teamOperationStore = createTeamOperationStore({ filePath: join(KSWARM_HOME, 'team-operations.json') });
+const teamProvisioningHub = createTeamProvisioningHub({
+  hub,
+  agentStore,
+  operationStore: teamOperationStore,
+  catalog: getCapabilityCatalog(),
+});
 const heartbeatManager = createHeartbeatManager(hub);
 heartbeatManager.start();
 // On server start, all old worker processes are dead — reset to offline
@@ -1287,27 +1301,6 @@ async function isAgentOnBroker(agentId) {
   }
 }
 
-function buildAgentChildEnv(agent, agentId, runtime = {}) {
-  const childEnv = { ...process.env, ...agent.customEnv };
-  if (agent.provider) {
-    if (agent.provider === 'openai') {
-      if (agent.apiKey) childEnv.OPENAI_API_KEY = agent.apiKey;
-      if (agent.baseUrl) childEnv.OPENAI_BASE_URL = agent.baseUrl;
-      if (agent.model) childEnv.OPENAI_MODEL = agent.model;
-    } else if (agent.provider === 'anthropic') {
-      if (agent.apiKey) childEnv.ANTHROPIC_API_KEY = agent.apiKey;
-      if (agent.model) childEnv.ANTHROPIC_MODEL = agent.model;
-    } else if (agent.provider === 'ollama') {
-      if (agent.baseUrl) childEnv.OLLAMA_BASE_URL = agent.baseUrl;
-      if (agent.model) childEnv.OLLAMA_MODEL = agent.model;
-    }
-  }
-  childEnv.KSWARM_AGENT_ID = agentId;
-  if (runtime.logicalAgentId) childEnv.KSWARM_LOGICAL_AGENT_ID = runtime.logicalAgentId;
-  if (runtime.projectId) childEnv.KSWARM_PROJECT_ID = runtime.projectId;
-  return childEnv;
-}
-
 function autoWorkerSpawnConfig(agentId, alias, customArgs = [], env = process.env) {
   return createAutoWorkerSpawnConfig({
     scriptPath: join(import.meta.dirname, '../../scripts/auto-worker.js'),
@@ -1349,7 +1342,7 @@ function spawnRuntimeInstance(instance, logicalAgent) {
     return { ok: true, instanceId: instance.instanceId, pid: instance.pid, alreadyRunning: true };
   }
 
-  const childEnv = buildAgentChildEnv(logicalAgent, instance.instanceId, {
+  const childEnv = buildAgentChildEnv(logicalAgent, instance.instanceId, process.env, {
     logicalAgentId: logicalAgent.id,
     projectId: instance.role === 'project_owner' ? instance.projectId : undefined,
   });
@@ -1629,10 +1622,13 @@ function parseBody(req) {
 }
 
 function resolveDesktopMutationContext(req) {
-  const token = String(req.headers['x-kswarm-mutation-token'] || '');
-  if (!DESKTOP_MUTATION_TOKEN || token !== DESKTOP_MUTATION_TOKEN) {
-    return { ok: false, error: 'unauthorized_transport' };
-  }
+  const result = mutationAuthority.authorize({
+    method: req.method || 'GET',
+    path: new URL(req.url || '/', `http://localhost:${PORT}`).pathname,
+    headers: req.headers,
+    requestSource: 'user',
+  });
+  if (!result.ok) return { ok: false, error: result.error, status: result.status || 401 };
   return {
     ok: true,
     requestContext: {
@@ -1642,6 +1638,35 @@ function resolveDesktopMutationContext(req) {
       transport: 'desktop_ipc',
     },
   };
+}
+
+function redactTeamOperation(operation) {
+  return {
+    ...operation,
+    provisioningIntents: Array.isArray(operation.provisioningIntents)
+      ? operation.provisioningIntents.map(intent => ({
+          intentId: intent.intentId,
+          desiredAgentId: intent.desiredAgentId,
+          roleKey: intent.roleKey,
+          status: intent.status,
+        }))
+      : [],
+  };
+}
+
+function redactProjectTeamResponse(project) {
+  if (!project || typeof project !== 'object') return project;
+  return {
+    id: project.id,
+    projectRevision: project.projectRevision,
+    members: project.members,
+    poAgent: project.poAgent,
+    teamPlan: project.teamPlan,
+  };
+}
+
+function hasForbiddenAgentPayload(body) {
+  return ['apiKey', 'baseUrl', 'customEnv', 'runtimePath', 'execution'].some(key => body && Object.hasOwn(body, key));
 }
 
 function json(res, data, status = 200) {
@@ -1726,11 +1751,16 @@ async function handleRequest(req, res) {
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, startPolicy, requestedStartPolicy, autoStartPlanning, clientRequestKey } = body;
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
+      const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, startPolicy, requestedStartPolicy, autoStartPlanning, clientRequestKey, memberCount } = body;
       if (!name || !poAgent) return json(res, { error: 'name and poAgent required' }, 400);
       const shouldAutoStartPlanning = autoStartPlanning !== false;
       const resolvedPoAgent = poAgent;
       const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== resolvedPoAgent) : [];
+      if (Number.isInteger(memberCount) && memberCount > resolvedMembers.length + 1) {
+        return json(res, { ok: false, error: 'team_reconcile_required' }, 409);
+      }
       const normalizedAgentSelection = normalizeProjectAgentSelection({
         poAgent: resolvedPoAgent,
         members: resolvedMembers,
@@ -1783,10 +1813,62 @@ async function handleRequest(req, res) {
       return json(res, { ok: true, project, preparation, planningStart }, 201);
     }
 
+    if (path === '/agents/capability-catalog' && req.method === 'GET') {
+      return json(res, getCapabilityCatalog());
+    }
+
+    const teamPlanMatch = path.match(/^\/projects\/([^/]+)\/team\/plan$/);
+    if (teamPlanMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok || body.requestSource !== 'user') return json(res, { ok: false, error: context.ok ? 'request_source_denied' : context.error }, context.ok ? 403 : (context.status || 401));
+      const result = teamProvisioningHub.plan({
+        projectId: teamPlanMatch[1],
+        expectedProjectRevision: body.expectedProjectRevision,
+        catalogVersion: body.catalogVersion,
+        needs: body.needs,
+      });
+      return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 409);
+    }
+
+    const teamReconcileMatch = path.match(/^\/projects\/([^/]+)\/team\/reconcile$/);
+    if (teamReconcileMatch && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok || body.requestSource !== 'user') return json(res, { ok: false, error: context.ok ? 'request_source_denied' : context.error }, context.ok ? 403 : (context.status || 401));
+      const result = teamProvisioningHub.reconcile({
+        projectId: teamReconcileMatch[1],
+        planDigest: body.planDigest,
+        expectedProjectRevision: body.expectedProjectRevision,
+        clientRequestKey: body.clientRequestKey,
+        requestSource: body.requestSource,
+      });
+      if (result.operation) result.operation = redactTeamOperation(result.operation);
+      if (result.project) result.project = redactProjectTeamResponse(result.project);
+      return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 409);
+    }
+
+    const latestTeamOperationMatch = path.match(/^\/projects\/([^/]+)\/team\/operations\/latest$/);
+    if (latestTeamOperationMatch && req.method === 'GET') {
+      const operation = teamOperationStore.findLatestByProject(latestTeamOperationMatch[1]);
+      return json(res, { ok: true, operation: operation ? redactTeamOperation(operation) : null });
+    }
+
+    const teamOperationMatch = path.match(/^\/projects\/([^/]+)\/team\/operations\/([^/]+)$/);
+    if (teamOperationMatch && req.method === 'GET') {
+      const operation = teamOperationStore.get(teamOperationMatch[2]);
+      if (!operation || operation.projectId !== teamOperationMatch[1]) {
+        return json(res, { ok: false, error: 'operation_not_found' }, 404);
+      }
+      return json(res, { ok: true, operation: redactTeamOperation(operation) });
+    }
+
     const executionModeMatch = path.match(/^\/projects\/([^/]+)\/execution-mode$/);
     if (executionModeMatch && req.method === 'PATCH') {
       const projectId = executionModeMatch[1];
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.updateProjectExecutionMode(projectId, body?.executionMode, {
         updatedBy: body?.updatedBy || 'human',
       });
@@ -2151,6 +2233,8 @@ async function handleRequest(req, res) {
 
     // ── Delete project (Human only) ──
     if (projectMatch && req.method === 'DELETE') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.deleteProject(projectMatch[1]);
       if (result.ok) {
         log('info', `Human deleted project: ${projectMatch[1]}`);
@@ -3219,11 +3303,14 @@ async function handleRequest(req, res) {
     // ── Create agent ──
     if (path === '/agents' && req.method === 'POST') {
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
+      if (hasForbiddenAgentPayload(body)) return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
       const result = agentStore.create(body);
       if (result.error) return json(res, result, result.code || 400);
       log('info', `Agent created: ${result.agent.name} (${result.agent.id})`);
       broadcast({ type: 'agent_created', agent: agentStore.redact(result.agent) });
-      return json(res, { ok: true, agent: result.agent }, 201);
+      return json(res, { ok: true, agent: agentStore.redact(result.agent), reused: result.reused === true }, result.reused ? 200 : 201);
     }
 
     // ── Agent heartbeat ping ──
@@ -3258,19 +3345,24 @@ async function handleRequest(req, res) {
       if (req.method === 'GET') {
         const agent = agentStore.get(agentId);
         if (!agent) return json(res, { error: 'agent not found' }, 404);
-        return json(res, { agent });
+        return json(res, { agent: agentStore.redact(agent) });
       }
 
       if (req.method === 'PUT') {
         const body = await parseBody(req);
+        const context = resolveDesktopMutationContext(req);
+        if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
+        if (hasForbiddenAgentPayload(body)) return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
         const result = agentStore.update(agentId, body);
         if (result.error) return json(res, result, result.code || 400);
         log('info', `Agent updated: ${result.agent.name} (${agentId})`);
         broadcast({ type: 'agent_updated', agent: agentStore.redact(result.agent) });
-        return json(res, { ok: true, agent: result.agent });
+        return json(res, { ok: true, agent: agentStore.redact(result.agent) });
       }
 
       if (req.method === 'DELETE') {
+        const context = resolveDesktopMutationContext(req);
+        if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
         const result = agentStore.archive(agentId);
         if (result.error) return json(res, result, result.code || 400);
         log('info', `Agent archived: ${agentId}`);
@@ -3282,6 +3374,8 @@ async function handleRequest(req, res) {
     // ── Archive/Restore agent ──
     const agentArchiveMatch = path.match(/^\/agents\/([^/]+)\/archive$/);
     if (agentArchiveMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = agentStore.archive(agentArchiveMatch[1]);
       if (result.error) return json(res, result, result.code || 400);
       log('info', `Agent archived: ${agentArchiveMatch[1]}`);
@@ -3291,6 +3385,8 @@ async function handleRequest(req, res) {
 
     const agentRestoreMatch = path.match(/^\/agents\/([^/]+)\/restore$/);
     if (agentRestoreMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = agentStore.restore(agentRestoreMatch[1]);
       if (result.error) return json(res, result, result.code || 400);
       log('info', `Agent restored: ${agentRestoreMatch[1]}`);
@@ -3301,6 +3397,8 @@ async function handleRequest(req, res) {
     // ── Start agent (spawn a worker process for this agent) ──
     const agentStartMatch = path.match(/^\/agents\/([^/]+)\/start$/);
     if (agentStartMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const agentId = agentStartMatch[1];
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
@@ -3338,6 +3436,8 @@ async function handleRequest(req, res) {
     // ── Stop agent ──
     const agentStopMatch = path.match(/^\/agents\/([^/]+)\/stop$/);
     if (agentStopMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const agentId = agentStopMatch[1];
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
@@ -3357,6 +3457,8 @@ async function handleRequest(req, res) {
     // ── Restart agent (force kill + respawn with latest code) ──
     const agentRestartMatch = path.match(/^\/agents\/([^/]+)\/restart$/);
     if (agentRestartMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const agentId = agentRestartMatch[1];
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
@@ -3371,6 +3473,8 @@ async function handleRequest(req, res) {
     // ── Probe agent CLI health ──
     const agentProbeMatch = path.match(/^\/agents\/([^/]+)\/probe$/);
     if (agentProbeMatch && req.method === 'GET') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const agentId = agentProbeMatch[1];
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
@@ -3386,7 +3490,7 @@ async function handleRequest(req, res) {
     const agentLLMMatch = path.match(/^\/agents\/([^/]+)\/llm$/);
     if (agentLLMMatch && req.method === 'GET') {
       const config = agentStore.resolveLLMConfig(agentLLMMatch[1]);
-      return json(res, { agentId: agentLLMMatch[1], llm: config ? { ...config, apiKey: config.apiKey ? '****' : null } : null });
+      return json(res, { agentId: agentLLMMatch[1], llm: config ? { provider: config.provider, model: config.model } : null });
     }
 
     // ── LLM: list supported providers ──

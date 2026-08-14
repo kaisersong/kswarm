@@ -15,6 +15,7 @@ import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
 import { createUnknownRuntimeHealth, recordRuntimeSuccess } from './runtime-health.js';
 import { resolveAgentExecution } from './agent-execution.js';
+import { CAPABILITY_DEFINITIONS } from './capability-catalog.js';
 
 const KSWARM_HOME = join(homedir(), '.kswarm');
 const AGENTS_FILE = join(KSWARM_HOME, 'agents.json');
@@ -22,32 +23,7 @@ const XIAOK_PO_SEED_ID = 'xiaok-po';
 const XIAOK_WORKER_SEED_ID = 'xiaok-worker';
 const DESKTOP_AGENT_RUNTIME_SOURCE = 'desktop-agent-runtime';
 const XIAOK_DESKTOP_HOST_PARTICIPANT_ID = 'xiaok-desktop';
-const XIAOK_FULL_TASK_CAPABILITIES = [
-  'coding',
-  'testing',
-  'qa',
-  'design',
-  'planning',
-  'research',
-  'analysis',
-  'source_research',
-  'web_research',
-  'writing',
-  'documentation',
-  'review',
-  'product',
-  'requirements',
-  'architecture',
-  'system-design',
-  'engineering',
-  'devops',
-  'deployment',
-  'data_analysis',
-  'report_generation',
-  'presentation_generation',
-  'presentation_content',
-  'slide_generation',
-];
+const XIAOK_FULL_TASK_CAPABILITIES = CAPABILITY_DEFINITIONS.map(definition => definition.key);
 const XIAOK_DIRECT_OUTPUT_CAPABILITIES = ['markdown', 'html', 'report_html', 'text', 'json', 'csv'];
 
 // ─── Agent Schema ─────────────────────────────────────────────────────────────
@@ -209,6 +185,14 @@ export function createAgentStore(options = {}) {
   let agents = new Map(); // id → Agent
   let needsSaveAfterLoad = false;
   const storeFile = options.filePath || AGENTS_FILE;
+  const onTeamRelevantChange = typeof options.onTeamRelevantChange === 'function'
+    ? options.onTeamRelevantChange
+    : null;
+
+  function notifyTeamRelevantChange(agent, change) {
+    if (!onTeamRelevantChange || !agent?.id) return;
+    onTeamRelevantChange({ agentId: agent.id, change, agent });
+  }
 
   // Load from disk
   _load();
@@ -302,6 +286,14 @@ export function createAgentStore(options = {}) {
   // ─── CRUD ─────────────────────────────────────────────────────────
 
   function create(data) {
+    const requestedId = data.id || randomUUID().slice(0, 12);
+    const existingById = agents.get(requestedId);
+    if (existingById) {
+      if (sameProvisioningProvenance(existingById, data)) {
+        return { ok: true, reused: true, agent: existingById };
+      }
+      return { error: 'agent_id_conflict', code: 409 };
+    }
     // Validate name uniqueness
     const existing = Array.from(agents.values()).find(
       a => a.name === data.name && !a.archivedAt
@@ -313,7 +305,7 @@ export function createAgentStore(options = {}) {
     const agent = {
       ...AGENT_DEFAULTS,
       ...data,
-      id: data.id || randomUUID().slice(0, 12),
+      id: requestedId,
       createdAt: Date.now(),
       archivedAt: null,
     };
@@ -323,6 +315,7 @@ export function createAgentStore(options = {}) {
 
     agents.set(agent.id, normalizeAgent(agent));
     _save();
+    notifyTeamRelevantChange(agents.get(agent.id), 'create');
     return { ok: true, agent: agents.get(agent.id) };
   }
 
@@ -366,6 +359,7 @@ export function createAgentStore(options = {}) {
 
     agents.set(id, normalizeAgent(updated));
     _save();
+    notifyTeamRelevantChange(agents.get(id), 'update');
     return { ok: true, agent: agents.get(id) };
   }
 
@@ -378,6 +372,7 @@ export function createAgentStore(options = {}) {
     agent.status = 'offline';
     agent.runtimeId = null;
     _save();
+    notifyTeamRelevantChange(agent, 'archive');
     return { ok: true, agent };
   }
 
@@ -389,14 +384,17 @@ export function createAgentStore(options = {}) {
     agent.archivedAt = null;
     agent.archivedBy = null;
     _save();
+    notifyTeamRelevantChange(agent, 'restore');
     return { ok: true, agent };
   }
 
   function remove(id) {
     // Hard delete (use archive for soft delete)
     if (!agents.has(id)) return { error: 'agent not found', code: 404 };
+    const agent = agents.get(id);
     agents.delete(id);
     _save();
+    notifyTeamRelevantChange(agent, 'remove');
     return { ok: true };
   }
 
@@ -408,6 +406,7 @@ export function createAgentStore(options = {}) {
     agent.status = status;
     if (runtimeId !== undefined) agent.runtimeId = runtimeId;
     _save();
+    notifyTeamRelevantChange(agent, 'status');
   }
 
   function setOnline(id, runtimeId) {
@@ -423,6 +422,7 @@ export function createAgentStore(options = {}) {
       }
     );
     _save();
+    notifyTeamRelevantChange(agent, 'runtime_health');
   }
 
   function setOffline(id) {
@@ -435,6 +435,7 @@ export function createAgentStore(options = {}) {
       taskCapabilities: agent.taskCapabilities || agent.capabilities || AGENT_DEFAULTS.capabilities,
     });
     _save();
+    notifyTeamRelevantChange(agent, 'runtime_health');
   }
 
   function updateRuntimeHealth(id, runtimeHealth) {
@@ -442,6 +443,7 @@ export function createAgentStore(options = {}) {
     if (!agent) return { error: 'agent not found', code: 404 };
     agent.runtimeHealth = normalizeRuntimeHealth(agent, runtimeHealth);
     _save();
+    notifyTeamRelevantChange(agent, 'runtime_health');
     return { ok: true, agent };
   }
 
@@ -516,13 +518,11 @@ export function createAgentStore(options = {}) {
   function redact(agent) {
     if (!agent) return null;
     const copy = { ...agent };
-    if (copy.apiKey) copy.apiKey = '****';
-    if (copy.customEnv && Object.keys(copy.customEnv).length > 0) {
-      copy.customEnv = Object.fromEntries(
-        Object.keys(copy.customEnv).map(k => [k, '****'])
-      );
-      copy.customEnvRedacted = true;
-    }
+    delete copy.apiKey;
+    delete copy.baseUrl;
+    delete copy.customEnv;
+    delete copy.runtimePath;
+    delete copy.execution;
     return copy;
   }
 
@@ -564,6 +564,16 @@ function normalizeAgent(agent) {
   normalized.execution = resolveAgentExecution(normalized);
   normalized.runtimeHealth = normalizeRuntimeHealth(normalized, normalized.runtimeHealth);
   return normalized;
+}
+
+function sameProvisioningProvenance(existing, requested) {
+  const current = existing?.provisioning;
+  const proposed = requested?.provisioning;
+  return Boolean(
+    current && proposed
+    && current.operationId === proposed.operationId
+    && current.roleKey === proposed.roleKey
+  );
 }
 
 function isXiaokRuntime(agent = {}) {

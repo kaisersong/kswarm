@@ -127,6 +127,8 @@ function firstArgProjectId(args) {
 
 const PROJECT_FIRST_ARG = new Set([
   'createProject',
+  'setProjectTeamPlan',
+  'attachTeamOperationMembers',
   'updateProjectExecutionMode',
   'handleApprove',
   'activateAndStartProject',
@@ -190,6 +192,7 @@ const GLOBAL_MUTATIONS = new Set([
 ]);
 
 export function resolveMutationScope(name, args = [], lookups = {}) {
+  if (name === 'invalidateTeamPlansForAgent') return FULL_SCOPE;
   if (GLOBAL_MUTATIONS.has(name)) return FULL_SCOPE;
   if (PROJECT_FIRST_ARG.has(name)) return projectScope(firstArgProjectId(args));
   if (PROPOSAL_KEYED.has(name)) {

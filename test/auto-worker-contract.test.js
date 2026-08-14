@@ -166,6 +166,14 @@ test('worker supports separate logical agent and runtime instance identity', () 
   assert.match(source, /fetch\(`\$\{KSWARM_API\}\/agents\/\$\{LOGICAL_AGENT_ID\}`\)/);
 });
 
+test('worker restores private CLI execution config from trusted process environment after public agent redaction', () => {
+  assert.match(source, /KSWARM_AGENT_RUNTIME_TYPE/);
+  assert.match(source, /KSWARM_AGENT_RUNTIME_PATH/);
+  assert.match(source, /KSWARM_AGENT_RUNTIME_MODEL/);
+  assert.match(source, /function applyPrivateRuntimeEnv/);
+  assert.match(source, /agentConfig\s*=\s*applyPrivateRuntimeEnv\(data\.agent/);
+});
+
 test('auto-worker refuses desktop-managed seed user tasks unless explicitly running maintenance mode', () => {
   assert.match(source, /function isDesktopManagedSeedConfig/);
   assert.match(source, /KSWARM_AUTO_WORKER_MODE/);

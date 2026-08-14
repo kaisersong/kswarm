@@ -163,7 +163,7 @@ async function loadAgentConfig() {
     const res = await fetch(`${KSWARM_API}/agents/${LOGICAL_AGENT_ID}`);
     if (res.ok) {
       const data = await res.json();
-      agentConfig = data.agent;
+      agentConfig = applyPrivateRuntimeEnv(data.agent);
       console.log(`[${ALIAS}] Agent config loaded from server: ${agentConfig.name}`);
 
       // Log runtime info
@@ -214,6 +214,15 @@ async function loadAgentConfig() {
   } else {
     console.log(`[${ALIAS}] LLM: not configured (using template fallback)`);
   }
+}
+
+function applyPrivateRuntimeEnv(config = {}) {
+  return {
+    ...config,
+    runtimeType: process.env.KSWARM_AGENT_RUNTIME_TYPE || config.runtimeType,
+    runtimePath: process.env.KSWARM_AGENT_RUNTIME_PATH || config.runtimePath,
+    runtimeModel: process.env.KSWARM_AGENT_RUNTIME_MODEL || config.runtimeModel,
+  };
 }
 
 function isDesktopManagedSeedConfig(config = {}) {
