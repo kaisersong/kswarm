@@ -332,7 +332,14 @@ export function createTaskBoard(projectId = 'legacy-project') {
   function recoverSubmission(taskId, result, meta = {}) {
     const task = getTask(taskId);
     if (!task) return { ok: false, error: 'task_not_found' };
-    if (!['cancelled', 'failed', 'blocked', 'in_progress', 'accepted', 'dispatched'].includes(task.status)) {
+    const pendingFailedArtifactRecovery = task.status === 'pending'
+      && meta.allowPendingFailedArtifactRecovery === true
+      && !task.activeRunId
+      && !task.runLease
+      && Number.isFinite(Number(task.failedAt))
+      && Number(task.failedAt) > 0
+      && Boolean(String(task.failureReason || task.lastFailureClass || '').trim());
+    if (!['cancelled', 'failed', 'blocked', 'in_progress', 'accepted', 'dispatched'].includes(task.status) && !pendingFailedArtifactRecovery) {
       return { ok: false, error: `cannot_recover_from_status: ${task.status}` };
     }
     const oldStatus = task.status;

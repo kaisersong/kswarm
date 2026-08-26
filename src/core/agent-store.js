@@ -64,6 +64,7 @@ const AGENT_DEFAULTS = {
   capabilities: ['coding', 'testing', 'design', 'planning'],
   roles: ['worker'],
   maxConcurrentTasks: 6,
+  fallbackToDesktopModel: false,
   status: 'offline',
   runtimeId: null,
   runtimeMode: 'local',

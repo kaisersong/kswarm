@@ -56,12 +56,31 @@ export function resolveProjectIntervention({
     }));
   }
 
-  const intervention = deriveProjectIntervention({
+  let intervention = deriveProjectIntervention({
     project,
     tasks: board.getAllTasks(),
     agents,
     now,
   });
+  const explicitTask = request.expectedPrimaryTaskId
+    ? board.getTask(request.expectedPrimaryTaskId)
+    : null;
+  const pendingArtifactRecovery = isPendingArtifactRecoveryCandidate(explicitTask, request);
+  if (!intervention?.required && pendingArtifactRecovery) {
+    intervention = {
+      ...intervention,
+      required: true,
+      reason: 'prepared_artifact_recovery',
+      primaryTaskId: explicitTask.id,
+      primaryTaskTitle: explicitTask.title || explicitTask.id,
+      primaryAction: {
+        id: 'repair_and_submit',
+        strategy: 'recover_submission',
+        taskId: explicitTask.id,
+        taskUpdatedAt: explicitTask.updatedAt || null,
+      },
+    };
+  }
   if (!intervention?.required) {
     return remember(project, idempotencyKey, requestHash, notAdvanced({
       ok: false,
@@ -107,7 +126,7 @@ export function resolveProjectIntervention({
     validatedArtifacts.push(validation.artifact);
   }
 
-  if (!['cancelled', 'failed', 'in_progress', 'accepted', 'dispatched', 'blocked'].includes(task.status)) {
+  if (!['cancelled', 'failed', 'in_progress', 'accepted', 'dispatched', 'blocked'].includes(task.status) && !pendingArtifactRecovery) {
     return remember(project, idempotencyKey, requestHash, notAdvanced({
       ok: false,
       error: `cannot_repair_from_status: ${task.status}`,
@@ -161,8 +180,9 @@ export function resolveProjectIntervention({
 
   const recovered = recoverSubmission
     ? recoverSubmission(task.id, resultPayload, fromAgent, {
-        recoveryReason: 'intervention_repair_and_submit',
-        idempotencyKey,
+      recoveryReason: 'intervention_repair_and_submit',
+      idempotencyKey,
+      allowPendingFailedArtifactRecovery: pendingArtifactRecovery,
       })
     : { ok: false, error: 'recover_submission_unavailable' };
   if (!recovered.ok) {
@@ -213,6 +233,16 @@ export function resolveProjectIntervention({
     reviewNotification,
     ...(reviewNotificationError ? { reviewNotificationError } : {}),
   });
+}
+
+function isPendingArtifactRecoveryCandidate(task, request = {}) {
+  if (!task || task.status !== 'pending') return false;
+  if (!request.expectedPrimaryTaskId || request.expectedPrimaryTaskId !== task.id) return false;
+  if (request.expectedTaskUpdatedAt === undefined || request.expectedTaskUpdatedAt === null) return false;
+  if (Number(request.expectedTaskUpdatedAt) !== Number(task.updatedAt || 0)) return false;
+  if (task.activeRunId || task.runLease) return false;
+  if (!Number.isFinite(Number(task.failedAt)) || Number(task.failedAt) <= 0) return false;
+  return Boolean(String(task.failureReason || task.lastFailureClass || '').trim());
 }
 
 export function validateRepairArtifact(input = {}) {

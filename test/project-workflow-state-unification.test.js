@@ -138,6 +138,46 @@ test('legacy workflow completion with pending board becomes reconciliation, not 
   assert.equal(lifecycle.issues.some(issue => issue.kind === 'legacy_board_pending_conflict'), false);
 });
 
+test('historical failed retry does not block lifecycle after its parent returns to pending', () => {
+  const lifecycle = deriveProjectLifecycle({
+    project: { id: 'proj-retry-history', status: 'active' },
+    tasks: [
+      { id: 'proj-retry-history__item-1', title: '当前任务', status: 'pending', required: true },
+      {
+        id: 'proj-retry-history__item-1-retry-1',
+        title: '当前任务',
+        status: 'failed',
+        required: true,
+        parentTaskId: 'proj-retry-history__item-1',
+        failureReason: 'runtime_stalled',
+      },
+    ],
+  });
+
+  assert.equal(lifecycle.state, 'active');
+  assert.equal(lifecycle.canDispatch, true);
+  assert.equal(lifecycle.counts.failed, 1);
+});
+
+test('failed retry remains a lifecycle blocker while its parent is failed', () => {
+  const lifecycle = deriveProjectLifecycle({
+    project: { id: 'proj-retry-blocked', status: 'active' },
+    tasks: [
+      { id: 'proj-retry-blocked__item-1', title: '当前任务', status: 'failed', required: true },
+      {
+        id: 'proj-retry-blocked__item-1-retry-1',
+        title: '当前任务',
+        status: 'failed',
+        required: true,
+        parentTaskId: 'proj-retry-blocked__item-1',
+      },
+    ],
+  });
+
+  assert.equal(lifecycle.state, 'blocked');
+  assert.equal(lifecycle.canDispatch, false);
+});
+
 test('agent workflow deliverable is a candidate until user approves it', () => {
   const hub = createHub({ silent: true });
   const projectId = 'proj-agent-candidate';

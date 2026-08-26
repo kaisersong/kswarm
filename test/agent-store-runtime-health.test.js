@@ -70,10 +70,32 @@ test('legacy agents loaded without runtimeHealth receive defaults on read', asyn
     const store = createAgentStore();
     const agent = store.get('legacy');
 
+    assert.equal(agent.fallbackToDesktopModel, false);
     assert.equal(agent.runtimeHealth.state, 'unknown');
     assert.deepEqual(agent.runtimeHealth.outputCapabilities, ['markdown']);
     assert.deepEqual(agent.runtimeHealth.taskCapabilities, ['planning']);
     assert.equal(existsSync(agentsFile), true);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('agent store persists explicit desktop model fallback preference', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'kswarm-agent-store-'));
+  try {
+    const { createAgentStore } = await importFreshAgentStore(home);
+    const store = createAgentStore();
+    store.create({
+      id: 'external-worker',
+      name: 'External worker',
+      runtimeType: 'codex',
+      runtimePath: '/bin/echo',
+      fallbackToDesktopModel: true,
+    });
+
+    assert.equal(store.get('external-worker').fallbackToDesktopModel, true);
+    const persisted = JSON.parse(readFileSync(join(home, '.kswarm', 'agents.json'), 'utf-8'));
+    assert.equal(persisted.find(a => a.id === 'external-worker').fallbackToDesktopModel, true);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

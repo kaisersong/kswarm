@@ -1,8 +1,31 @@
 import { execFileSync } from 'node:child_process';
 import { createUnknownRuntimeHealth, recordProbeResult, recordRuntimeSuccess } from './runtime-health.js';
 
+const GENERATION_PROBE_PROMPT = 'Reply with exactly OK. Do not use tools or modify files.';
+const GENERATION_PROBE_TYPES = new Set(['claude', 'codex', 'opencode', 'gemini']);
+
+export function supportsGenerationProbe(runtimeType) {
+  return GENERATION_PROBE_TYPES.has(String(runtimeType || '').trim().toLowerCase());
+}
+
+export async function probeAgentGeneration(agent = {}, options = {}) {
+  if (!agent.runtimePath || !supportsGenerationProbe(agent.runtimeType)) {
+    return { ok: false, output: '', unsupported: true };
+  }
+  const runCommand = options.runCommand || defaultRunCommand;
+  const args = generationProbeArgs(agent.runtimeType, agent.model);
+  const startedAt = Date.now();
+  const output = await runCommand(agent.runtimePath, args, { timeout: options.timeoutMs || 30_000 });
+  return {
+    ok: Boolean(String(output || '').trim()),
+    output: String(output || '').trim(),
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 export async function probeAgentRuntime(agent = {}, options = {}) {
   const now = options.now ?? Date.now();
+  const startedAt = Date.now();
   const runCommand = options.runCommand || defaultRunCommand;
   const enableGenerationProbe = options.enableGenerationProbe === true;
   const generationProbe = options.generationProbe || null;
@@ -23,6 +46,8 @@ export async function probeAgentRuntime(agent = {}, options = {}) {
       probe: 'skip',
       message: agent.runtimeType === 'xiaok' ? 'xiaok builtin runtime' : 'No CLI runtime (builtin/API mode)',
       healthy: true,
+      callability: 'limited',
+      durationMs: Date.now() - startedAt,
       runtimeHealth,
     };
   }
@@ -39,7 +64,10 @@ export async function probeAgentRuntime(agent = {}, options = {}) {
       ...base,
       probe: 'fail',
       message: 'runtimePath not set',
+      error: 'runtimePath not set',
       healthy: false,
+      callability: 'unavailable',
+      durationMs: Date.now() - startedAt,
       runtimeHealth,
     };
   }
@@ -53,7 +81,10 @@ export async function probeAgentRuntime(agent = {}, options = {}) {
     if (enableGenerationProbe && generationProbe) {
       generationSkipped = false;
       try {
-        generationOk = Boolean(await generationProbe(agent));
+        const generationResult = await generationProbe(agent);
+        generationOk = typeof generationResult === 'object'
+          ? generationResult?.ok === true && Boolean(String(generationResult?.output || '').trim())
+          : Boolean(generationResult);
       } catch (err) {
         generationError = err.message || String(err);
       }
@@ -73,7 +104,10 @@ export async function probeAgentRuntime(agent = {}, options = {}) {
       ...base,
       probe: 'ok',
       version: firstLine(output),
-      healthy: true,
+      healthy: generationSkipped || generationOk,
+      callability: generationSkipped ? 'limited' : generationOk ? 'available' : 'unavailable',
+      durationMs: Date.now() - startedAt,
+      ...(generationError ? { message: generationError, error: generationError } : {}),
       runtimeHealth,
     };
   } catch (err) {
@@ -89,7 +123,10 @@ export async function probeAgentRuntime(agent = {}, options = {}) {
       ...base,
       probe: 'fail',
       message,
+      error: message,
       healthy: false,
+      callability: 'unavailable',
+      durationMs: Date.now() - startedAt,
       runtimeHealth,
     };
   }
@@ -103,12 +140,27 @@ async function probeCommand(runtimePath, runCommand) {
   }
 }
 
-function defaultRunCommand(runtimePath, args) {
+function defaultRunCommand(runtimePath, args, options = {}) {
   return execFileSync(runtimePath, args, {
     encoding: 'utf-8',
-    timeout: 5000,
+    timeout: options.timeout || 5000,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
+}
+
+function generationProbeArgs(runtimeType, model) {
+  switch (String(runtimeType || '').toLowerCase()) {
+    case 'claude':
+      return ['-p', GENERATION_PROBE_PROMPT, '--output-format', 'text', '--permission-mode', 'plan'];
+    case 'codex':
+      return ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', ...(model ? ['--model', model] : []), GENERATION_PROBE_PROMPT];
+    case 'opencode':
+      return ['run', '--format', 'json', ...(model ? ['--model', model] : []), GENERATION_PROBE_PROMPT];
+    case 'gemini':
+      return ['-p', GENERATION_PROBE_PROMPT, '-o', 'text', ...(model ? ['-m', model] : [])];
+    default:
+      return [];
+  }
 }
 
 function defaultHealth(agent) {

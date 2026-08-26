@@ -17,6 +17,15 @@ export function resolveAgentExecution(agent = {}) {
 
 export function resolveBrokerDispatchTarget(agent = {}) {
   const execution = resolveAgentExecution(agent);
+  if (shouldUseDesktopFallback(agent, execution)) {
+    return {
+      executionMode: 'hosted_fallback',
+      targetParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
+      targetAgentId: normalizeId(agent.id) || undefined,
+      hostParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
+      fallbackRuntime: 'desktop_current_model',
+    };
+  }
   if (execution?.mode === 'hosted') {
     return {
       executionMode: 'hosted',
@@ -36,6 +45,14 @@ export function resolveBrokerDispatchTarget(agent = {}) {
     executionMode: 'self_running',
     targetParticipantId: fallback,
   };
+}
+
+function shouldUseDesktopFallback(agent, execution) {
+  if (agent?.fallbackToDesktopModel !== true || execution?.mode !== 'self_running') return false;
+  const state = normalizeId(agent?.runtimeHealth?.state).toLowerCase();
+  const status = normalizeId(agent?.status).toLowerCase();
+  return ['degraded', 'unhealthy', 'error', 'failed', 'offline', 'cooldown', 'stalled'].includes(state)
+    || ['error', 'failed', 'offline'].includes(status);
 }
 
 export function resolveIncomingLogicalAgent({ fromParticipantId, payload } = {}) {
@@ -76,4 +93,3 @@ function isHostedDesktopAgent(agent = {}) {
 function normalizeId(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
 }
-

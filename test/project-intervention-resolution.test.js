@@ -141,6 +141,60 @@ test('repair_and_submit recovers blocked task with artifact path for PO review',
   assert.equal(sent.filter(message => message.kind === 'review_submission').length, 1);
 });
 
+test('repair_and_submit recovers a pending task with explicit failed history and no active lease', () => {
+  const { hub, project, task } = setupFailedProject();
+  const writer = tempArtifactWriter();
+  writeFileSync(join(writer.artifactsDir, 'prepared-repair.md'), STORY, 'utf8');
+  assert.equal(hub.getBoard(project.id).transition(task.id, 'pending').ok, true);
+  const pending = hub.getBoard(project.id).getTask(task.id);
+
+  const result = hub.handleResolveProjectIntervention(project.id, {
+    idempotencyKey: 'repair-prepared-pending',
+    resolution: 'repair_and_submit',
+    fromAgent: 'xiaok',
+    expectedPrimaryTaskId: pending.id,
+    expectedTaskUpdatedAt: pending.updatedAt,
+    summary: '提交已经准备完成的修复产物',
+    artifacts: [{ path: 'artifacts/prepared-repair.md', mimeType: 'text/markdown' }],
+  }, writer);
+
+  const updated = hub.getBoard(project.id).getTask(task.id);
+  assert.equal(result.ok, true);
+  assert.equal(updated.status, 'submitted');
+  assert.equal(updated.recoveredFromStatus, 'pending');
+  assert.equal(updated.result.artifacts[0].filename, 'prepared-repair.md');
+});
+
+test('pending repair is default-deny without failed history, exact version, or with an active lease', () => {
+  for (const variant of ['clean', 'missing-version', 'active-lease']) {
+    const { hub, project, task } = setupFailedProject();
+    const writer = tempArtifactWriter();
+    writeFileSync(join(writer.artifactsDir, `${variant}.md`), STORY, 'utf8');
+    assert.equal(hub.getBoard(project.id).transition(task.id, 'pending').ok, true);
+    const pending = hub.getBoard(project.id).getTask(task.id);
+    if (variant === 'clean') {
+      pending.failureReason = null;
+      pending.lastFailureClass = null;
+      pending.failedAt = null;
+    }
+    if (variant === 'active-lease') {
+      pending.activeRunId = 'run-active';
+      pending.runLease = { runId: 'run-active' };
+    }
+    const request = {
+      idempotencyKey: `repair-pending-deny-${variant}`,
+      resolution: 'repair_and_submit',
+      fromAgent: 'xiaok',
+      expectedPrimaryTaskId: pending.id,
+      ...(variant === 'missing-version' ? {} : { expectedTaskUpdatedAt: pending.updatedAt }),
+      artifacts: [{ path: `artifacts/${variant}.md` }],
+    };
+    const result = hub.handleResolveProjectIntervention(project.id, request, writer);
+    assert.equal(result.ok, false, variant);
+    assert.equal(hub.getBoard(project.id).getTask(task.id).status, 'pending', variant);
+  }
+});
+
 test('repair_and_submit expands short summary so evidence-gated blocked task can pass review', () => {
   const { hub, project, task } = setupFailedProject();
   const writer = tempArtifactWriter();

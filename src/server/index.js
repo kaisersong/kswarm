@@ -37,8 +37,9 @@ import {
   normalizeProjectForPlanRetry,
   resolvePlanRetryPoAgent,
 } from '../core/plan-retry-recovery.js';
-import { probeAgentRuntime } from '../core/runtime-probe.js';
+import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from '../core/runtime-probe.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
+import { failureRecoveryTaskIds } from '../core/failure-recovery-dispatch.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
 import {
   deriveProjectPreparation,
@@ -83,6 +84,7 @@ const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const RUNTIME_TOKEN = process.env.KSWARM_RUNTIME_TOKEN || '';
 const DESKTOP_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
+const XIAOK_DESKTOP_HOST_PARTICIPANT_ID = 'xiaok-desktop';
 const MAX_SUSPEND_MS = 300_000;
 const SERVICE_FEATURES = [
   'dynamic_workflows',
@@ -115,9 +117,14 @@ const pendingProbeByAgentId = new Map();
 const READINESS_PROBE_TIMEOUT_MS = 10_000;
 const READINESS_PROBE_TTL_MS = 5 * 60_000;
 
-function listAgentProfilesForRouting() {
-  const agents = agentStore?.list({ includeArchived: false }) || [];
-  return applyBrokerPresenceToAgentProfiles(agents, brokerOnlineAgentIds);
+function listAgentProfilesForRouting({ includeArchived = false } = {}) {
+  const agents = agentStore?.list({ includeArchived }) || [];
+  const activeAgents = agents.filter(agent => !agent.archivedAt);
+  const activeProfiles = applyBrokerPresenceToAgentProfiles(activeAgents, brokerOnlineAgentIds);
+  if (!includeArchived) return activeProfiles;
+
+  const activeProfileById = new Map(activeProfiles.map(agent => [agent.id, agent]));
+  return agents.map(agent => activeProfileById.get(agent.id) || agent);
 }
 
 const hub = createHubOrExit();
@@ -349,7 +356,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
           'handoff_create_failed',
           taskRequest.error || 'handoff_create_failed',
         );
-        if (failed?.retryDispatched && failed.retryTaskId) retryTaskIds.push(failed.retryTaskId);
+        retryTaskIds.push(...failureRecoveryTaskIds(failed));
         continue;
       }
       const delivery = await sendTaskToBrokerParticipant({
@@ -371,6 +378,45 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
           error: delivery.error,
           delivery: delivery.delivery || null,
         });
+        const fallbackAgent = !task.assignedRuntimeInstance ? agentStore?.get(task.assignedAgent) : null;
+        if (fallbackAgent?.fallbackToDesktopModel === true && targetParticipantId !== XIAOK_DESKTOP_HOST_PARTICIPANT_ID) {
+          recordAgentRuntimeFailure(task.assignedAgent, 'runtime_offline', delivery.error || 'delivery_failed');
+          const fallbackRequest = createBrokerTaskRequest({
+            handoffRoot: join(KSWARM_HOME, 'handoff-packages', projectId),
+            project,
+            workspace: ws,
+            task,
+            targetAgent,
+            targetParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
+          });
+          const fallbackDelivery = fallbackRequest.ok
+            ? await sendTaskToBrokerParticipant({
+                brokerClient,
+                targetId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
+                kind: 'request_task',
+                isOnline: isAgentOnBroker,
+                waitTimeoutMs: 8_000,
+                waitIntervalMs: 200,
+                request: fallbackRequest.request,
+              })
+            : { ok: false, error: fallbackRequest.error || 'fallback_handoff_failed' };
+          if (fallbackDelivery.ok) {
+            log('warn', `Agent runtime unavailable; task routed to Desktop current model`, {
+              projectId,
+              taskId: task.id,
+              agent: task.assignedAgent,
+              fallbackRuntime: 'desktop_current_model',
+            });
+            broadcast({
+              type: 'agent_runtime_fallback',
+              projectId,
+              taskId: task.id,
+              agent: task.assignedAgent,
+              fallbackRuntime: 'desktop_current_model',
+            });
+            continue;
+          }
+        }
         if (!task.assignedRuntimeInstance && task.assignedAgent) {
           agentStore?.setOffline(task.assignedAgent);
         }
@@ -382,7 +428,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
           'runtime_offline',
           delivery.error || 'delivery_failed',
         );
-        if (failed?.retryDispatched && failed.retryTaskId) retryTaskIds.push(failed.retryTaskId);
+        retryTaskIds.push(...failureRecoveryTaskIds(failed));
       }
     } catch (err) {
       log('warn', `Failed to send request_task to ${targetAgent}`, { projectId, taskId: task.id, agent: task.assignedAgent, targetParticipantId, runtimeInstance: task.assignedRuntimeInstance || null, error: err.message });
@@ -397,7 +443,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
         'runtime_offline',
         err.message,
       );
-      if (failed?.retryDispatched && failed.retryTaskId) retryTaskIds.push(failed.retryTaskId);
+      retryTaskIds.push(...failureRecoveryTaskIds(failed));
     }
   }
 
@@ -1124,11 +1170,12 @@ function handleBrokerIntent(intent) {
         retried: result.retried,
       });
       broadcast({ type: 'task_failed', projectId: resolved.projectId, taskId: resolved.taskId, agent: logicalParticipantId, ...result });
-      if (result.retryDispatched && result.retryTaskId) {
-        sendBrokerRequestTasks(resolved.projectId, [result.retryTaskId]).catch(err => {
+      const recoveryTaskIds = failureRecoveryTaskIds(result);
+      if (recoveryTaskIds.length > 0) {
+        sendBrokerRequestTasks(resolved.projectId, recoveryTaskIds).catch(err => {
           log('warn', 'Failed to deliver retry request_task to broker', {
             projectId: resolved.projectId,
-            retryTaskId: result.retryTaskId,
+            recoveryTaskIds,
             error: String(err?.message || err),
           });
         });
@@ -2938,8 +2985,9 @@ async function handleRequest(req, res) {
       if (result.ok) {
         log('info', `Task failed: ${taskId}`, { projectId, failureReason: result.failureReason, retried: result.retried });
         broadcast({ type: 'task_failed', projectId, taskId, ...result });
-        if (result.retryDispatched && result.retryTaskId) {
-          await sendBrokerRequestTasks(projectId, [result.retryTaskId]);
+        const recoveryTaskIds = failureRecoveryTaskIds(result);
+        if (recoveryTaskIds.length > 0) {
+          await sendBrokerRequestTasks(projectId, recoveryTaskIds);
         }
       }
       return json(res, result);
@@ -3295,7 +3343,8 @@ async function handleRequest(req, res) {
     // ── List agents ──
     if (path === '/agents' && req.method === 'GET') {
       const includeArchived = url.searchParams.get('include_archived') === 'true';
-      const agents = agentStore.list({ includeArchived });
+      await refreshBrokerOnlineAgentIds();
+      const agents = listAgentProfilesForRouting({ includeArchived });
       // Redact secrets for listing
       return json(res, { agents: agents.map(a => agentStore.redact(a)) });
     }
@@ -3479,8 +3528,21 @@ async function handleRequest(req, res) {
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
 
+      if (isDesktopRuntimeAgent(agent)) {
+        const readiness = await requestReadinessProbe({ agentId, role: agent.roles?.[0] || 'worker', forceProbe: true });
+        return json(res, {
+          agentId,
+          runtimeType: agent.runtimeType,
+          healthy: readiness.ok === true,
+          callability: readiness.ok === true ? 'available' : 'unavailable',
+          ...(readiness.reason ? { message: readiness.reason, error: readiness.reason } : {}),
+          durationMs: Math.max(0, Date.now() - Number(readiness.checkedAt || Date.now())),
+        });
+      }
+
       const result = await probeAgentRuntime(agent, {
-        enableGenerationProbe: process.env.KSWARM_ENABLE_GENERATION_PROBE === 'true',
+        enableGenerationProbe: supportsGenerationProbe(agent.runtimeType),
+        generationProbe: probeAgentGeneration,
       });
       if (result.runtimeHealth) agentStore.updateRuntimeHealth(agentId, result.runtimeHealth);
       return json(res, result);
@@ -3625,6 +3687,16 @@ function runStalledRunWatchdog() {
         );
         log(result.ok ? 'warn' : 'error', `Marked run stalled: ${action.taskId}`, { ...action, result });
         broadcast({ type: 'run_stalled', ...action, result });
+        const recoveryTaskIds = failureRecoveryTaskIds(result);
+        if (recoveryTaskIds.length > 0) {
+          sendBrokerRequestTasks(action.projectId, recoveryTaskIds).catch(err => {
+            log('warn', 'Failed to deliver stalled-run recovery task', {
+              projectId: action.projectId,
+              recoveryTaskIds,
+              error: String(err?.message || err),
+            });
+          });
+        }
         continue;
       }
       if (action.type === 'request_cancel_run') {

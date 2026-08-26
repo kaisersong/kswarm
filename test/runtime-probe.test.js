@@ -45,6 +45,48 @@ test('command-only CLI probe returns limited runtime health and preserves backwa
   assert.equal(result.runtimeHealth.probe.generationSkipped, true);
 });
 
+test('generation probe only reports callable when the configured runtime returns content', async () => {
+  const calls = [];
+  const result = await probeAgentRuntime({
+    id: 'cli',
+    runtimeType: 'codex',
+    runtimePath: '/usr/local/bin/codex',
+    capabilities: ['analysis'],
+  }, {
+    now,
+    runCommand: async () => 'codex 1.0.0',
+    enableGenerationProbe: true,
+    generationProbe: async (agent) => {
+      calls.push(agent.id);
+      return { ok: true, output: 'OK', durationMs: 12 };
+    },
+  });
+
+  assert.deepEqual(calls, ['cli']);
+  assert.equal(result.healthy, true);
+  assert.equal(result.callability, 'available');
+  assert.equal(result.runtimeHealth.state, 'healthy');
+  assert.equal(result.runtimeHealth.probe.generationOk, true);
+});
+
+test('generation authentication failure is unavailable even when the CLI binary exists', async () => {
+  const result = await probeAgentRuntime({
+    id: 'cli',
+    runtimeType: 'codex',
+    runtimePath: '/usr/local/bin/codex',
+  }, {
+    now,
+    runCommand: async () => 'codex 1.0.0',
+    enableGenerationProbe: true,
+    generationProbe: async () => { throw new Error('authentication failed'); },
+  });
+
+  assert.equal(result.healthy, false);
+  assert.equal(result.callability, 'unavailable');
+  assert.equal(result.runtimeHealth.state, 'degraded');
+  assert.match(result.message, /authentication failed/);
+});
+
 test('command probe failure degrades runtime health', async () => {
   const result = await probeAgentRuntime({
     id: 'cli',

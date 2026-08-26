@@ -53,6 +53,49 @@ test('self-running agent dispatch targets its own participant', () => {
   assert.equal(route.executionMode, 'self_running');
 });
 
+test('unhealthy external agent with desktop fallback routes to desktop and preserves logical id', () => {
+  const route = resolveBrokerDispatchTarget({
+    id: 'codex3',
+    execution: { mode: 'self_running', participantId: 'codex-session-019e905e' },
+    fallbackToDesktopModel: true,
+    runtimeHealth: { state: 'degraded' },
+  });
+
+  assert.equal(route.targetParticipantId, 'xiaok-desktop');
+  assert.equal(route.targetAgentId, 'codex3');
+  assert.equal(route.executionMode, 'hosted_fallback');
+  assert.equal(route.fallbackRuntime, 'desktop_current_model');
+});
+
+test('fallback remains opt-in and does not redirect a healthy external agent', () => {
+  const optedOut = resolveBrokerDispatchTarget({
+    id: 'codex3',
+    execution: { mode: 'self_running', participantId: 'codex-session-019e905e' },
+    runtimeHealth: { state: 'degraded' },
+  });
+  const healthy = resolveBrokerDispatchTarget({
+    id: 'codex3',
+    execution: { mode: 'self_running', participantId: 'codex-session-019e905e' },
+    fallbackToDesktopModel: true,
+    runtimeHealth: { state: 'healthy' },
+  });
+
+  assert.equal(optedOut.targetParticipantId, 'codex-session-019e905e');
+  assert.equal(healthy.targetParticipantId, 'codex-session-019e905e');
+});
+
+test('an explicitly offline external agent falls back before dispatch even without a prior probe', () => {
+  const route = resolveBrokerDispatchTarget({
+    id: 'claude-worker',
+    status: 'offline',
+    execution: { mode: 'self_running', participantId: 'claude-worker' },
+    fallbackToDesktopModel: true,
+    runtimeHealth: { state: 'unknown' },
+  });
+  assert.equal(route.targetParticipantId, 'xiaok-desktop');
+  assert.equal(route.targetAgentId, 'claude-worker');
+});
+
 test('hosted response resolves logical agent from payload instead of broker sender', () => {
   assert.equal(resolveIncomingLogicalAgent({
     fromParticipantId: 'xiaok-desktop',

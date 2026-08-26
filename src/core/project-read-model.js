@@ -51,19 +51,23 @@ export function deriveExecutionGraph({
   const normalizedTasks = Array.isArray(tasks) ? tasks : [];
   const normalizedWorkflowRuns = Array.isArray(workflowRuns) ? workflowRuns : [];
   const taskLookup = buildTaskLookup(project?.id, normalizedTasks);
+  const taskById = new Map(normalizedTasks.map(task => [task.id, task]));
   const claimedTaskIds = new Set();
   const nodes = [];
 
   for (const task of normalizedTasks) {
+    const historicalRetryAttempt = isHistoricalRetryAttempt(task, taskById);
     nodes.push({
       stableNodeId: task.localTaskId || task.userFacingId || normalizeTaskDisplayId(project?.id, task.id) || task.id,
       displayId: task.localTaskId || task.userFacingId || normalizeTaskDisplayId(project?.id, task.id) || task.id,
       title: task.title || task.id,
       source: 'task_board',
-      ownership: isDelegatedTask(project, task, normalizedWorkflowRuns) ? 'delegated_to_workflow' : 'canonical',
+      ownership: historicalRetryAttempt
+        ? 'historical_retry_attempt'
+        : isDelegatedTask(project, task, normalizedWorkflowRuns) ? 'delegated_to_workflow' : 'canonical',
       taskId: task.id,
       status: normalizeTaskStatus(task.status),
-      required: task.required !== false,
+      required: task.required !== false && !historicalRetryAttempt,
       expectedDeliverableKind: inferExpectedDeliverableKind(task),
       expectedFormat: inferExpectedFormat(task),
       assignedAgent: task.assignedAgent || null,
@@ -151,6 +155,7 @@ export function deriveProjectLifecycle({
 
   let state = normalizeLegacyLifecycleState(legacyStatus);
   let primaryAction = null;
+  const requiredNodes = executionGraph.nodes.filter(node => node.required !== false);
 
   if (legacyStatus === 'closed') {
     state = 'closed';
@@ -166,10 +171,10 @@ export function deriveProjectLifecycle({
   } else if (hasCandidateFinal && allRequiredTerminalOk) {
     state = 'ready_to_deliver';
     primaryAction = { id: 'user_review_final_deliverable', strategy: 'review_final_deliverable' };
-  } else if (executionGraph.nodes.some(node => node.status === 'blocked' || node.status === 'failed')) {
+  } else if (requiredNodes.some(node => node.status === 'blocked' || node.status === 'failed')) {
     state = 'blocked';
     primaryAction = { id: 'resolve_blocker', strategy: 'resolve_project_blocker' };
-  } else if (executionGraph.nodes.some(node => ['dispatched', 'accepted', 'in_progress', 'submitted', 'reviewing'].includes(node.status))) {
+  } else if (requiredNodes.some(node => ['dispatched', 'accepted', 'in_progress', 'submitted', 'reviewing'].includes(node.status))) {
     state = 'running';
   } else if (legacyStatus === 'planning' && executionGraph.nodes.length > 0) {
     state = 'ready_to_start';
@@ -193,6 +198,12 @@ export function deriveProjectLifecycle({
     version: Number(project?.lifecycleVersion || project?.version || project?.updatedAt || project?.createdAt || 0),
     derivedAt: new Date(now).toISOString(),
   };
+}
+
+function isHistoricalRetryAttempt(task, taskById) {
+  if (!task?.parentTaskId) return false;
+  const parent = taskById.get(task.parentTaskId);
+  return Boolean(parent && !['failed', 'blocked'].includes(parent.status));
 }
 
 function parsePositiveInteger(raw) {
