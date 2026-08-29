@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { probeAgentRuntime } from '../src/core/runtime-probe.js';
+import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from '../src/core/runtime-probe.js';
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -85,6 +85,28 @@ test('generation authentication failure is unavailable even when the CLI binary 
   assert.equal(result.callability, 'unavailable');
   assert.equal(result.runtimeHealth.state, 'degraded');
   assert.match(result.message, /authentication failed/);
+});
+
+test('Kimi uses a real non-interactive generation probe instead of version-only health', async () => {
+  const calls = [];
+  const result = await probeAgentGeneration({
+    id: 'kimi-agent',
+    runtimeType: 'kimi',
+    runtimePath: '/Users/test/.kimi-code/bin/kimi',
+    model: 'kimi-k3',
+  }, {
+    runCommand: async (runtimePath, args) => {
+      calls.push({ runtimePath, args });
+      return 'OK';
+    },
+  });
+
+  assert.equal(supportsGenerationProbe('kimi'), true);
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, [{
+    runtimePath: '/Users/test/.kimi-code/bin/kimi',
+    args: ['--prompt', 'Reply with exactly OK. Do not use tools or modify files.', '--output-format', 'text', '--model', 'kimi-k3'],
+  }]);
 });
 
 test('command probe failure degrades runtime health', async () => {

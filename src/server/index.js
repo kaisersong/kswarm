@@ -38,6 +38,7 @@ import {
   resolvePlanRetryPoAgent,
 } from '../core/plan-retry-recovery.js';
 import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from '../core/runtime-probe.js';
+import { isSupportedCliRuntimeType, resolveAgentRuntimeSelection } from '../core/agent-runtime-selection.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
 import { failureRecoveryTaskIds } from '../core/failure-recovery-dispatch.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
@@ -1713,7 +1714,8 @@ function redactProjectTeamResponse(project) {
 }
 
 function hasForbiddenAgentPayload(body) {
-  return ['apiKey', 'baseUrl', 'customEnv', 'runtimePath', 'execution'].some(key => body && Object.hasOwn(body, key));
+  return ['apiKey', 'baseUrl', 'provider', 'model', 'customEnv', 'runtimePath', 'execution', 'credential', 'secret']
+    .some(key => body && Object.hasOwn(body, key));
 }
 
 function json(res, data, status = 200) {
@@ -3304,12 +3306,15 @@ async function handleRequest(req, res) {
     if (path === '/runtimes' && req.method === 'GET') {
       const known = agentStore.getKnownCLIs();
       const detected = agentStore.detectCLIs();
-      const detectedTypes = new Set(detected.map(d => d.type));
-      const runtimes = known.map(cli => ({
-        ...cli,
-        detected: detectedTypes.has(cli.type),
-        path: detected.find(d => d.type === cli.type)?.path || null,
-      }));
+      const runtimes = [...new Map(known.map(cli => [cli.type, cli])).values()].map(cli => {
+        const detectedRuntime = detected.find(runtime => runtime.type === cli.type);
+        return {
+          ...cli,
+          detected: Boolean(detectedRuntime),
+          supported: isSupportedCliRuntimeType(cli.type),
+          path: detectedRuntime?.path || null,
+        };
+      });
       return json(res, { runtimes });
     }
 
@@ -3355,7 +3360,15 @@ async function handleRequest(req, res) {
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       if (hasForbiddenAgentPayload(body)) return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
-      const result = agentStore.create(body);
+      let agentInput = body;
+      if (body.runtimeType && body.runtimeType !== 'xiaok') {
+        try {
+          agentInput = { ...body, ...resolveAgentRuntimeSelection(body, agentStore.detectCLIs()) };
+        } catch (err) {
+          return json(res, { ok: false, error: err.message }, 400);
+        }
+      }
+      const result = agentStore.create(agentInput);
       if (result.error) return json(res, result, result.code || 400);
       log('info', `Agent created: ${result.agent.name} (${result.agent.id})`);
       broadcast({ type: 'agent_created', agent: agentStore.redact(result.agent) });
@@ -3401,7 +3414,9 @@ async function handleRequest(req, res) {
         const body = await parseBody(req);
         const context = resolveDesktopMutationContext(req);
         if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
-        if (hasForbiddenAgentPayload(body)) return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
+        if (hasForbiddenAgentPayload(body) || Object.hasOwn(body, 'runtimeType')) {
+          return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
+        }
         const result = agentStore.update(agentId, body);
         if (result.error) return json(res, result, result.code || 400);
         log('info', `Agent updated: ${result.agent.name} (${agentId})`);

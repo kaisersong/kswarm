@@ -1,8 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { createUnknownRuntimeHealth, recordProbeResult, recordRuntimeSuccess } from './runtime-health.js';
+import { buildKimiCliArgs } from './kimi-cli-harness.js';
 
 const GENERATION_PROBE_PROMPT = 'Reply with exactly OK. Do not use tools or modify files.';
-const GENERATION_PROBE_TYPES = new Set(['claude', 'codex', 'opencode', 'gemini']);
+const GENERATION_PROBE_TYPES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi']);
 
 export function supportsGenerationProbe(runtimeType) {
   return GENERATION_PROBE_TYPES.has(String(runtimeType || '').trim().toLowerCase());
@@ -158,6 +159,8 @@ function generationProbeArgs(runtimeType, model) {
       return ['run', '--format', 'json', ...(model ? ['--model', model] : []), GENERATION_PROBE_PROMPT];
     case 'gemini':
       return ['-p', GENERATION_PROBE_PROMPT, '-o', 'text', ...(model ? ['-m', model] : [])];
+    case 'kimi':
+      return buildKimiCliArgs(GENERATION_PROBE_PROMPT, model);
     default:
       return [];
   }

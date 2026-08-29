@@ -36,6 +36,7 @@ import {
   buildSemanticOutputArtifacts,
   hasRequiredOutputType,
 } from '../src/core/semantic-html-renderer.js';
+import { buildKimiCliArgs } from '../src/core/kimi-cli-harness.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -327,6 +328,7 @@ async function runCLIHarness(prompt, workFolder) {
   let rawOutput;
   switch (runtimeType) {
     case 'xiaok':
+    case 'xiaok-cli':
       rawOutput = await runXiaok(runtimePath, prompt, model, workFolder);
       break;
     case 'claude':
@@ -343,6 +345,9 @@ async function runCLIHarness(prompt, workFolder) {
       break;
     case 'qoder':
       rawOutput = await runQoder(runtimePath, prompt, model, workFolder);
+      break;
+    case 'kimi':
+      rawOutput = await runKimi(runtimePath, prompt, model, workFolder);
       break;
     default:
       console.log(`[${ALIAS}]   ⚠ Unknown runtime type: ${runtimeType}, falling back`);
@@ -673,6 +678,33 @@ function runGemini(binPath, prompt, model, workFolder) {
     });
 
     child.on('error', (err) => { clearActiveChild(child); reject(err); });
+  });
+}
+
+/**
+ * Kimi CLI prompt mode is non-interactive and uses auto permissions by default.
+ */
+function runKimi(binPath, prompt, model, workFolder) {
+  return new Promise((resolve, reject) => {
+    const cwd = workFolder && existsSync(workFolder) ? workFolder : process.cwd();
+    const child = spawn(binPath, buildKimiCliArgs(prompt, model), {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, ...(agentConfig.customEnv || {}) },
+      timeout: CLI_TIMEOUT,
+    });
+    registerActiveChild(child);
+
+    let output = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { noteStdout(); output += chunk.toString(); });
+    child.stderr.on('data', chunk => { noteStderr(); stderr += chunk.toString(); });
+    child.on('close', code => {
+      clearActiveChild(child);
+      if (code !== 0 && !output.trim()) reject(new Error(`kimi exited ${code}: ${stderr.slice(0, 200)}`));
+      else resolve(output.trim() || `(kimi exited ${code})`);
+    });
+    child.on('error', err => { clearActiveChild(child); reject(err); });
   });
 }
 

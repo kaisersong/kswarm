@@ -174,6 +174,13 @@ test('worker restores private CLI execution config from trusted process environm
   assert.match(source, /agentConfig\s*=\s*applyPrivateRuntimeEnv\(data\.agent/);
 });
 
+test('worker routes Kimi runtime through the native Kimi CLI harness', () => {
+  assert.match(source, /case ['"]kimi['"]:/);
+  assert.match(source, /runKimi\(runtimePath, prompt, model, workFolder\)/);
+  assert.match(source, /function runKimi\(/);
+  assert.match(source, /buildKimiCliArgs/);
+});
+
 test('auto-worker refuses desktop-managed seed user tasks unless explicitly running maintenance mode', () => {
   assert.match(source, /function isDesktopManagedSeedConfig/);
   assert.match(source, /KSWARM_AUTO_WORKER_MODE/);
