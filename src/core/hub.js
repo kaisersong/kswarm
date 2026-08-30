@@ -83,7 +83,7 @@ import { reconcileProjectAgentSelectionWithEffectiveAgents } from './agent-selec
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null } = {}) {
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null, brokerClient = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const workflowRuns = new Map();
@@ -322,7 +322,154 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
 
   // ─── Project lifecycle ─────────────────────────────────────────────
 
-  function createProject({ id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary, agentSelection = null, preparationContext = null, executionMode = 'direct', autoAssignPo = true, clientRequestKey, requestedStartPolicy }) {
+  function roomContractError(code, extra = {}) {
+    const error = new Error(code);
+    error.code = code;
+    for (const [key, value] of Object.entries(extra)) {
+      error[key] = value;
+    }
+    return error;
+  }
+
+  // Room project event outbox (design §8.4, §11.2): every room-visible event
+  // gets a durable projectionEventId `proj:<projectId>#<seq>`; the sequence
+  // lives on the project so persistence keeps it monotonic across restarts.
+  function nextRoomProjectionEventId(project) {
+    project.roomEventSeq = (project.roomEventSeq ?? 0) + 1;
+    return `proj:${project.id}#${project.roomEventSeq}`;
+  }
+
+  function appendRoomEventOutboxItem(project, { eventType, summary = null, sourceRefs = {} }) {
+    if (!project.primaryRoomId) return null;
+    if (!Array.isArray(project.roomEventOutbox)) project.roomEventOutbox = [];
+    const item = {
+      projectionEventId: nextRoomProjectionEventId(project),
+      projectId: project.id,
+      roomId: project.primaryRoomId,
+      eventType,
+      summary,
+      sourceRefs,
+      status: 'pending',
+      createdAt: Date.now(),
+    };
+    project.roomEventOutbox.push(item);
+    return item;
+  }
+
+  async function validateRoomFirstCreate(input, mutationCtx) {
+    const primaryRoomId = typeof input.primaryRoomId === 'string' && input.primaryRoomId.trim()
+      ? input.primaryRoomId.trim()
+      : null;
+
+    // agent-source create is rejected from every entry (design §9.2)
+    if (mutationCtx?.requestSource === 'agent') {
+      throw roomContractError('room_actor_forbidden');
+    }
+
+    const isTrustedCaller = mutationCtx?.requestSource === 'user'
+      || mutationCtx?.requestSource === 'system';
+
+    if (!primaryRoomId) {
+      if (isTrustedCaller && mutationCtx.requestSource === 'user') {
+        // Room-first path: trusted user creates MUST carry a primary room
+        throw roomContractError('room_primary_room_required');
+      }
+      // legacy compatibility window: no mutation context, null-room project
+      return { primaryRoomId: null };
+    }
+
+    if (!brokerClient || typeof brokerClient.getRoomSnapshot !== 'function') {
+      throw roomContractError('kswarm_unavailable', { detail: 'room membership provider missing' });
+    }
+
+    const snapshot = await brokerClient.getRoomSnapshot(primaryRoomId);
+    if (!snapshot || snapshot.ok === false) {
+      throw roomContractError(snapshot?.code ?? 'room_not_found');
+    }
+    if (snapshot.room?.status !== 'active') {
+      throw roomContractError('room_archived', { status: snapshot.room?.status });
+    }
+
+    const sourceMessageIds = Array.isArray(input.sourceMessageIds) ? input.sourceMessageIds : [];
+    const roomMessageIds = new Set((snapshot.messages ?? []).map((message) => message?.messageId).filter(Boolean));
+    for (const messageId of sourceMessageIds) {
+      if (!roomMessageIds.has(messageId)) {
+        throw roomContractError('room_message_not_found', { messageId });
+      }
+    }
+
+    const activeRoomAgents = new Set(
+      (snapshot.members ?? [])
+        .filter((member) => member?.subject?.kind === 'agent' && member?.status === 'active')
+        .map((member) => member.subject.logicalAgentId)
+    );
+
+    const poAgent = typeof input.poAgent === 'string' ? input.poAgent.trim() : '';
+    const requiredAgents = [poAgent, ...(Array.isArray(input.members) ? input.members : [])]
+      .map((agentId) => (typeof agentId === 'string' ? agentId.trim() : ''))
+      .filter(Boolean);
+    for (const agentId of requiredAgents) {
+      if (!activeRoomAgents.has(agentId)) {
+        throw roomContractError('room_membership_required', { agentId });
+      }
+    }
+
+    // membership-use lease for the PO and every member (design §8.2 step 4)
+    const operationId = `room-create:${input.clientRequestKey ?? input.id}`;
+    for (const agentId of requiredAgents) {
+      const leaseResult = await brokerClient.acquireRoomMembershipLease({
+        roomId: primaryRoomId,
+        logicalAgentId: agentId,
+        operationId,
+      });
+      if (!leaseResult || leaseResult.ok === false) {
+        throw roomContractError('room_membership_lease_required', {
+          cause: leaseResult?.code ?? 'room_membership_lease_required',
+          agentId,
+        });
+      }
+    }
+
+    return { primaryRoomId };
+  }
+
+  function createProject(input = {}, mutationCtx = undefined) {
+    const {
+      id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary,
+      agentSelection = null, preparationContext = null, executionMode = 'direct',
+      autoAssignPo = true, clientRequestKey, requestedStartPolicy,
+      primaryRoomId, sourceMessageIds, linkedBy,
+    } = input;
+
+    const hasRoomContext = typeof primaryRoomId === 'string' && primaryRoomId.trim() !== '';
+
+    if (mutationCtx?.requestSource === 'agent') {
+      throw roomContractError('room_actor_forbidden');
+    }
+
+    // Room-first create performs cross-service validation (snapshot + lease),
+    // so it is asynchronous; the legacy window stays synchronous.
+    if (hasRoomContext || mutationCtx?.requestSource === 'user') {
+      // idempotent retry: the same clientRequestKey must return the SAME
+      // project instead of creating a duplicate (design §11.2)
+      const normalizedKey = normalizeProjectCreateClientRequestKey(input.clientRequestKey);
+      if (normalizedKey) {
+        const reusable = findReusableProjectForCreateRequest({ clientRequestKey: normalizedKey });
+        if (reusable) return Promise.resolve(reusable);
+      }
+      return validateRoomFirstCreate(input, mutationCtx).then(({ primaryRoomId: resolvedRoomId }) =>
+        createProjectValidated(input, mutationCtx, resolvedRoomId));
+    }
+    return createProjectValidated(input, mutationCtx, null);
+  }
+
+  function createProjectValidated(input, mutationCtx, resolvedRoomId) {
+    const {
+      id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary,
+      agentSelection = null, preparationContext = null, executionMode = 'direct',
+      autoAssignPo = true, clientRequestKey, requestedStartPolicy,
+      primaryRoomId, sourceMessageIds, linkedBy,
+    } = input;
     const createdAt = Date.now();
     const normalizedClientRequestKey = normalizeProjectCreateClientRequestKey(clientRequestKey);
     const effectiveName = normalizeProjectNameForDisplay(name);
@@ -367,14 +514,32 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       lifecycleVersion: 0,
       projectRevision: 1,
       teamPlan: null,
+      primaryRoomId: resolvedRoomId,
     };
     if (normalizedClientRequestKey) {
       project.clientRequestKey = normalizedClientRequestKey;
+    }
+    if (resolvedRoomId) {
+      project.roomLink = {
+        kind: 'primary',
+        sourceMessageIds: Array.isArray(sourceMessageIds) ? sourceMessageIds : [],
+        linkedBy: linkedBy ?? { kind: 'system', service: 'kswarm' },
+        linkedAt: new Date(createdAt).toISOString(),
+      };
     }
     projects.set(id, project);
     boards.set(id, createTaskBoard(id));
 
     eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: normalizedPoAgent });
+    // room-first creates enqueue project.created into the durable outbox in
+    // the same logical transaction as the project write (design §11.2)
+    if (resolvedRoomId) {
+      appendRoomEventOutboxItem(project, {
+        eventType: 'project.created',
+        summary: `项目 ${effectiveName} 已创建`,
+        sourceRefs: { projectId: id },
+      });
+    }
     recordHumanAction('create_project', { projectId: id, projectName: effectiveName, poAgent: normalizedPoAgent });
 
     if (preparationContext) {
@@ -393,6 +558,97 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       sendAssignPo(project, effectivePlanningGuidance);
     }
     return project;
+  }
+
+  function getRoomEventOutbox({ projectId } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { items: [] };
+    return { items: Array.isArray(project.roomEventOutbox) ? [...project.roomEventOutbox] : [] };
+  }
+
+  async function flushRoomEventOutbox() {
+    if (!brokerClient || typeof brokerClient.publishRoomProjectEvent !== 'function') {
+      return { ok: false, code: 'kswarm_unavailable' };
+    }
+    let published = 0;
+    let suppressed = 0;
+    for (const project of projects.values()) {
+      if (!Array.isArray(project.roomEventOutbox) || !project.primaryRoomId) continue;
+      for (const item of project.roomEventOutbox) {
+        if (item.status !== 'pending') continue;
+        const snapshot = await brokerClient.getRoomSnapshot(project.primaryRoomId);
+        if (!snapshot || snapshot.ok === false || snapshot.room?.status !== 'active') {
+          // terminal suppression: no retry loop, no project rollback (§7.4)
+          item.status = 'suppressed_room_archived';
+          item.suppressedAt = Date.now();
+          suppressed += 1;
+          continue;
+        }
+        const result = await brokerClient.publishRoomProjectEvent({
+          projectionEventId: item.projectionEventId,
+          roomId: item.roomId,
+          projectId: item.projectId,
+          eventType: item.eventType,
+          summary: item.summary,
+          sourceRefs: item.sourceRefs,
+        });
+        if (result && result.ok !== false) {
+          item.status = 'published';
+          item.publishedAt = Date.now();
+          published += 1;
+        }
+        // publish failure keeps the item pending for the next flush
+      }
+    }
+    return { ok: true, published, suppressed };
+  }
+
+  function submitTaskResult({ projectId, taskId, agentId, summary = null } = {}) {
+    const project = projects.get(projectId);
+    if (!project) {
+      return { ok: false, error: 'project_not_found' };
+    }
+    const board = boards.get(projectId);
+    if (board) {
+      try {
+        const task = board.getTask(taskId);
+        if (task) {
+          board.transition(taskId, 'done', { agentId, summary });
+        }
+      } catch {
+        // transition failures (invalid state) must not block the room event
+      }
+    }
+    eventLog.emit('task.done', { projectId, taskId, agentId, summary });
+    const item = appendRoomEventOutboxItem(project, {
+      eventType: 'task.done',
+      summary: summary ?? `任务 ${taskId} 已完成`,
+      sourceRefs: { projectId, taskId },
+    });
+    return { ok: true, taskId, projectionEventId: item?.projectionEventId ?? null };
+  }
+
+  function listRoomMemberBlockers({ projectId, logicalAgentId } = {}) {
+    const project = projects.get(projectId);
+    if (!project) return { blockers: [] };
+    const blockers = [];
+    if (project.poAgent && project.poAgent === logicalAgentId) {
+      blockers.push(`project_po:${projectId}`);
+    }
+    if (Array.isArray(project.members) && project.members.includes(logicalAgentId)) {
+      blockers.push(`project_member:${projectId}`);
+    }
+    // task assignees and open review owners under this project
+    const board = boards.get(projectId);
+    if (board && typeof board.getTasks === 'function') {
+      for (const task of board.getTasks()) {
+        const assignees = task?.assignees ?? (task?.assignedAgent ? [task.assignedAgent] : []);
+        if (assignees.includes(logicalAgentId) && !['done', 'cancelled'].includes(task.status)) {
+          blockers.push(`task_assignee:${taskId}`);
+        }
+      }
+    }
+    return { blockers };
   }
 
   function findReusableProjectForCreateRequest({ clientRequestKey } = {}) {
@@ -4814,6 +5070,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     getEventLog,
     listProjects,
     findReusableProjectForCreateRequest,
+    getRoomEventOutbox,
+    flushRoomEventOutbox,
+    submitTaskResult,
+    listRoomMemberBlockers,
     getDispatchPlan,
     getExecutionGraph,
     getProjectLifecycle,

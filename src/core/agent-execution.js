@@ -10,7 +10,10 @@ export function resolveAgentExecution(agent = {}) {
     return { mode: 'hosted', hostParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID };
   }
 
-  const participantId = normalizeId(agent.participantId || agent.id);
+  // Only an EXPLICIT participantId constitutes a self-running route. A bare
+  // agent id is a display name, not a transport address — resolving it as a
+  // participant is the bare-participant fallback design §9.2 forbids.
+  const participantId = normalizeId(agent.participantId);
   if (participantId) return { mode: 'self_running', participantId };
   return null;
 }
@@ -27,6 +30,12 @@ export function resolveBrokerDispatchTarget(agent = {}) {
     };
   }
   if (execution?.mode === 'hosted') {
+    // A hosted logical agent declaring a conflicting direct participant id is
+    // an identity conflict, not a routing choice (design §9.2): fail closed.
+    const declaredParticipantId = normalizeId(agent.participantId);
+    if (declaredParticipantId && declaredParticipantId !== execution.hostParticipantId) {
+      return { ok: false, code: 'agent_route_identity_conflict' };
+    }
     return {
       executionMode: 'hosted',
       targetParticipantId: execution.hostParticipantId,
@@ -40,11 +49,10 @@ export function resolveBrokerDispatchTarget(agent = {}) {
       targetParticipantId: execution.participantId,
     };
   }
-  const fallback = normalizeId(agent.id || agent.participantId);
-  return {
-    executionMode: 'self_running',
-    targetParticipantId: fallback,
-  };
+  // Route resolution fails CLOSED: an agent with no resolvable identity has
+  // no target — never fall back to a bare participant id or broadcast
+  // (design §9.2).
+  return { ok: false, code: 'agent_route_unavailable' };
 }
 
 function shouldUseDesktopFallback(agent, execution) {

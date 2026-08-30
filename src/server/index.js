@@ -39,6 +39,7 @@ import {
 } from '../core/plan-retry-recovery.js';
 import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from '../core/runtime-probe.js';
 import { isSupportedCliRuntimeType, resolveAgentRuntimeSelection } from '../core/agent-runtime-selection.js';
+import { runtimeCatalogEntry } from '../core/runtime-capabilities.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
 import { failureRecoveryTaskIds } from '../core/failure-recovery-dispatch.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
@@ -109,6 +110,7 @@ const mutationAuthority = createMutationAuthority({ token: DESKTOP_MUTATION_TOKE
 
 // ─── Hub Instance ─────────────────────────────────────────────────
 let agentStore = null;
+let brokerClient = null;
 let brokerOnlineAgentIds = null;
 let brokerOnlineAgentIdsUpdatedAt = 0;
 let brokerOnlineParticipants = [];
@@ -145,6 +147,11 @@ function createHubOrExit() {
       },
       getAgentProfiles: () => listAgentProfilesForRouting(),
       getQualityOverlays: () => qualityOverlayStore.listOverlays(),
+      brokerClient: {
+        getRoomSnapshot: (...args) => brokerClient?.getRoomSnapshot(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
+        acquireRoomMembershipLease: (...args) => brokerClient?.acquireRoomMembershipLease(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
+        publishRoomProjectEvent: (...args) => brokerClient?.publishRoomProjectEvent(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
+      },
       runtimeInstanceAllocator: {
         getAgentConcurrency: () => getEffectiveAgentConcurrency({
           baseConcurrency: runtimeInstancePool.getAgentConcurrency(),
@@ -299,7 +306,6 @@ if (interruptedTaskWorkflows.recovered?.length > 0) {
 
 // ─── Broker Connection ────────────────────────────────────────────
 let brokerConnected = false;
-let brokerClient = null;
 let recoveryRunning = false;
 let watchdogStarted = false;
 let watchdog = null;
@@ -545,6 +551,7 @@ function connectBroker() {
       alias: 'kswarm',
       roles: ['hub', 'coordinator'],
       capabilities: ['project_management', 'task_routing'],
+      roomSystemToken: process.env.INTENT_BROKER_KSWARM_TOKEN || null,
       onIntent: handleBrokerIntent,
       onConnect: () => {
         brokerConnected = true;
@@ -1774,6 +1781,75 @@ async function handleRequest(req, res) {
         overlayStore: qualityOverlayStore,
       });
       if (result.handled) return json(res, result.body, result.status);
+    }
+
+    // ── Room-first project creation (trusted Desktop user only) ──
+    if (path === '/projects/room-first' && req.method === 'POST') {
+      const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
+      if (body.requestSource !== 'user') {
+        return json(res, { ok: false, error: 'request_source_denied' }, 403);
+      }
+      const {
+        name, goal, requirements, planningGuidance, poAgent, members, workFolder,
+        enableSummary, agentSelection, executionMode, requestedStartPolicy,
+        clientRequestKey, primaryRoomId, sourceMessageIds,
+      } = body;
+      if (!name || !poAgent || !primaryRoomId || !Array.isArray(sourceMessageIds) || sourceMessageIds.length === 0) {
+        return json(res, { ok: false, error: 'room_project_input_invalid' }, 400);
+      }
+      const resolvedMembers = Array.isArray(members) ? members.filter(memberId => memberId !== poAgent) : [];
+      const normalizedAgentSelection = normalizeProjectAgentSelection({
+        poAgent,
+        members: resolvedMembers,
+        agentSelection,
+        defaultSource: 'room_selection',
+      });
+      const id = createProjectInstanceId();
+      try {
+        const project = await hub.createProject({
+          id,
+          name,
+          goal: goal || '',
+          requirements: requirements || '',
+          planningGuidance: planningGuidance || '',
+          poAgent,
+          members: resolvedMembers,
+          enableSummary,
+          agentSelection: normalizedAgentSelection,
+          executionMode,
+          requestedStartPolicy,
+          autoAssignPo: false,
+          clientRequestKey,
+          primaryRoomId,
+          sourceMessageIds,
+          linkedBy: { kind: 'user', userId: 'user.local' },
+        }, context.requestContext);
+
+        const ws = initProjectWorkspace(project.id, workFolder);
+        project.workFolder = ws.path;
+        await ensureProjectAgentsStarted(project);
+        const preparation = await prepareProjectForPlanning(project);
+        const planningStart = preparation?.state === 'ready'
+          ? await sendAssignPoForProject(project, { delayMs: 0 })
+              .catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }))
+          : { sent: false, reason: 'preparation_blocked' };
+        const roomProjection = await hub.flushRoomEventOutbox()
+          .catch(err => ({ ok: false, code: err.message || 'room_projection_failed' }));
+        broadcast({ type: 'project_created', project });
+        return json(res, { ok: true, project, preparation, planningStart, roomProjection }, 201);
+      } catch (error) {
+        const code = error?.code || error?.message || 'room_project_create_failed';
+        const status = code === 'room_not_found' || code === 'room_message_not_found'
+          ? 404
+          : code === 'room_membership_required' || code === 'room_membership_lease_required'
+            ? 409
+            : code === 'room_actor_forbidden'
+              ? 403
+              : 400;
+        return json(res, { ok: false, error: code, code }, status);
+      }
     }
 
     // ── Projects list ──
@@ -3308,11 +3384,12 @@ async function handleRequest(req, res) {
       const detected = agentStore.detectCLIs();
       const runtimes = [...new Map(known.map(cli => [cli.type, cli])).values()].map(cli => {
         const detectedRuntime = detected.find(runtime => runtime.type === cli.type);
+        // stable detected/supported/callability/reasonCode contract; supported
+        // is the creation gate, callability starts unknown until a real
+        // generation probe runs (design §6 Desktop)
         return {
           ...cli,
-          detected: Boolean(detectedRuntime),
-          supported: isSupportedCliRuntimeType(cli.type),
-          path: detectedRuntime?.path || null,
+          ...runtimeCatalogEntry(cli.type, { detected: Boolean(detectedRuntime), path: detectedRuntime?.path || null }),
         };
       });
       return json(res, { runtimes });

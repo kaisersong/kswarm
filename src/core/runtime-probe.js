@@ -1,12 +1,12 @@
 import { execFileSync } from 'node:child_process';
 import { createUnknownRuntimeHealth, recordProbeResult, recordRuntimeSuccess } from './runtime-health.js';
+import { supportsGenerationProbe as registrySupportsGenerationProbe, generationProbeArgv } from './runtime-capabilities.js';
 import { buildKimiCliArgs } from './kimi-cli-harness.js';
 
-const GENERATION_PROBE_PROMPT = 'Reply with exactly OK. Do not use tools or modify files.';
-const GENERATION_PROBE_TYPES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi']);
-
 export function supportsGenerationProbe(runtimeType) {
-  return GENERATION_PROBE_TYPES.has(String(runtimeType || '').trim().toLowerCase());
+  // single owner: the capability registry decides which runtimes get a real
+  // generation readiness probe (design §3; review point 2)
+  return registrySupportsGenerationProbe(runtimeType);
 }
 
 export async function probeAgentGeneration(agent = {}, options = {}) {
@@ -150,17 +150,13 @@ function defaultRunCommand(runtimePath, args, options = {}) {
 }
 
 function generationProbeArgs(runtimeType, model) {
+  // argv builders live in the capability registry / per-runtime harness
+  // modules so the probe exercises the exact production contract
+  const argv = generationProbeArgv(runtimeType, model);
+  if (argv) return argv;
   switch (String(runtimeType || '').toLowerCase()) {
-    case 'claude':
-      return ['-p', GENERATION_PROBE_PROMPT, '--output-format', 'text', '--permission-mode', 'plan'];
-    case 'codex':
-      return ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', ...(model ? ['--model', model] : []), GENERATION_PROBE_PROMPT];
-    case 'opencode':
-      return ['run', '--format', 'json', ...(model ? ['--model', model] : []), GENERATION_PROBE_PROMPT];
-    case 'gemini':
-      return ['-p', GENERATION_PROBE_PROMPT, '-o', 'text', ...(model ? ['-m', model] : [])];
     case 'kimi':
-      return buildKimiCliArgs(GENERATION_PROBE_PROMPT, model);
+      return buildKimiCliArgs('Reply with exactly OK. Do not use tools or modify files.', model);
     default:
       return [];
   }

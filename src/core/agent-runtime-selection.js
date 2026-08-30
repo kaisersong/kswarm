@@ -1,19 +1,14 @@
-const SUPPORTED_CLI_RUNTIME_TYPES = Object.freeze([
-  'xiaok-cli',
-  'claude',
-  'codex',
-  'opencode',
-  'gemini',
-  'qoder',
-  'kimi',
-]);
+import { isSupportedRuntimeType, listSupportedCliRuntimeTypes as registryList } from './runtime-capabilities.js';
 
+// Single owner: the capability registry decides which CLI runtimes are
+// creatable. This module must NOT keep a second allowlist (adversarial
+// review point 2).
 export function listSupportedCliRuntimeTypes() {
-  return [...SUPPORTED_CLI_RUNTIME_TYPES];
+  return registryList();
 }
 
 export function isSupportedCliRuntimeType(runtimeType) {
-  return SUPPORTED_CLI_RUNTIME_TYPES.includes(normalizeRuntimeType(runtimeType));
+  return isSupportedRuntimeType(runtimeType);
 }
 
 export function resolveAgentRuntimeSelection(input = {}, detectedRuntimes = []) {

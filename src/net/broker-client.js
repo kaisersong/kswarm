@@ -21,6 +21,8 @@ export function createBrokerClient({
   onConnect = null,
   onDisconnect = null,
   silent = false,
+  roomSystemToken = process.env.INTENT_BROKER_KSWARM_TOKEN || null,
+  fetchImpl = fetch,
 } = {}) {
   let ws = null;
   let connected = false;
@@ -36,7 +38,7 @@ export function createBrokerClient({
   // ─── HTTP helpers ────────────────────────────────────────────────
 
   async function httpPost(path, body) {
-    const resp = await fetch(`${httpBase}${path}`, {
+    const resp = await fetchImpl(`${httpBase}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -45,7 +47,20 @@ export function createBrokerClient({
   }
 
   async function httpGet(path) {
-    const resp = await fetch(`${httpBase}${path}`);
+    const resp = await fetchImpl(`${httpBase}${path}`);
+    return resp.json();
+  }
+
+  async function roomRequest(path, { method = 'GET', body } = {}) {
+    if (!roomSystemToken) return { ok: false, code: 'room_authentication_required' };
+    const resp = await fetchImpl(`${httpBase}${path}`, {
+      method,
+      headers: {
+        'x-intent-broker-room-token': roomSystemToken,
+        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
     return resp.json();
   }
 
@@ -147,6 +162,24 @@ export function createBrokerClient({
     return httpGet(`/inbox/${participantId}?after=${after}&limit=${limit}`);
   }
 
+  async function getRoomSnapshot(roomId) {
+    return roomRequest(`/rooms/${encodeURIComponent(roomId)}`);
+  }
+
+  async function acquireRoomMembershipLease(input) {
+    return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/membership-leases`, {
+      method: 'POST',
+      body: input,
+    });
+  }
+
+  async function publishRoomProjectEvent(input) {
+    return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/project-events`, {
+      method: 'POST',
+      body: input,
+    });
+  }
+
   return {
     register,
     connect,
@@ -154,6 +187,9 @@ export function createBrokerClient({
     sendIntent,
     sendTo,
     readInbox,
+    getRoomSnapshot,
+    acquireRoomMembershipLease,
+    publishRoomProjectEvent,
     httpPost,
     httpGet,
     isConnected: () => connected,

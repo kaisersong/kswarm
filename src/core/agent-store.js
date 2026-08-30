@@ -90,7 +90,13 @@ const KNOWN_AGENT_CLIS = [
   { type: 'openclaw', bin: 'openclaw',      envPath: 'KSWARM_OPENCLAW_PATH', envModel: 'KSWARM_OPENCLAW_MODEL', displayName: 'OpenClaw',  description: 'OpenClaw Agent CLI（第三方）' },
   { type: 'pi',       bin: 'pi',            envPath: 'KSWARM_PI_PATH',       envModel: 'KSWARM_PI_MODEL',       displayName: 'Pi',        description: 'Pi Agent CLI（第三方）' },
   { type: 'qoder',    bin: 'qodercli',      envPath: 'KSWARM_QODER_PATH',    envModel: 'KSWARM_QODER_MODEL',    displayName: 'Qoder',     description: 'Qoder CLI（第三方）' },
+  { type: 'deepseek', bin: 'dsh',           envPath: 'KSWARM_DEEPSEEK_PATH', envModel: null,                    displayName: 'DeepSeek Harness', description: 'DeepSeek Harness CLI dsh（developer preview，headless 契约未实证）' },
 ];
+
+/** Module-level read access for the capability registry single-owner check. */
+export function getKnownCLIs() {
+  return KNOWN_AGENT_CLIS.map(c => ({ type: c.type, bin: c.bin, displayName: c.displayName, description: c.description }));
+}
 
 function _which(cmd) {
   // Try execSync with PATH

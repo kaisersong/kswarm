@@ -37,6 +37,7 @@ import {
   hasRequiredOutputType,
 } from '../src/core/semantic-html-renderer.js';
 import { buildKimiCliArgs } from '../src/core/kimi-cli-harness.js';
+import { runPiHarness } from '../src/core/pi-cli-harness.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -349,6 +350,15 @@ async function runCLIHarness(prompt, workFolder) {
     case 'kimi':
       rawOutput = await runKimi(runtimePath, prompt, model, workFolder);
       break;
+    case 'pi':
+      rawOutput = await runPiHarnessTask(runtimePath, prompt, model, workFolder);
+      break;
+    case 'deepseek':
+      // registry keeps deepseek unsupported until a real `dsh --profile
+      // headless` probe passes (design §5/§9); the worker branch exists so
+      // the day it flips supported the path is wired, but it refuses to run
+      console.log(`[${ALIAS}]   ⚠ deepseek harness not verified (dsh headless contract unproven); refusing to run`);
+      return null;
     default:
       console.log(`[${ALIAS}]   ⚠ Unknown runtime type: ${runtimeType}, falling back`);
       return null;
@@ -684,6 +694,24 @@ function runGemini(binPath, prompt, model, workFolder) {
 /**
  * Kimi CLI prompt mode is non-interactive and uses auto permissions by default.
  */
+/**
+ * Pi one-shot harness: exact frozen argv, allowlist env, output limits and
+ * classified failures from src/core/pi-cli-harness.js (design §4).
+ */
+async function runPiHarnessTask(binPath, prompt, model, workFolder) {
+  const cwd = workFolder && existsSync(workFolder) ? workFolder : null;
+  if (!cwd) {
+    console.log(`[${ALIAS}]   ⚠ pi harness: work folder missing, failing closed`);
+    return null;
+  }
+  const result = await runPiHarness(binPath, prompt, model, cwd, { timeoutMs: CLI_TIMEOUT });
+  if (!result.ok) {
+    console.log(`[${ALIAS}]   ⚠ pi harness failed: ${result.errorKind}${result.stderr ? ` (${result.stderr.slice(0, 160)})` : ''}`);
+    return null;
+  }
+  return result.text;
+}
+
 function runKimi(binPath, prompt, model, workFolder) {
   return new Promise((resolve, reject) => {
     const cwd = workFolder && existsSync(workFolder) ? workFolder : process.cwd();

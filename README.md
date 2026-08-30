@@ -8,16 +8,19 @@ English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Xiaok Desktop v1.4.26 Integration Baseline
+## Xiaok Desktop v1.5.0 Integration Baseline
 
-- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.4.26. Desktop owns service startup, health/version probing, user-facing diagnostics, Loop and Graph UI, the Automations surface, model/runtime configuration, AI recording, ASR provider configuration, and Computer Use activation; KSwarm owns durable project state, task state, workflow runs, review gates, and deliverable metadata.
+- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.5.0. Desktop owns Room interaction and user confirmation; KSwarm owns durable project state, task state, workflow runs, review gates, and deliverable metadata.
+- Room-first creation is available through `/projects/room-first`. It validates Room membership and source-message provenance before creating a project, emits project events through the durable outbox, and keeps the Room/Project ownership boundary explicit.
+- Hosted and self-running agent routes now fail closed on missing or conflicting transport identity. Room membership leases cover dispatch, and project events can be projected back to the originating Room without making KSwarm the transcript owner.
+- Pi is available through a bounded one-shot CLI harness with real readiness probing. DeepSeek harness wiring is present but remains unsupported until a pinned `dsh --profile headless` binary passes the real probe contract.
 - **Workflow nodes can now automatically receive upstream output**: `enrichWorkflowNodeInput` collects completed upstream node outputs via `dependsOn` edges and injects them into the dispatched input. Desktop `buildKSwarmWorkflowNodePrompt` renders these as a structured "upstream reference" section. All new logic follows degradation-first: any failure skips injection silently (never blocks dispatch).
 - Completion evidence is consumed by Xiaok loop diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records remain the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
-- Xiaok Desktop v1.4.26 renders persisted workflow topology as a directed Graph with parallel groups, fan-in nodes, run/handoff metadata, and upstream/downstream details. KSwarm `0.9.2` durable SQLite project state remains the source of truth behind that view; the renderer does not invent workflow state.
+- Xiaok Desktop v1.5.0 renders persisted workflow topology as a directed Graph with parallel groups, fan-in nodes, run/handoff metadata, and upstream/downstream details. KSwarm `0.9.2` durable SQLite project state remains the source of truth behind that view; the renderer does not invent workflow state.
 - User Loops, model catalog updates, MCP 2.0 renderer plugins, AI recording, and Computer Use remain Desktop/plugin responsibilities. They do not require a KSwarm protocol migration: task completion, project delivery, workflow progress, and artifact handoff still use the existing project/task/workflow snapshot contract.
 - AI recording and transcription remain owned by the Desktop Knowledge Base stack, not by KSwarm. Saved notes can later become knowledge sources for project work, but KSwarm does not manage microphone capture, ASR credentials, local model downloads, punctuation restoration, or transcript summarization.
 - The active packaged sidecar is KSwarm `0.9.2`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
-- The Desktop release workflow for `desktop-v1.4.26` checks out this repository before packaging, so this README baseline must be pushed before the Xiaok release build starts even when the KSwarm sidecar version remains unchanged.
+- The Desktop release workflow for `desktop-v1.5.0` checks out the matching `desktop-v1.5.0` tag from this repository, so the sidecar snapshot is reproducible and must be pushed before the Xiaok release build starts.
 
 ## What's New in v0.9.2
 
