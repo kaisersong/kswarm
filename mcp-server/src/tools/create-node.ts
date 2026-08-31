@@ -12,6 +12,7 @@ export const createNodeSchema = {
   fanoutItemKey: z.string().optional().describe('Fanout item key for multi-item iteration'),
   required: z.boolean().default(true).describe('Whether this node is required for completion'),
   options: z.record(z.unknown()).optional().describe('Additional options for the agent'),
+  permissions: z.record(z.unknown()).optional().describe('Node permissions, e.g. { allowShell, deniedCommands }'),
 };
 
 const schema = z.object(createNodeSchema);

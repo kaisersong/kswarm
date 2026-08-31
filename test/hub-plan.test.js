@@ -183,6 +183,94 @@ test('qualityReview: passed → task done', () => {
   assert.equal(board.getTask('t1').reviewResult.feedback, 'Great work');
 });
 
+test('qualityReview: plan revision requirement blocks delivery until a real revision is applied', () => {
+  const hub = setup();
+  createTestProject(hub);
+  hub.handleSubmitPlan('proj-plan-1', {
+    analysis: 'Initial plan misses a required verification task',
+    phases: [{ id: 'p1', name: 'Phase 1', items: [
+      { id: 'item-1', title: 'Register draft artifact', brief: 'Register it', status: 'planned', assignedAgent: 'w-1', dependencies: [] },
+    ]}],
+  }, 'po-1');
+  hub.handleCreateTasks('proj-plan-1', [
+    { id: 'item-1', title: 'Register draft artifact', brief: 'Register it', assignedAgent: 'w-1', phaseId: 'p1', planItemId: 'item-1' },
+  ], 'po-1');
+  hub.handleApprove('proj-plan-1');
+
+  const board = hub.getBoard('proj-plan-1');
+  board.transition('item-1', 'dispatched');
+  board.transition('item-1', 'accepted');
+  board.transition('item-1', 'in_progress');
+  board.transition('item-1', 'submitted');
+
+  const reviewed = hub.handleQualityReview('proj-plan-1', 'item-1', {
+    passed: true,
+    feedback: 'Task contract passed, but the project still needs an independent verification task.',
+    planRevisionNeeded: true,
+  }, 'po-1');
+
+  assert.equal(reviewed.ok, true);
+  assert.equal(board.getTask('item-1').status, 'done');
+  assert.equal(board.getTask('item-1').reviewResult.planRevisionNeeded, true);
+  assert.equal(hub.getProject('proj-plan-1').planRevisionRequired.taskId, board.getTask('item-1').id);
+
+  const blocked = hub.handleDeliver('proj-plan-1', { synthesis: true }, 'po-1');
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.error, 'plan_revision_required');
+
+  const emptyRevision = hub.handleRevisePlan('proj-plan-1', {
+    reason: 'No-op',
+    resolvesPlanRevisionFromTaskId: board.getTask('item-1').id,
+    changes: [],
+  }, 'po-1');
+  assert.equal(emptyRevision.ok, true);
+  assert.equal(emptyRevision.appliedChanges, 0);
+  assert.ok(hub.getProject('proj-plan-1').planRevisionRequired);
+
+  const revised = hub.handleRevisePlan('proj-plan-1', {
+    reason: 'Add the missing independent verification',
+    resolvesPlanRevisionFromTaskId: board.getTask('item-1').id,
+    changes: [{
+      type: 'add',
+      phaseId: 'p1',
+      item: { id: 'item-2', title: 'Independent verification', brief: 'Close the project evidence gap', assignedAgent: 'w-2', dependencies: ['item-1'] },
+    }],
+  }, 'po-1');
+  assert.equal(revised.ok, true);
+  assert.equal(revised.appliedChanges, 1);
+  assert.equal(hub.getProject('proj-plan-1').planRevisionRequired, null);
+
+  const notDone = hub.handleDeliver('proj-plan-1', { synthesis: true }, 'po-1');
+  assert.equal(notDone.ok, false);
+  assert.equal(notDone.error, 'tasks_not_all_done');
+});
+
+test('revisePlan: unrelated revision cannot clear a task-bound plan blocker', () => {
+  const hub = setup();
+  createTestProject(hub);
+  hub.handleSubmitPlan('proj-plan-1', {
+    phases: [{ id: 'p1', name: 'Phase 1', items: [
+      { id: 'item-1', title: 'Draft', brief: 'Draft', assignedAgent: 'w-1', dependencies: [] },
+    ]}],
+  }, 'po-1');
+  hub.getProject('proj-plan-1').planRevisionRequired = {
+    taskId: 'proj-plan-1__item-1',
+    feedback: 'Add an independent review task.',
+    requestedAt: '2026-08-31T00:00:00.000Z',
+  };
+
+  const result = hub.handleRevisePlan('proj-plan-1', {
+    reason: 'Unrelated title cleanup',
+    resolvesPlanRevisionFromTaskId: 'proj-plan-1__other-task',
+    changes: [{ type: 'modify', phaseId: 'p1', itemId: 'item-1', field: 'title', newValue: 'Renamed draft' }],
+  }, 'po-1');
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'plan_revision_resolution_mismatch');
+  assert.ok(hub.getProject('proj-plan-1').planRevisionRequired);
+  assert.equal(hub.getProject('proj-plan-1').plan.phases[0].items[0].title, 'Draft');
+});
+
 test('qualityReview: failed → task rework', () => {
   const hub = setup();
   createTestProject(hub);

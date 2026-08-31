@@ -23,6 +23,7 @@ import { resolveMutationScope, FULL_SCOPE } from './state-scope.js';
 import { randomUUID } from 'node:crypto';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
+import { normalizeNodePermissions } from './workflow-node-permissions.js';
 import { getActiveTasksAcrossBoards, isReworkReadyForDispatch, planDispatch } from './dispatch-policy.js';
 import { superviseTaskFailure } from './failure-supervisor.js';
 import { deriveProjectHealth } from './project-health.js';
@@ -354,6 +355,65 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     };
     project.roomEventOutbox.push(item);
     return item;
+  }
+
+  function roomArtifactFilename(artifact) {
+    const raw = typeof artifact === 'string'
+      ? artifact
+      : artifact?.filename || artifact?.name || artifact?.relativePath || artifact?.path || artifact?.url || '';
+    const normalized = String(raw || '').replace(/\\/g, '/').split(/[?#]/, 1)[0].replace(/\/+$/, '');
+    const filename = basename(normalized).trim();
+    return filename && filename !== '.' ? filename : null;
+  }
+
+  function appendTaskArtifactRoomEvents(project, taskId, result = {}) {
+    if (!project?.primaryRoomId || !taskId || !result || typeof result !== 'object') return [];
+    const artifacts = [
+      ...(Array.isArray(result.artifacts) ? result.artifacts : []),
+      ...(Array.isArray(result.artifactManifest) ? result.artifactManifest : []),
+    ];
+    if (artifacts.length === 0) return [];
+
+    const existingArtifactIds = new Set((project.roomEventOutbox || [])
+      .filter((item) => item.eventType === 'artifact.registered')
+      .map((item) => item.sourceRefs?.artifactId)
+      .filter(Boolean));
+    const submissionFilenames = new Set();
+    const appended = [];
+    for (const artifact of artifacts) {
+      const filename = roomArtifactFilename(artifact);
+      if (!filename || submissionFilenames.has(filename)) continue;
+      submissionFilenames.add(filename);
+      const suppliedArtifactId = typeof artifact === 'object' && artifact
+        ? artifact.artifactId || artifact.id
+        : null;
+      const artifactId = String(suppliedArtifactId || `${taskId}:${filename}`);
+      if (existingArtifactIds.has(artifactId)) continue;
+      existingArtifactIds.add(artifactId);
+      const kind = typeof artifact === 'object' && artifact
+        ? artifact.kind || artifact.type || undefined
+        : undefined;
+      const mimeType = typeof artifact === 'object' && artifact
+        ? artifact.mimeType || undefined
+        : undefined;
+      const item = appendRoomEventOutboxItem(project, {
+        eventType: 'artifact.registered',
+        summary: `产物 ${filename} 已生成`,
+        sourceRefs: {
+          projectId: project.id,
+          taskId,
+          artifactId,
+          artifact: {
+            projectId: project.id,
+            filename,
+            ...(kind ? { kind } : {}),
+            ...(mimeType ? { mimeType } : {}),
+          },
+        },
+      });
+      if (item) appended.push(item);
+    }
+    return appended;
   }
 
   async function validateRoomFirstCreate(input, mutationCtx) {
@@ -1727,6 +1787,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     const project = projects.get(projectId);
     if (!project || project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
 
+    if (project.planRevisionRequired) {
+      return {
+        ok: false,
+        error: 'plan_revision_required',
+        blocker: project.planRevisionRequired,
+      };
+    }
+
     // Idempotent: a delivered project is not re-delivered.
     if (project.status === 'delivered') {
       return { ok: true, alreadyDelivered: true, deliveredAt: project.deliveredAt };
@@ -1837,6 +1905,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     if (!requestContext) return { ok: false, error: 'request_context_required' };
     if (requestContext.requestSource !== 'user') {
       return { ok: false, error: 'final_deliverable_approve_requires_user' };
+    }
+    if (project.planRevisionRequired) {
+      return {
+        ok: false,
+        error: 'plan_revision_required',
+        blocker: project.planRevisionRequired,
+      };
     }
 
     const finalDeliverable = finalDeliverables.get(deliverableId);
@@ -2074,6 +2149,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     });
 
     const project = projects.get(projectId);
+    if (project) appendTaskArtifactRoomEvents(project, task.id, normalizedResult);
     if (bridge && project) {
       bridge.send({
         type: 'intent', kind: 'result_submitted',
@@ -2155,6 +2231,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       output: normalizedResult, recovered: true,
     });
     const project = projects.get(projectId);
+    if (project) appendTaskArtifactRoomEvents(project, task.id, normalizedResult);
     if (bridge && project) {
       bridge.send({
         type: 'intent', kind: 'result_submitted',
@@ -2256,9 +2333,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     if (!project) return { ok: false, error: 'project_not_found' };
     if (project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
     if (!project.plan) return { ok: false, error: 'no_plan' };
+    if (
+      project.planRevisionRequired &&
+      revision.resolvesPlanRevisionFromTaskId !== project.planRevisionRequired.taskId
+    ) {
+      return {
+        ok: false,
+        error: 'plan_revision_resolution_mismatch',
+        blocker: project.planRevisionRequired,
+      };
+    }
 
     const board = boards.get(projectId);
     const newVersion = project.plan.version + 1;
+    let appliedChanges = 0;
 
     // Apply changes
     for (const change of (revision.changes || [])) {
@@ -2281,6 +2369,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
           if (!prepared.ok) return prepared;
           const added = board.addTasksChecked(prepared.tasks);
           if (!added.ok) return added;
+          appliedChanges++;
         }
       } else if (change.type === 'drop' && change.itemId) {
         // Drop item from plan + cancel task
@@ -2288,6 +2377,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
           const idx = phase.items.findIndex(i => i.id === change.itemId);
           if (idx >= 0) {
             phase.items[idx].status = 'dropped';
+            appliedChanges++;
             break;
           }
         }
@@ -2299,6 +2389,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
           const item = phase.items.find(i => i.id === change.itemId);
           if (item && change.field) {
             item[change.field] = change.newValue;
+            appliedChanges++;
             break;
           }
         }
@@ -2307,9 +2398,17 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
 
     project.plan.version = newVersion;
     project.plan.revisions.push({ version: newVersion, ts: Date.now(), reason: revision.reason, changes: revision.changes });
+    if (
+      appliedChanges > 0 &&
+      project.planRevisionRequired &&
+      revision.resolvesPlanRevisionFromTaskId === project.planRevisionRequired.taskId
+    ) {
+      project.planRevisionRequired = null;
+      bumpProjectLifecycleVersion(project);
+    }
 
     eventLog.emit('plan.revised', { projectId, version: newVersion, reason: revision.reason });
-    return { ok: true, plan: project.plan, version: newVersion };
+    return { ok: true, plan: project.plan, version: newVersion, appliedChanges };
   }
 
   /**
@@ -2334,11 +2433,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       passed: review.passed,
       feedback: review.feedback || '',
       failureClass: review.failureClass || null,
+      planRevisionNeeded: review.planRevisionNeeded === true,
       reviewedAt: Date.now(),
     };
     task.reviewResult = reviewResult;
     task.qualityReviewHistory = Array.isArray(task.qualityReviewHistory) ? task.qualityReviewHistory : [];
     task.qualityReviewHistory.push(reviewResult);
+    if (reviewResult.planRevisionNeeded) {
+      project.planRevisionRequired = {
+        taskId: task.id,
+        feedback: reviewResult.feedback,
+        requestedAt: new Date(reviewResult.reviewedAt).toISOString(),
+      };
+      bumpProjectLifecycleVersion(project, reviewResult.reviewedAt);
+    }
 
     if (review.passed) {
       if (task.evidenceContract && task.result) {
@@ -3004,6 +3112,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     prompt,
     assignedAgent = null,
     options = null,
+    permissions = null,
     parallelGroupId = null,
     fanoutItemKey = null,
     fanoutItemLabel = null,
@@ -3051,6 +3160,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
         prompt: readWorkflowString(prompt),
         label: title,
         options: options && typeof options === 'object' && !Array.isArray(options) ? JSON.parse(JSON.stringify(options)) : null,
+        permissions: normalizeNodePermissions(permissions),
         script: {
           workflowId: workflowRun.workflowId,
           workflowRunId,

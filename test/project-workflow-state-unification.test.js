@@ -228,6 +228,19 @@ test('agent workflow deliverable is a candidate until user approves it', () => {
     assert.equal(agentApprove.ok, false);
     assert.equal(agentApprove.error, 'final_deliverable_approve_requires_user');
 
+    hub.getProject(projectId).planRevisionRequired = {
+      taskId: 'item-2',
+      feedback: 'The project plan still misses a required final check.',
+      requestedAt: '2026-08-31T00:00:00.000Z',
+    };
+    const blockedApproval = hub.approveFinalDeliverable(projectId, registered.finalDeliverable.deliverableId, {
+      approvalIdempotencyKey: 'user-approve-while-plan-blocked',
+      expectedProjectVersion: hub.getProjectLifecycle(projectId).version,
+    }, makeUserContext());
+    assert.equal(blockedApproval.ok, false);
+    assert.equal(blockedApproval.error, 'plan_revision_required');
+    hub.getProject(projectId).planRevisionRequired = null;
+
     const approved = hub.approveFinalDeliverable(projectId, registered.finalDeliverable.deliverableId, {
       approvalIdempotencyKey: 'user-approve',
       expectedProjectVersion: hub.getProjectLifecycle(projectId).version,
@@ -240,6 +253,40 @@ test('agent workflow deliverable is a candidate until user approves it', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('pending plan revision blocks final-deliverable auto-close even after user approval', () => {
+  const lifecycle = deriveProjectLifecycle({
+    project: {
+      id: 'proj-plan-revision-blocked',
+      status: 'active',
+      planRevisionRequired: {
+        taskId: 'item-1',
+        feedback: 'Add the missing evidence verification task.',
+        requestedAt: '2026-08-31T00:00:00.000Z',
+      },
+    },
+    tasks: [{ id: 'item-1', title: 'Draft', status: 'done', required: true }],
+    finalDeliverables: [{
+      deliverableId: 'fd-plan-revision-blocked',
+      projectId: 'proj-plan-revision-blocked',
+      status: 'approved',
+      artifactRef: { path: 'artifacts/final.md' },
+      deterministicChecks: { ok: true },
+      approval: { requestContext: makeUserContext() },
+    }],
+    reviewGateDecisions: [{
+      gateId: 'gate-plan-revision-blocked',
+      projectId: 'proj-plan-revision-blocked',
+      finalDeliverableId: 'fd-plan-revision-blocked',
+      decision: 'passed',
+      autoCloseAllowed: true,
+    }],
+  });
+
+  assert.equal(lifecycle.state, 'blocked');
+  assert.equal(lifecycle.canAutoClose, false);
+  assert.equal(lifecycle.issues.some(issue => issue.kind === 'plan_revision_required'), true);
 });
 
 test('start policy is downgraded from agent auto-dispatch when service risk is unknown', () => {

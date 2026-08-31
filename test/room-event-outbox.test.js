@@ -40,6 +40,7 @@ function createFakeBrokerClient(overrides = {}) {
         room: { roomId, status: 'active', revision: 1 },
         members: [
           { subject: { kind: 'agent', logicalAgentId: 'agent-po' }, status: 'active' },
+          { subject: { kind: 'agent', logicalAgentId: 'agent-worker' }, status: 'active' },
         ],
       };
     },
@@ -73,7 +74,7 @@ async function createRoomLinkedProject(hub) {
       name: 'outbox project',
       goal: 'g',
       poAgent: 'agent-po',
-      members: [],
+      members: ['agent-worker'],
       primaryRoomId: 'room-1',
       clientRequestKey: 'room-create:outbox-1',
     },
@@ -182,6 +183,89 @@ test('a publish failure keeps the outbox item pending for the next flush', async
   await hub.flushRoomEventOutbox();
   const outboxAfterRetry = hub.getRoomEventOutbox({ projectId: project.id });
   assert.ok(outboxAfterRetry.items.every((item) => item.status !== 'pending'));
+});
+
+test('an accepted task submission projects durable artifact references without leaking local paths', async () => {
+  const brokerClient = createFakeBrokerClient();
+  const hub = createHub({ silent: true, brokerClient });
+  const project = await createRoomLinkedProject(hub);
+  assert.equal(hub.handleCreateTasks(project.id, [{
+    id: 'task-artifact',
+    title: 'Prepare outputs',
+    brief: 'Prepare the requested outputs for the project room.',
+    assignedAgent: 'agent-worker',
+    dependencies: [],
+  }], 'agent-po').ok, true);
+  assert.equal(hub.handleApprove(project.id).ok, true);
+  assert.deepEqual(hub.handleRequestDispatch(project.id, 'agent-po').dispatched, [`${project.id}__task-artifact`]);
+
+  const task = hub.getBoard(project.id).getTask('task-artifact');
+  const runId = task.activeRunId;
+  assert.equal(hub.handleAcceptTask(project.id, task.id, 'agent-worker', runId).ok, true);
+  assert.equal(hub.handleProgress(project.id, task.id, 'started', 'agent-worker', runId).ok, true);
+  assert.equal(hub.handleSubmitResult(project.id, task.id, {
+    summary: 'The requested project outputs are complete and ready for the product owner to inspect in the collaboration room.',
+    artifacts: [
+      {
+        artifactId: 'artifact-html',
+        filename: 'report.html',
+        path: '/private/tmp/kswarm/artifacts/report.html',
+        kind: 'html',
+        mimeType: 'text/html',
+      },
+      {
+        path: 'C:\\workspace\\artifacts\\notes.md',
+        kind: 'markdown',
+        mimeType: 'text/markdown',
+      },
+    ],
+    artifactManifest: [{ filename: 'report.html', kind: 'html', mimeType: 'text/html' }],
+  }, 'agent-worker', runId).ok, true);
+
+  const outbox = hub.getRoomEventOutbox({ projectId: project.id });
+  const artifactItems = outbox.items.filter((item) => item.eventType === 'artifact.registered');
+  assert.equal(artifactItems.length, 2);
+  assert.deepEqual(artifactItems.map((item) => item.sourceRefs.artifact.filename), ['report.html', 'notes.md']);
+  assert.equal(artifactItems[0].sourceRefs.artifactId, 'artifact-html');
+  assert.equal(artifactItems[1].sourceRefs.artifactId, `${task.id}:notes.md`);
+  assert.equal(artifactItems.every((item) => item.sourceRefs.projectId === project.id), true);
+  assert.equal(artifactItems.every((item) => item.sourceRefs.taskId === task.id), true);
+  assert.doesNotMatch(JSON.stringify(artifactItems), /private\/tmp|C:\\\\workspace/);
+
+  await hub.flushRoomEventOutbox();
+  const publishedArtifacts = brokerClient.calls.publishRoomProjectEvent
+    .filter((event) => event.eventType === 'artifact.registered');
+  assert.equal(publishedArtifacts.length, 2);
+  assert.deepEqual(publishedArtifacts.map((event) => event.sourceRefs.artifact.filename), ['report.html', 'notes.md']);
+});
+
+test('a deliverable-contract rejection does not expose the rejected artifact in the room', async () => {
+  const hub = createHub({ silent: true, brokerClient: createFakeBrokerClient() });
+  const project = await createRoomLinkedProject(hub);
+  assert.equal(hub.handleCreateTasks(project.id, [{
+    id: 'task-rejected',
+    title: 'Conference deck',
+    brief: 'The final deliverable must be a PPTX file, not Markdown.',
+    assignedAgent: 'agent-worker',
+    dependencies: [],
+  }], 'agent-po').ok, true);
+  assert.equal(hub.handleApprove(project.id).ok, true);
+  hub.handleRequestDispatch(project.id, 'agent-po');
+  const task = hub.getBoard(project.id).getTask('task-rejected');
+  const runId = task.activeRunId;
+  hub.handleAcceptTask(project.id, task.id, 'agent-worker', runId);
+  hub.handleProgress(project.id, task.id, 'started', 'agent-worker', runId);
+
+  const rejected = hub.handleSubmitResult(project.id, task.id, {
+    summary: 'The draft is complete but only available as Markdown, so it should fail the explicit file contract.',
+    artifacts: [{ filename: 'deck.md', path: '/private/tmp/deck.md', mimeType: 'text/markdown' }],
+  }, 'agent-worker', runId);
+
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error, 'deliverable_contract_failed');
+  const artifactItems = hub.getRoomEventOutbox({ projectId: project.id }).items
+    .filter((item) => item.eventType === 'artifact.registered');
+  assert.equal(artifactItems.length, 0);
 });
 
 let passed = 0;

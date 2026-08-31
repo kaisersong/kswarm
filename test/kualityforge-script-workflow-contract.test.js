@@ -120,6 +120,13 @@ test('KualityForge script preview can create a KSwarm dynamic workflow and revie
       fanoutItemLabel: 'codex:gpt-5',
       required: true,
       evidenceRequired: true,
+      permissions: {
+        allowShell: true,
+        allowWrite: false,
+        allowNetwork: false,
+        allowRenderer: false,
+        deniedCommands: ['git diff'],
+      },
       options: {
         role: 'reviewer',
         runnerId: 'codex:gpt-5',
@@ -133,6 +140,11 @@ test('KualityForge script preview can create a KSwarm dynamic workflow and revie
     assert.equal(reviewer.dispatches[0].targetParticipantId, 'codex:gpt-5');
     assert.equal(reviewer.dispatches[0].input.options.outputArtifact, 'reviews/codex-gpt-5.md');
     assert.equal(reviewer.workflowRun.nodes.find(node => node.id === reviewer.nodeId).parallelGroupId, group.parallelGroup.id);
+
+    const reviewerNode = reviewer.workflowRun.nodes.find(node => node.id === reviewer.nodeId);
+    assert.deepEqual(reviewerNode.input.permissions.deniedCommands, ['git diff']);
+    assert.equal(reviewerNode.input.permissions.allowShell, true);
+    assert.deepEqual(reviewer.dispatches[0].input.permissions.deniedCommands, ['git diff']);
 
     const dispatch = reviewer.dispatches[0];
     assert.ok(dispatch.nodeId);

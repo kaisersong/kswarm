@@ -138,6 +138,7 @@ export function deriveProjectLifecycle({
   const gateDecision = approvedFinal
     ? selectGateDecisionForDeliverable(reviewGateDecisions, approvedFinal.deliverableId)
     : null;
+  const planRevisionRequired = Boolean(project?.planRevisionRequired);
   const allRequiredTerminalOk = executionGraph.nodes
     .filter(node => node.required !== false)
     .every(node => isExecutionNodeTerminalOk(node));
@@ -145,6 +146,7 @@ export function deriveProjectLifecycle({
   const hasLegacyWorkflowCandidate = hasCandidateFinal && ['created', 'planning'].includes(legacyStatus);
   const canAutoClose = Boolean(
     approvedFinal &&
+    !planRevisionRequired &&
     approvedFinal.approval?.requestContext?.requestSource === 'user' &&
     gateDecision?.finalDeliverableId === approvedFinal.deliverableId &&
     gateDecision?.decision === 'passed' &&
@@ -159,6 +161,14 @@ export function deriveProjectLifecycle({
 
   if (legacyStatus === 'closed') {
     state = 'closed';
+  } else if (planRevisionRequired) {
+    state = 'blocked';
+    primaryAction = { id: 'revise_project_plan', strategy: 'revise_plan' };
+    issues.push({
+      kind: 'plan_revision_required',
+      taskId: project.planRevisionRequired?.taskId || null,
+      feedback: project.planRevisionRequired?.feedback || '',
+    });
   } else if (canAutoClose || legacyStatus === 'delivered') {
     state = canAutoClose ? 'delivered' : 'ready_to_deliver';
     if (legacyStatus === 'delivered' && !canAutoClose) {

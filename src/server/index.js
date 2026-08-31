@@ -310,6 +310,9 @@ let recoveryRunning = false;
 let watchdogStarted = false;
 let watchdog = null;
 let stalledRunWatchdogTimer = null;
+let roomEventOutboxTimer = null;
+let roomEventOutboxFlushInFlight = false;
+const ROOM_EVENT_OUTBOX_FLUSH_INTERVAL_MS = 1_000;
 let pendingRecoveryTimer = null;
 let recoveryCompletedAt = 0;
 let systemSuspended = false;
@@ -2155,6 +2158,7 @@ async function handleRequest(req, res) {
         prompt: body?.prompt,
         assignedAgent: body?.assignedAgent || null,
         options: body?.options || null,
+        permissions: body?.permissions || null,
         parallelGroupId: body?.parallelGroupId || null,
         fanoutItemKey: body?.fanoutItemKey || null,
         fanoutItemLabel: body?.fanoutItemLabel || null,
@@ -3721,8 +3725,31 @@ server.listen(PORT, () => {
   // If broker is slow/unavailable, still run local recovery before watchdog.
   // Unified scheduler collapses this with the broker onConnect schedule.
   startWatchdog();
+  startRoomEventOutboxPublisher();
   scheduleStartupRecovery(STARTUP_RECOVERY_DELAY_MS);
 });
+
+async function flushRoomEventOutboxOnce() {
+  if (roomEventOutboxFlushInFlight) return;
+  roomEventOutboxFlushInFlight = true;
+  try {
+    const result = await hub.flushRoomEventOutbox();
+    if (result?.ok && (result.published > 0 || result.suppressed > 0)) {
+      log('info', 'Room event outbox flushed', result);
+    }
+  } catch (err) {
+    log('warn', 'Room event outbox flush failed', { error: String(err?.message || err) });
+  } finally {
+    roomEventOutboxFlushInFlight = false;
+  }
+}
+
+function startRoomEventOutboxPublisher() {
+  if (roomEventOutboxTimer) return;
+  void flushRoomEventOutboxOnce();
+  roomEventOutboxTimer = setInterval(flushRoomEventOutboxOnce, ROOM_EVENT_OUTBOX_FLUSH_INTERVAL_MS);
+  if (typeof roomEventOutboxTimer.unref === 'function') roomEventOutboxTimer.unref();
+}
 
 function startWatchdog() {
   if (watchdogStarted) return;
@@ -3847,6 +3874,10 @@ let shuttingDown = false;
 function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  if (roomEventOutboxTimer) {
+    clearInterval(roomEventOutboxTimer);
+    roomEventOutboxTimer = null;
+  }
   log('info', `Received ${signal}; marking active runs suspended for clean restart`);
   try {
     const result = hub.handleSuspendActiveRuns();

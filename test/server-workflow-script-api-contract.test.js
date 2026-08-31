@@ -51,6 +51,13 @@ test('server wires script node retry endpoint with workflow update broadcast and
   assert.match(routeBlock, /sendWorkflowNodeHandoffs/);
 });
 
+test('server forwards node permissions into script node dispatch', () => {
+  const routeStart = source.indexOf('scriptWorkflowNodeMatch && req.method');
+  assert.ok(routeStart > -1);
+  const routeBlock = source.slice(routeStart, routeStart + 1400);
+  assert.match(routeBlock, /permissions: body\?\.permissions/);
+});
+
 test('server forwards scriptSource into script-generated proposal and exposes runs via GET', () => {
   const routeStart = source.indexOf('scriptWorkflowProposalMatch');
   assert.ok(routeStart > -1);

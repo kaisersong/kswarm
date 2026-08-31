@@ -11,6 +11,11 @@ import {
   buildEvidencePromptSection,
   shouldCollectSearchEvidence,
 } from '../src/core/auto-worker-evidence.js';
+import {
+  buildDeniedCommandsPromptSection,
+  composeNodePrompt,
+  normalizeNodePermissions,
+} from '../src/core/workflow-node-permissions.js';
 
 const source = readFileSync(join(process.cwd(), 'scripts/auto-worker.js'), 'utf-8');
 
@@ -229,6 +234,7 @@ test('PO planning and review prompts include current date and future-data guardr
   assert.match(source, /当前日期/);
   assert.match(source, /不得要求当前日期之后/);
   assert.match(source, /planRevisionNeeded/);
+  assert.match(source, /resolvesPlanRevisionFromTaskId/);
 });
 
 test('worker task prompt includes current date and anti-fabrication source rules', () => {
@@ -279,6 +285,68 @@ test('auto-worker evidence helpers require search evidence and build a grounding
   assert.ok(section.includes('search-evidence.json'));
   assert.ok(section.includes('灵基 Lingee'));
   assert.ok(section.includes('禁止新增未出现在搜索证据中的事实'));
+});
+
+test('node permissions normalize to a deduped denied-command list or null', () => {
+  assert.equal(normalizeNodePermissions(null), null);
+  assert.equal(normalizeNodePermissions('git diff'), null);
+  assert.equal(normalizeNodePermissions({}), null);
+  assert.equal(normalizeNodePermissions({ deniedCommands: ['', '   '] }), null);
+
+  const normalized = normalizeNodePermissions({
+    allowShell: true,
+    allowWrite: false,
+    deniedCommands: ['git diff', ' git diff ', 'git stash'],
+  });
+  assert.deepEqual(normalized.deniedCommands, ['git diff', 'git stash']);
+  assert.equal(normalized.allowShell, true);
+  assert.equal(normalized.allowWrite, false);
+});
+
+test('denied-command prompt section carries every denied command verbatim', () => {
+  assert.equal(buildDeniedCommandsPromptSection(null), '');
+  assert.equal(buildDeniedCommandsPromptSection({ allowShell: true }), '');
+
+  const section = buildDeniedCommandsPromptSection({
+    deniedCommands: ['git diff', 'git stash'],
+  });
+  // Structural invariant: each denied command reaches the agent prompt. The
+  // surrounding wording is free to change; dropping a command must not be.
+  assert.ok(section.includes('git diff'));
+  assert.ok(section.includes('git stash'));
+});
+
+test('composeNodePrompt is the real assembly auto-worker hands to the CLI', () => {
+  // Executes the production composition, not a replica of it: a test that
+  // re-implements the concatenation proves nothing about auto-worker.
+  const plain = composeNodePrompt({ prompt: 'Review the changeset.' });
+  assert.equal(plain.basePrompt, 'Review the changeset.');
+  assert.equal(plain.prompt, 'Review the changeset.');
+
+  const withDenials = composeNodePrompt({
+    prompt: 'Review the changeset.',
+    permissions: { deniedCommands: ['git diff'] },
+  });
+  assert.ok(withDenials.prompt.startsWith('Review the changeset.'));
+  assert.ok(withDenials.prompt.includes('git diff'));
+
+  // A node carrying only a permissions declaration must still register as
+  // prompt-missing, so the denied-command section cannot mask an empty prompt.
+  const permissionsOnly = composeNodePrompt({
+    permissions: { deniedCommands: ['git diff'] },
+  });
+  assert.equal(permissionsOnly.basePrompt, '');
+
+  assert.equal(composeNodePrompt(null).prompt, '');
+  assert.equal(composeNodePrompt({ value: 'legacy field' }).basePrompt, 'legacy field');
+});
+
+test('auto-worker renders node permissions into the workflow node prompt', () => {
+  const handoffStart = source.indexOf('async function handleWorkflowNodeHandoff');
+  assert.ok(handoffStart > -1);
+  const handoffBlock = source.slice(handoffStart, source.indexOf('runCLIHarness', handoffStart));
+  assert.match(handoffBlock, /composeNodePrompt\(input\)/);
+  assert.match(source, /workflow-node-permissions\.js/);
 });
 
 test('auto-worker collects search evidence before generating source-heavy artifacts', () => {

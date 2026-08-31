@@ -31,6 +31,7 @@ import {
   buildEvidencePromptSection,
   shouldCollectSearchEvidence,
 } from '../src/core/auto-worker-evidence.js';
+import { composeNodePrompt } from '../src/core/workflow-node-permissions.js';
 import { requiresExternalSourceEvidence, validateSourceEvidenceArtifact } from '../src/core/source-evidence.js';
 import {
   buildSemanticOutputArtifacts,
@@ -918,7 +919,7 @@ async function handleWorkflowNodeHandoff(payload) {
   const options = input?.options || {};
   const project = payload?.project || {};
   const projectId = project.id || input?.workflowRun?.projectId || payload?.projectId;
-  const prompt = input?.prompt || input?.value || '';
+  const { basePrompt, prompt } = composeNodePrompt(input);
   const runnerId = options.runnerId || AGENT_ID;
   const artifactRoot = options.artifactRoot || null;
   const outputArtifact = options.outputArtifact || null;
@@ -938,7 +939,7 @@ async function handleWorkflowNodeHandoff(payload) {
     console.log(`[${ALIAS}]   ⚠ Workflow handoff missing identity, ignoring`);
     return;
   }
-  if (!prompt) {
+  if (!basePrompt) {
     await failNode('workflow_node_prompt_missing');
     return;
   }
@@ -1573,7 +1574,7 @@ Strict JSON (no markdown fences):
 
       // If plan revision needed, trigger it
       if (reviewResult.planRevisionNeeded) {
-        await revisePlanFromReview(projectId, taskTitle, reviewResult.feedback);
+        await revisePlanFromReview(projectId, taskId, taskTitle, reviewResult.feedback);
       }
 
       // Trigger dispatch for next tasks
@@ -1590,7 +1591,7 @@ Strict JSON (no markdown fences):
 /**
  * PO revises the plan based on review outcomes or new insights.
  */
-async function revisePlanFromReview(projectId, taskTitle, reviewFeedback) {
+async function revisePlanFromReview(projectId, taskId, taskTitle, reviewFeedback) {
   console.log(`[${ALIAS}]   → Plan revision triggered by review of "${taskTitle}"`);
 
   const lang = detectLanguage(reviewFeedback);
@@ -1643,7 +1644,11 @@ If not: {"needed": false}`;
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        revision: { reason: revisionData.reason, changes: revisionData.changes || [] },
+        revision: {
+          reason: revisionData.reason,
+          resolvesPlanRevisionFromTaskId: taskId,
+          changes: revisionData.changes || [],
+        },
         fromAgent: LOGICAL_AGENT_ID,
       }),
     });
