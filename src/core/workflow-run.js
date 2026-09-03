@@ -9,7 +9,12 @@ import { createHash } from 'node:crypto';
 
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_NODE_STATUSES = new Set(['completed', 'failed', 'blocked', 'cancelled']);
-const PASSING_GATE_STATUSES = new Set(['passed', 'conditional-pass']);
+// design §8.2 表格（workflow-run.js:PASSING_GATE_STATUSES / gate reducer 项）：
+// "删除 conditional-pass 的 passing 语义；schema v2 读取时把旧值归一为
+// waiting_for_evidence，不得把 node/run 标 completed 或满足 verified edge"。
+// 此前 conditional-pass 一直在这个集合里（真实存在的旁路，本轮核实发现并修复），
+// 与既有测试 test/workflow-run.test.js 一起被主动锁定，从未被移除。
+const PASSING_GATE_STATUSES = new Set(['passed']);
 
 export function validateWorkflowRunInput(input = {}) {
   if (!input.projectId) return { ok: false, error: 'project_id_required' };

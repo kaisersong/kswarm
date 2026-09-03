@@ -1,5 +1,10 @@
+import { isContractFamily } from './contract-kind-registry.js';
+
 export function shouldCollectSearchEvidence(evidenceContract) {
-  return evidenceContract?.required === true && evidenceContract.kind === 'external_source_v1';
+  // design §5.1.1：统一走 contract kind registry 分派，而不是硬编码
+  // 'external_source_v1' 单值判断，防止未来新增的 external_source_v2 在这个
+  // 判定点被静默漏检（既不报错，也不采集证据）。
+  return evidenceContract?.required === true && isContractFamily(evidenceContract.kind, 'external_source');
 }
 
 export function buildEvidencePromptSection(evidence = {}) {

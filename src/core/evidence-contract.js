@@ -34,9 +34,13 @@ export function hasSpeculativeSourceLanguage(content = '') {
 function normalizeExternalContract(contract = {}, task = {}, options = {}) {
   const text = collectTaskText(task);
   const requiresRecentEvidence = contract.requiresRecentEvidence ?? isRecentTask(text, options.now);
+  // design §5.1.1：生成点必须按 executionGateSchemaVersion 显式选 kind，不能
+  // 永远硬编码 v1。schemaVersion 未显式传 2 时保持 v1 默认行为（v1 项目/未
+  // 声明 schema 的调用方不受影响）。
+  const isV2 = Number(options.schemaVersion) === 2;
   return {
-    version: 1,
-    kind: 'external_source_v1',
+    version: isV2 ? 2 : 1,
+    kind: isV2 ? 'external_source_v2' : 'external_source_v1',
     required: true,
     requiresRecentEvidence,
     freshnessWindowDays: Number(contract.freshnessWindowDays || (requiresRecentEvidence ? 7 : 30)),

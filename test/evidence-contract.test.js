@@ -15,6 +15,40 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 const now = Date.UTC(2026, 4, 21, 5, 0, 0);
 
+// design §5.1.1（Contract kind registry 与 fail-closed）：
+// "生成点必须按 executionGateSchemaVersion 显式选 kind，并由 contract test
+// 扫描所有 kind ===/!== 分支；禁止局部 accepted set 与局部默认值漂移。"
+//
+// 现状核实（2026-09-02）：inferEvidenceContract 此前完全没有 schemaVersion
+// 输入，永远产出 external_source_v1，即使调用方项目是 schema v2——这是
+// auto-worker.js 从未真正调用 collectSearchEvidenceV2 的根本原因之一
+// （生成点本身就没有产 v2 kind 的能力，不是 auto-worker.js 单独的接线缺失）。
+test('schemaVersion=2 时产出 external_source_v2（此前完全没有这个能力，永远只产 v1）', () => {
+  const contract = inferEvidenceContract({
+    title: '收集金蝶2026年AI产品公开信息',
+    brief: '搜索金蝶官网、新闻稿、发布会记录，整理来源链接。',
+    acceptanceCriteria: '每条信息有来源链接或明确出处。',
+    projectGoal: '金蝶今年AI产品分析',
+  }, { now, schemaVersion: 2 });
+
+  assert.equal(contract.version, 2);
+  assert.equal(contract.kind, 'external_source_v2');
+  assert.equal(contract.required, true);
+  assert.ok(contract.minFetchedPages >= 1);
+});
+
+test('schemaVersion 未传时保持默认 v1 行为（不引入回归）', () => {
+  const contract = inferEvidenceContract({
+    title: '收集金蝶2026年AI产品公开信息',
+    brief: '搜索金蝶官网、新闻稿、发布会记录，整理来源链接。',
+    acceptanceCriteria: '每条信息有来源链接或明确出处。',
+    projectGoal: '金蝶今年AI产品分析',
+  }, { now });
+
+  assert.equal(contract.version, 1);
+  assert.equal(contract.kind, 'external_source_v1');
+});
+
 test('infers required recent external evidence for current public research tasks', () => {
   const contract = inferEvidenceContract({
     title: '收集金蝶2026年AI产品公开信息',

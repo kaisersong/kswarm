@@ -183,6 +183,7 @@ test('agent workflow deliverable is a candidate until user approves it', () => {
   const projectId = 'proj-agent-candidate';
   createReadyProject(hub, projectId);
   markAllTasksDone(hub, projectId);
+  hub.getBoard(projectId).getTask('item-2').reviewResult = { passed: true, feedback: '' };
 
   const dir = mkdtempSync(join(tmpdir(), 'kswarm-final-deliverable-'));
   try {
@@ -206,6 +207,7 @@ test('agent workflow deliverable is a candidate until user approves it', () => {
 
     const registered = hub.registerFinalDeliverable(projectId, {
       executionNodeId: null,
+      taskId: 'item-2',
       kind: 'file',
       expectedFormat: 'markdown',
       artifactRef: { path: artifactPath },
@@ -287,6 +289,43 @@ test('pending plan revision blocks final-deliverable auto-close even after user 
   assert.equal(lifecycle.state, 'blocked');
   assert.equal(lifecycle.canAutoClose, false);
   assert.equal(lifecycle.issues.some(issue => issue.kind === 'plan_revision_required'), true);
+});
+
+test('open review conditions prevent auto-close from diverging from approval preflight', () => {
+  const lifecycle = deriveProjectLifecycle({
+    project: { id: 'proj-condition-blocked', status: 'active' },
+    tasks: [{
+      id: 'item-1',
+      title: 'Draft',
+      status: 'done',
+      required: true,
+      reviewResult: { passed: true },
+    }],
+    finalDeliverables: [{
+      deliverableId: 'fd-condition-blocked',
+      projectId: 'proj-condition-blocked',
+      taskId: 'item-1',
+      kind: 'none',
+      requiresReview: true,
+      status: 'approved',
+      approval: { requestContext: makeUserContext() },
+    }],
+    reviewGateDecisions: [{
+      gateId: 'gate-condition-blocked',
+      projectId: 'proj-condition-blocked',
+      finalDeliverableId: 'fd-condition-blocked',
+      decision: 'passed',
+      autoCloseAllowed: true,
+    }],
+    reviewConditions: [{
+      conditionId: 'cond-open',
+      projectId: 'proj-condition-blocked',
+      blocking: true,
+      status: 'open',
+    }],
+  });
+
+  assert.equal(lifecycle.canAutoClose, false);
 });
 
 test('start policy is downgraded from agent auto-dispatch when service risk is unknown', () => {

@@ -370,7 +370,13 @@ ${c.bold}╔══════════════════════�
   check(board.isAllDone(), '所有任务完成');
   const delivered = po.deliver(projectId);
   check(delivered, 'PO 成功提交交付');
-  check(hub.getProject(projectId).status === 'delivered', '项目状态 = delivered');
+  // design §8.2（legacy handleDeliver 项）：handleDeliver 现在是 candidate-only
+  // 兼容 adapter，只注册 FinalDeliverable candidate，不再直写 project.status=delivered；
+  // 必须经用户 approveFinalDeliverable（requestSource=user）显式批准才能真正交付。
+  // 这条验证脚本因此不能再断言 handleDeliver 之后项目状态直达 delivered。
+  const candidateDeliverable = hub.listFinalDeliverables(projectId).find(item => item.status === 'candidate');
+  check(Boolean(candidateDeliverable), 'handleDeliver 注册了 FinalDeliverable candidate（不再直写 delivered）');
+  check(hub.getProject(projectId).status !== 'delivered', '项目状态在用户批准前不应变为 delivered');
 
   await sleep(300);
 

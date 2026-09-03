@@ -1,6 +1,46 @@
 import { z } from 'zod';
 import type { KSwarmHttpClient } from '../client/http-client.js';
 
+const deniedCommandId = z.enum(['git-diff', 'git-stash']);
+const deniedCommandLabel = z.enum(['git diff', 'git stash']);
+const deniedCommandLabels = {
+  'git-diff': 'git diff',
+  'git-stash': 'git stash',
+} as const;
+const boundedTrimmedString = z.string().refine(
+  value => value === value.trim() && value.length >= 1 && value.length <= 64,
+  'must be trimmed and contain 1..64 characters',
+);
+const permissionsSchema = z.object({
+  deniedCommandIds: z.array(deniedCommandId).min(1).max(16).optional(),
+  deniedCommands: z.array(deniedCommandLabel).min(1).max(16).optional(),
+  toolCategories: z.array(boundedTrimmedString).min(1).max(32).optional(),
+}).strict().superRefine((permissions, ctx) => {
+  if (
+    permissions.deniedCommandIds === undefined &&
+    permissions.deniedCommands === undefined &&
+    permissions.toolCategories === undefined
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'permissions must declare at least one restriction',
+    });
+  }
+  if (permissions.deniedCommands === undefined) return;
+  const expected = permissions.deniedCommandIds?.map(id => deniedCommandLabels[id]);
+  if (
+    !expected ||
+    expected.length !== permissions.deniedCommands.length ||
+    expected.some((label, index) => label !== permissions.deniedCommands?.[index])
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['deniedCommands'],
+      message: 'deniedCommands must match deniedCommandIds in order',
+    });
+  }
+});
+
 export const createNodeSchema = {
   projectId: z.string().describe('KSwarm project ID'),
   workflowRunId: z.string().describe('Workflow run ID'),
@@ -12,7 +52,7 @@ export const createNodeSchema = {
   fanoutItemKey: z.string().optional().describe('Fanout item key for multi-item iteration'),
   required: z.boolean().default(true).describe('Whether this node is required for completion'),
   options: z.record(z.unknown()).optional().describe('Additional options for the agent'),
-  permissions: z.record(z.unknown()).optional().describe('Node permissions, e.g. { allowShell, deniedCommands }'),
+  permissions: permissionsSchema.optional().describe('Advisory node restrictions using canonical command IDs'),
 };
 
 const schema = z.object(createNodeSchema);

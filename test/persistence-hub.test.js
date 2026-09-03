@@ -35,8 +35,27 @@ function tempDir(label = 'hub-persist') { return mkdtempSync(join(tmpdir(), `ksw
 function sqliteDataDir(dir) { return { backend: 'sqlite', filePath: join(dir, 'state.sqlite'), legacyJsonPath: join(dir, 'state.json') }; }
 
 function createActiveProject(hub, id) {
-  hub.createProject({ id, name: id, goal: 'goal', poAgent: 'po-1', members: [] });
+  hub.createProject({ id, name: id, goal: 'goal', poAgent: 'po-1', members: ['worker-1'] });
   hub.handleApprove(id);
+}
+
+function createReviewConditionThroughWorkflow(hub, projectId) {
+  createActiveProject(hub, projectId);
+  const started = hub.startAgentReviewSmokeWorkflow(projectId);
+  const worker = hub.handleWorkflowNodeResult({
+    workflowRunId: started.workflowRun.id, nodeId: 'worker-diagnose-project',
+    attempt: started.dispatches[0].attempt, handoffId: started.dispatches[0].handoffId,
+    fromAgent: 'worker-1', output: { summary: 'done' },
+  });
+  const review = worker.dispatches[0];
+  const result = hub.handleWorkflowNodeReview({
+    workflowRunId: started.workflowRun.id, nodeId: 'reviewer-adversarial-check',
+    attempt: review.attempt, handoffId: review.handoffId, fromAgent: 'po-1',
+    reviewDecision: { status: 'needs_rework', reason: 'blocking', evidenceRefs: ['review:f1'] },
+    output: { reviewEvidence: { findings: [{ id: 'f1', blocking: true }] } },
+  });
+  assert.equal(result.ok, true);
+  return hub.listReviewConditions(projectId)[0];
 }
 
 // ── durable sqlite commit ────────────────────────────────────────────────
@@ -53,6 +72,24 @@ test('hub sqlite: mutation is durably committed synchronously and survives reope
     const restored = hub2.getProject('p1');
     assert.ok(restored, 'project should be durably persisted without debounce');
     assert.equal(restored.name, 'Alpha');
+    hub2.closePersistence();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('hub sqlite: review conditions survive reopen and remain project-isolated', () => {
+  const dir = tempDir('review-conditions');
+  try {
+    const dataDir = sqliteDataDir(dir);
+    const hub1 = createHub({ silent: true, dataDir });
+    const p1Condition = createReviewConditionThroughWorkflow(hub1, 'p1');
+    createActiveProject(hub1, 'p2');
+    assert.equal(hub1.listReviewConditions('p1').length, 1);
+    assert.deepEqual(hub1.listReviewConditions('p2'), []);
+    hub1.closePersistence();
+
+    const hub2 = createHub({ silent: true, dataDir });
+    assert.equal(hub2.listReviewConditions('p1')[0].conditionId, p1Condition.conditionId);
+    assert.deepEqual(hub2.listReviewConditions('p2'), []);
     hub2.closePersistence();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -89,13 +126,21 @@ test('hub sqlite: scoped save only materializes the affected project entities', 
     const hub = createHub({ silent: true, persistence: fakePersistence });
     hub.createProject({ id: 'p1', name: 'A', goal: 'g', poAgent: 'po-1', members: [] });
     hub.createProject({ id: 'p2', name: 'B', goal: 'g', poAgent: 'po-1', members: [] });
+    createReviewConditionThroughWorkflow(hub, 'p3');
+    const fullPayload = captured[captured.length - 1].payload.full();
+    assert.equal(fullPayload.reviewConditions.length, 1);
     captured.length = 0;
-    hub.handleApprove('p1');
+    hub.submitReviewConditionEvidence(
+      'p3', hub.listReviewConditions('p3')[0].conditionId,
+      { evidenceRefs: ['artifact:proof'] },
+      { requestSource: 'agent', actorId: 'worker-1' },
+    );
     const last = captured[captured.length - 1];
     assert.equal(last.scope.type, 'project');
-    assert.equal(last.scope.projectId, 'p1');
+    assert.equal(last.scope.projectId, 'p3');
     assert.ok(last.payload.entities.length > 0);
-    assert.ok(last.payload.entities.every(e => e.projectId === 'p1'), 'scoped payload must only contain p1 entities');
+    assert.ok(last.payload.entities.every(e => e.projectId === 'p3'), 'scoped payload must only contain p3 entities');
+    assert.equal(last.payload.entities.filter(e => e.collection === 'reviewCondition').length, 1);
     hub.closePersistence();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

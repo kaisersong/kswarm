@@ -626,12 +626,26 @@ test('historical failed retry child does not block project delivery after parent
 
   const board = hub.getBoard('proj-deliver-history');
   board.getTask('item-1').status = 'done';
+  board.getTask('item-1').reviewResult = { passed: true, feedback: '' };
   board.getTask('item-1-retry-1').status = 'failed';
   board.getTask('item-1-retry-1').failureReason = 'model_empty_output';
 
   assert.equal(board.isAllDone(), true);
-  const delivered = hub.handleDeliver('proj-deliver-history', { synthesis: true }, 'po');
-  assert.equal(delivered.ok, true);
+  const registered = hub.handleDeliver('proj-deliver-history', { synthesis: true }, 'po', {
+    taskId: 'item-1',
+  });
+  assert.equal(registered.ok, true);
+  assert.equal(registered.status, 'awaiting_user_approval');
+  // handleDeliver 本身不再直接把项目置为 delivered（design §8.2）；
+  // 只有 approveFinalDeliverable（requestSource='user'）才能做到。
+  assert.notEqual(hub.getProject('proj-deliver-history').status, 'delivered');
+  const approval = hub.approveFinalDeliverable(
+    'proj-deliver-history',
+    registered.finalDeliverable.deliverableId,
+    { approvalIdempotencyKey: 'approve-history-1' },
+    { requestSource: 'user', actorId: 'desktop-main' },
+  );
+  assert.equal(approval.ok, true);
   assert.equal(hub.getProject('proj-deliver-history').status, 'delivered');
 });
 
@@ -804,6 +818,47 @@ test('quality review reports effective failure when evidence contract rejects a 
   assert.equal(review.rework, true);
   assert.equal(task.status, 'dispatched');
   assert.match(task.failureReason, /missing required review evidence field: verdict/);
+});
+
+test('quality review imports blocking findings with the authenticated task reviewer identity', () => {
+  const hub = createHub({ silent: true });
+  hub.createProject({ id: 'proj-review-condition-task', name: 'Review Conditions', goal: 'goal', poAgent: 'po', members: ['reviewer'] });
+  assert.equal(hub.handleCreateTasks('proj-review-condition-task', [{
+    id: 'review-task',
+    title: 'Review the deliverable',
+    assignedAgent: 'reviewer',
+    dependencies: [],
+    evidenceContract: {
+      kind: 'review_iteration_v1',
+      requiredArtifacts: ['review-evidence.json'],
+      requiredFields: ['verdict', 'findings'],
+    },
+  }], 'po').ok, true);
+  assert.equal(hub.handleApprove('proj-review-condition-task').ok, true);
+  assert.deepEqual(hub.handleRequestDispatch('proj-review-condition-task', 'po').dispatched, ['proj-review-condition-task__review-task']);
+
+  const task = hub.getBoard('proj-review-condition-task').getTask('review-task');
+  const runId = task.activeRunId;
+  assert.equal(hub.handleAcceptTask('proj-review-condition-task', 'review-task', 'reviewer', runId).ok, true);
+  assert.equal(hub.handleProgress('proj-review-condition-task', 'review-task', 'started', 'reviewer', runId).ok, true);
+  assert.equal(hub.handleSubmitResult('proj-review-condition-task', 'review-task', {
+    summary: 'Completed the independent review with concrete evidence and a blocking finding that requires remediation.',
+    artifacts: [{ filename: 'review-evidence.json', relativePath: 'artifacts/review-evidence.json' }],
+    reviewEvidence: {
+      verdict: 'blocked',
+      findings: [{ id: 'finding-1', blocking: true, owner: { kind: 'user', id: 'forged-user' } }],
+    },
+  }, 'reviewer', runId).ok, true);
+
+  const reviewed = hub.handleQualityReview('proj-review-condition-task', 'review-task', {
+    passed: true,
+    feedback: 'The review artifact satisfies its contract.',
+  }, 'po');
+  assert.equal(reviewed.ok, true);
+  const [condition] = hub.listReviewConditions('proj-review-condition-task');
+  assert.equal(condition.originatingReviewerIdentity, 'reviewer');
+  assert.equal(condition.sourceTaskId, 'proj-review-condition-task__review-task');
+  assert.deepEqual(condition.owner, { kind: 'task', id: 'proj-review-condition-task__review-task' });
 });
 
 test('quality review accepts valid artifact-backed result even when runtime summary is low signal', () => {

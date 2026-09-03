@@ -366,6 +366,7 @@ scenario('5. 完整生命周期 — 智能分配 → 执行 → 超时恢复 →
   hub.handleMarkDone('e2e-full-1', 'full-t2', 'po-agent');
   assert(board.getTask('full-t2').status === 'done', 't2 最终完成');
   assert(board.isAllDone(), '所有任务完成');
+  board.getTask('full-t2').reviewResult = { passed: true, feedback: '' };
 
   // Step 9: PO 交付 + 聚合
   const wsDir = join(TEST_DIR, 'e2e-full-1');
@@ -373,8 +374,19 @@ scenario('5. 完整生命周期 — 智能分配 → 执行 → 超时恢复 →
   writeFileSync(join(wsDir, 'artifacts', 'full-t1-report.md'), '# Login API\n\nImplemented OAuth2 login.');
   writeFileSync(join(wsDir, 'artifacts', 'full-t2-report.md'), '# Test Report\n\n- 15 tests passed\n- 0 failures');
 
-  const deliverResult = hub.handleDeliver('e2e-full-1', { summary: 'All done' }, 'po-agent');
-  assert(deliverResult.ok, '交付成功');
+  const deliverResult = hub.handleDeliver('e2e-full-1', { summary: 'All done' }, 'po-agent', {
+    taskId: 'full-t2',
+  });
+  assert(deliverResult.ok, '交付候选注册成功');
+  assert(deliverResult.status === 'awaiting_user_approval', '等待用户批准（design §8.2）');
+
+  const approveResult = hub.approveFinalDeliverable(
+    'e2e-full-1',
+    deliverResult.finalDeliverable.deliverableId,
+    { approvalIdempotencyKey: 'e2e-full-1-approve' },
+    { requestSource: 'user', actorId: 'desktop-main' },
+  );
+  assert(approveResult.ok, '用户批准成功');
 
   const delivery = aggregateDelivery(wsDir, {
     name: '全流程集成测试',

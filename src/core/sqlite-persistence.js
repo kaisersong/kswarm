@@ -109,7 +109,7 @@ export function createSqlitePersistence(options = {}) {
   let lockHeld = false;
   // in-memory index: collection -> Map(key -> { checksum, projectId, revision })
   const index = new Map();
-  for (const c of ['project', 'board', 'workflowRun', 'workflowProposal', 'finalDeliverable', 'reviewGateDecision', 'humanAction']) {
+  for (const c of ['project', 'board', 'workflowRun', 'workflowProposal', 'finalDeliverable', 'reviewGateDecision', 'reviewCondition', 'humanAction']) {
     index.set(c, new Map());
   }
 

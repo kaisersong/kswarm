@@ -1,6 +1,7 @@
 import { validateDeliverableContract } from './deliverable-contract.js';
 import { inferEvidenceContract } from './evidence-contract.js';
 import { inferTaskRequirements } from './task-requirements.js';
+import { isContractFamily, isExplicitNoContractKind, lookupContractKind } from './contract-kind-registry.js';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, resolve, sep } from 'node:path';
 
@@ -38,7 +39,7 @@ export function isReviewLikeTask(task = {}) {
 export function inferExecutionContract(task = {}) {
   const structurallyReviewLike = isReviewLikeTask(task);
   const staleReviewEvidenceContract = shouldDiscardPersistedReviewEvidenceContract(task, structurallyReviewLike);
-  const persistedReviewLike = task.evidenceContract?.kind === 'review_iteration_v1' && !staleReviewEvidenceContract;
+  const persistedReviewLike = isContractFamily(task.evidenceContract?.kind, 'review_iteration') && !staleReviewEvidenceContract;
   const reviewLike = persistedReviewLike || structurallyReviewLike;
   const requirements = inferTaskRequirements(task);
   const executionContract = {
@@ -48,7 +49,7 @@ export function inferExecutionContract(task = {}) {
     requireArtifactForEmptySummary: task.executionContract?.requireArtifactForEmptySummary !== false,
     ...(task.executionContract || {}),
   };
-  const sourceEvidenceContract = inferEvidenceContract(task);
+  const sourceEvidenceContract = inferEvidenceContract(task, { schemaVersion: task.executionGateSchemaVersion });
   const taskEvidenceContract = staleReviewEvidenceContract ? null : (task.evidenceContract || null);
 
   const evidenceContract = reviewLike
@@ -76,7 +77,7 @@ export function inferExecutionContract(task = {}) {
 
 function shouldDiscardPersistedReviewEvidenceContract(task = {}, structurallyReviewLike = false) {
   if (structurallyReviewLike) return false;
-  if (task.evidenceContract?.kind !== 'review_iteration_v1') return false;
+  if (!isContractFamily(task.evidenceContract?.kind, 'review_iteration')) return false;
 
   const text = [
     task.title,
@@ -116,7 +117,14 @@ export function validateTaskResultAgainstContract(task = {}, result = {}, option
       }
   }
 
-  if (enriched.evidenceContract?.kind === 'review_iteration_v1') {
+  const evidenceKind = enriched.evidenceContract?.kind;
+  const evidenceKindStatus = evidenceKind ? lookupContractKind(evidenceKind) : null;
+  if (evidenceKind && !isExplicitNoContractKind(evidenceKind) && (!evidenceKindStatus || !evidenceKindStatus.supported)) {
+    errors.push('unsupported_evidence_contract');
+    failureClasses.push('quality_evidence_missing');
+  }
+
+  if (evidenceKindStatus?.family === 'review_iteration' && evidenceKindStatus.validator === 'v1') {
     const artifacts = getArtifactNames(result);
     for (const artifactName of enriched.evidenceContract.requiredArtifacts || []) {
       if (!artifacts.some(name => name.endsWith(artifactName) || name === artifactName)) {
@@ -126,13 +134,26 @@ export function validateTaskResultAgainstContract(task = {}, result = {}, option
       }
     }
 
-    const evidence = getReviewEvidence(result, workspacePath);
+    const evidence = extractReviewEvidence(result, workspacePath);
     for (const field of enriched.evidenceContract.requiredFields || []) {
       if (!hasMeaningfulField(evidence, field)) {
         errors.push(`missing required review evidence field: ${field}`);
         missing.push(field);
         failureClasses.push('quality_evidence_missing');
       }
+    }
+  }
+
+  // design §3.2 步骤 1/5：v2 只做浅层结构校验——task result 必须显式声明唯一
+  // gateEvidenceArtifactId，不接受 inline reviewEvidence/evidence/qualityEvidence
+  // 满足 required fields（那正是 v1 fail-open 缺陷）。深层 hash/schema/containment
+  // 校验属于 gate-evidence-acceptor.js:acceptTaskGateEvidence 的职责，这一层不
+  // 重新实现一份深度校验，避免出现第二份不一致的 v2 验证逻辑。
+  if (evidenceKindStatus?.family === 'review_iteration' && evidenceKindStatus.validator === 'v2') {
+    if (!result?.gateEvidenceArtifactId || typeof result.gateEvidenceArtifactId !== 'string') {
+      errors.push('missing required field: gateEvidenceArtifactId');
+      missing.push('gateEvidenceArtifactId');
+      failureClasses.push('quality_evidence_missing');
     }
   }
 
@@ -188,7 +209,7 @@ function getArtifactName(artifact) {
   return artifact.name || artifact.filename || artifact.relativePath || artifact.path || artifact.url || '';
 }
 
-function getReviewEvidence(result = {}, workspacePath = '') {
+export function extractReviewEvidence(result = {}, workspacePath = '') {
   const fileEvidence = readReviewEvidenceArtifact(result, workspacePath);
   const inlineEvidence = firstObject(result.reviewEvidence, result.evidence, result.qualityEvidence);
   return { ...fileEvidence, ...inlineEvidence };

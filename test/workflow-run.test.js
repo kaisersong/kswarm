@@ -118,7 +118,12 @@ test('cancelled workflow cancels unfinished nodes and preserves completed output
   assert.equal(summarizeWorkflowRun(run).completed, 1);
 });
 
-test('gate_completed with conditional-pass completes the run', () => {
+// design §8.2 表格（workflow-run.js:PASSING_GATE_STATUSES / gate reducer 项）：
+// "删除 conditional-pass 的 passing 语义；schema v2 读取时把旧值归一为
+// waiting_for_evidence，不得把 node/run 标 completed 或满足 verified edge"。
+// 此前这个测试断言了相反的行为（conditional-pass 完成 run）——这是一处真实
+// 存在、此前从未被修正的旁路，本次核实发现并修正。
+test('gate_completed with conditional-pass no longer completes the run (design §8.2: conditional-pass passing semantics removed)', () => {
   let run = createWorkflowRun({
     id: 'wf-4',
     projectId: 'proj-1',
@@ -140,11 +145,10 @@ test('gate_completed with conditional-pass completes the run', () => {
     decision: { status: 'conditional-pass', reasons: ['no blockers'] },
   }, { now: 1770000003000 });
 
-  assert.equal(run.status, 'completed');
-  assert.equal(run.gateDecision.status, 'conditional-pass');
-  assert.equal(run.summary.completed, 2);
-  assert.equal(run.summary.primaryMessage, 'Review gate conditional pass');
+  assert.equal(run.status, 'blocked', 'conditional-pass 不再满足 passing，run 应保持 blocked（不是 completed）');
+  assert.equal(run.gateDecision.status, 'conditional-pass', '原始 decision.status 仍原样记录，供审计；只是不再被当作 passing 消费');
 });
+
 
 test('gate_completed with blocked gate blocks the run', () => {
   let run = createWorkflowRun({
@@ -172,7 +176,14 @@ test('gate_completed with blocked gate blocks the run', () => {
   assert.equal(run.gateDecision.status, 'blocked');
 });
 
-test('refreshWorkflowRunState recognizes conditional-pass in gateDecision after all nodes complete', () => {
+// design §8.2：conditional-pass 归一为非 passing，refreshWorkflowRunState 同样
+// 不应把它当作满足 passing gate 的依据。构造一个尚未终态（status='running'，
+// 不在 TERMINAL_RUN_STATUSES 里）、全部 node 已完成、携带 gateDecision 的 run，
+// 这样才能真正触达 refreshSummary 里"gateDecision 决定 status"的判定分支
+// （此前的测试场景 status 在 applyWorkflowEvent 阶段就已经因为"全部节点完成"
+// 独立判定为 completed，从未真正触达 gateDecision 判定分支——是一处测试构造
+// 疏漏，本次核实一并修正）。
+test('refreshWorkflowRunState no longer treats conditional-pass as completing (design §8.2)', () => {
   let run = createWorkflowRun({
     id: 'wf-6',
     projectId: 'proj-1',
@@ -187,12 +198,16 @@ test('refreshWorkflowRunState recognizes conditional-pass in gateDecision after 
 
   run = applyWorkflowEvent(run, { type: 'node_started', nodeId: 'agent-1' }, { now: 1770000001000 });
   run = applyWorkflowEvent(run, { type: 'node_completed', nodeId: 'agent-1' }, { now: 1770000002000 });
+  assert.equal(run.status, 'completed', '全部节点完成后 run 独立判定为 completed（与本测试要验证的 gateDecision 判定分支无关，先确认前提成立）');
 
+  // 强制回退到非终态，模拟"gate 尚未评审前"的中间状态，这样刷新时才会真正
+  // 走到 refreshSummary 里比对 gateDecision 的分支。
   const refreshed = refreshWorkflowRunState({
     ...run,
+    status: 'running',
     gateDecision: { status: 'conditional-pass', reasons: ['no blockers'] },
   });
-  assert.equal(refreshed.status, 'completed');
+  assert.equal(refreshed.status, 'blocked', 'conditional-pass 不再满足 passing，refreshWorkflowRunState 必须把 status 判定为 blocked（不是 completed）');
 });
 
 let passed = 0;

@@ -301,6 +301,56 @@ test('dispatch planning does not reroute worker tasks to project-owner-only PO',
   assert.equal(plan.projectGate, 'waiting_for_capable_agent');
 });
 
+test('verified_pass consumed artifacts are isolated per downstream task', () => {
+  const evaluation = {
+    schemaVersion: 'gate-evaluation-v1',
+    sourceArtifactId: 'eval-source',
+    sourceArtifactSha256: 'eval-hash',
+    sourceRunId: 'run-current',
+    subjectArtifacts: [{ artifactId: 'a1', sha256: 'hash-a1' }],
+    verdict: 'passed',
+    reasonCode: 'all_checks_passed',
+    findingIds: [],
+    conditionIds: [],
+    evaluator: {
+      participantId: 'reviewer-1',
+      role: 'independent_reviewer',
+      independence: 'independent',
+    },
+    createdAt: '2026-09-01T00:00:00.000Z',
+  };
+  const plan = planDispatch({
+    projectId: 'proj-gate',
+    tasks: [
+      { id: 'review', title: 'Review', status: 'done', assignedAgent: 'reviewer', dependencies: [] },
+      { id: 'consumer-a', title: 'Consumer A', status: 'pending', assignedAgent: 'worker-a', dependencies: ['review'] },
+      { id: 'consumer-b', title: 'Consumer B', status: 'pending', assignedAgent: 'worker-b', dependencies: ['review'] },
+    ],
+    dependencyPolicies: { review: 'verified_pass' },
+    gateEvaluationsByTaskId: { review: [evaluation] },
+    consumedArtifactIdsByTaskId: {
+      'consumer-a': { review: ['a1'] },
+      'consumer-b': { review: ['a2'] },
+    },
+    currentGateFactsByTaskId: {
+      review: {
+        sourceRunId: 'run-current',
+        evaluationSourceArtifact: { artifactId: 'eval-source', sha256: 'eval-hash' },
+        canonicalArtifacts: [
+          { taskId: 'review', artifactId: 'a1', sha256: 'hash-a1' },
+          { taskId: 'review', artifactId: 'a2', sha256: 'hash-a2' },
+        ],
+      },
+    },
+    schemaV2: true,
+  });
+
+  assert.deepEqual(plan.dispatchedTasks.map(task => task.id), ['consumer-a']);
+  assert.deepEqual(plan.blocked, [
+    { taskId: 'consumer-b', reason: 'dependency_pending', dependencies: ['review'] },
+  ]);
+});
+
 test('retry with future retryNotBefore is deferred with retry_backoff', () => {
   const now = 1_000_000;
   const plan = planDispatch({

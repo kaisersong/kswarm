@@ -17,6 +17,31 @@ import {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+// design §5.1.1：task.executionGateSchemaVersion=2 时 enrichTaskWithExecutionContract
+// 必须透传给 inferEvidenceContract，产出 external_source_v2（此前完全没有
+// 这条链路，auto-worker.js 永远只会拿到 v1 evidence contract）。
+test('enrichTaskWithExecutionContract 透传 task.executionGateSchemaVersion=2，产出 external_source_v2 evidence contract', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'research-task',
+    title: '收集2026年AI行业最新发布信息',
+    brief: '搜索官方公告、新闻稿，整理带来源链接的清单。',
+    acceptanceCriteria: '每条信息有来源链接。',
+    executionGateSchemaVersion: 2,
+  });
+  assert.equal(task.evidenceContract?.kind, 'external_source_v2');
+  assert.equal(task.evidenceContract?.version, 2);
+});
+
+test('enrichTaskWithExecutionContract 不带 executionGateSchemaVersion 时保持默认 v1（不引入回归）', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'research-task-v1',
+    title: '收集2026年AI行业最新发布信息',
+    brief: '搜索官方公告、新闻稿，整理带来源链接的清单。',
+    acceptanceCriteria: '每条信息有来源链接。',
+  });
+  assert.equal(task.evidenceContract?.kind, 'external_source_v1');
+});
+
 test('review tasks receive a structured evidence contract', () => {
   const task = enrichTaskWithExecutionContract({
     id: 'review-slides',
@@ -30,6 +55,107 @@ test('review tasks receive a structured evidence contract', () => {
   assert.ok(task.evidenceContract.requiredArtifacts.includes('review-evidence.json'));
   assert.ok(task.evidenceContract.requiredFields.includes('verdict'));
   assert.ok(task.evidenceContract.requiredFields.includes('findings'));
+});
+
+// design §5.1.1（FIXED）：persistedReviewLike / shouldDiscardPersistedReviewEvidenceContract
+// 之前硬编码只认 evidenceContract.kind === 'review_iteration_v1'；现在通过
+// contract-kind-registry 的 family 判断，一个已持久化的 review_iteration_v2
+// 契约也必须被识别为 review-like，不能因为版本号不同就被误判为需要重新推断。
+test('a persisted review_iteration_v2 evidence contract is still recognized as review-like', () => {
+  const task = inferExecutionContract({
+    id: 'v2-review-task',
+    title: 'A generic task title with no review keywords',
+    brief: 'A generic brief',
+    evidenceContract: {
+      version: 2,
+      kind: 'review_iteration_v2',
+      requiredArtifacts: ['review-evidence-v2.json'],
+      requiredFields: ['verdict', 'findings', 'subjectArtifacts'],
+    },
+  });
+
+  assert.equal(task.evidenceContract.kind, 'review_iteration_v2', 'the persisted v2 contract must be preserved, not overwritten by v1 inference');
+});
+
+test('review_iteration_v2 rejects a payload satisfying v1 evidence shape as unsupported', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'v2-review-task',
+    title: 'Review generated report',
+    evidenceContract: {
+      version: 2,
+      kind: 'review_iteration_v2',
+      requiredArtifacts: ['review-evidence.json'],
+      requiredFields: ['verdict', 'findings'],
+    },
+  });
+
+  const result = validateTaskResultAgainstContract(task, {
+    summary: 'The review checked narrative structure, evidence quality, audience fit, and implementation details.',
+    artifacts: [{ name: 'review-evidence.json', path: 'review-evidence.json' }],
+    reviewEvidence: {
+      verdict: 'pass',
+      findings: [{ severity: 'minor', message: 'A complete v1-shaped finding.' }],
+    },
+  });
+
+  // design §5.1.1 之后的精确演进：review_iteration_v2 现在是 supported:true
+  // （gate-evidence-acceptor.js 提供了真实 v2 validator），所以拒绝原因从
+  // "整个 kind 不支持"变为"v2 要求的 gateEvidenceArtifactId 缺失"——v1-shaped
+  // inline reviewEvidence 依然不能满足 v2（§3.2 步骤 5 的核心要求），只是
+  // 拒绝理由更精确，不再是笼统的 unsupported。
+  assert.equal(result.ok, false);
+  assert.ok(result.missing.includes('gateEvidenceArtifactId'), JSON.stringify(result));
+  assert.ok(
+    !result.errors.some(e => e.includes('review evidence field')),
+    'v1-shaped inline reviewEvidence 的字段内容不应该被当作满足 v2 required fields 的证据（§3.2 步骤 5：inline evidence 永不满足 v2）',
+  );
+});
+
+// design §3.2 步骤 5：inline evidence 只可作为 v1 旧项目的非 gate 展示信息；
+// v2 validation 只认 task result 显式声明的唯一 gateEvidenceArtifactId，不接受
+// inline reviewEvidence/evidence/qualityEvidence 满足 required fields。
+// 上面这个测试证明了 v1-shaped inline payload 仍被拒绝；这里补一个区分度测试：
+// 正确声明了 gateEvidenceArtifactId 的 v2 payload 必须能通过这一层浅层结构校验
+// （深层 hash/schema 校验是 gate-evidence-acceptor.js:acceptTaskGateEvidence 的
+// 职责，这一层只检查"是否声明了唯一 ID"，不重新实现一份深度校验）。
+test('review_iteration_v2 with an explicit gateEvidenceArtifactId passes the shallow structural check (deep hash/schema validation belongs to acceptTaskGateEvidence)', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'v2-review-task',
+    title: 'Review generated report',
+    evidenceContract: {
+      version: 2,
+      kind: 'review_iteration_v2',
+      requiredArtifacts: ['review-evidence-v2.json'],
+      requiredFields: ['verdict', 'findings', 'subjectArtifacts'],
+    },
+  });
+
+  const result = validateTaskResultAgainstContract(task, {
+    summary: 'The review checked narrative structure, evidence quality, audience fit, and implementation details thoroughly.',
+    gateEvidenceArtifactId: 'gate-ev-1',
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result.errors));
+});
+
+test('review_iteration_v2 without gateEvidenceArtifactId still fails the shallow structural check', () => {
+  const task = enrichTaskWithExecutionContract({
+    id: 'v2-review-task',
+    title: 'Review generated report',
+    evidenceContract: {
+      version: 2,
+      kind: 'review_iteration_v2',
+      requiredArtifacts: ['review-evidence-v2.json'],
+      requiredFields: ['verdict', 'findings', 'subjectArtifacts'],
+    },
+  });
+
+  const result = validateTaskResultAgainstContract(task, {
+    summary: 'The review checked narrative structure, evidence quality, audience fit, and implementation details thoroughly.',
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.missing.includes('gateEvidenceArtifactId'));
 });
 
 test('revision tasks mentioning review feedback are not treated as review tasks', () => {

@@ -139,6 +139,29 @@ scenario('manifest 元数据 — 包含 project meta', () => {
   assert(manifest.deliveredAt === 1700000000000, `deliveredAt: ${manifest.deliveredAt}`);
 });
 
+// design §8.2（handleDeliver taskId 关联修复的根因回归）：worker/desktop
+// runtime 提交的真实 artifact 对象常见 { path, kind, label }，没有 filename
+// 字段。selectUserFacingDeliveryTask 之前只识别 artifact.filename，导致这类
+// 真实产物被 taskHasArtifacts 判定为"没有产物"而永远选不出候选任务——这个
+// 问题此前从未暴露，因为没有代码路径依赖 selectUserFacingDeliveryTask 必须
+// 成功返回结果；现在 /synthesize 路由需要用它关联 handleDeliver 的
+// taskId，才第一次真正暴露了这个兼容性缺口。
+scenario('最终产物选择 — 识别只有 path/label（无 filename）的真实 worker 产物', () => {
+  const finalTask = selectUserFacingDeliveryTask([
+    {
+      id: 'proj-1__item-1',
+      title: '撰写端到端验证报告',
+      status: 'done',
+      completedAt: 1000,
+      result: {
+        artifacts: [{ path: '/tmp/workspace/artifacts/report.md', kind: 'markdown', label: 'report.md' }],
+      },
+    },
+  ]);
+  assert(finalTask, '应该能从只有 path/label 的产物中选出候选任务');
+  assert(finalTask.id === 'proj-1__item-1', `期望 proj-1__item-1，实际 ${finalTask.id}`);
+});
+
 scenario('最终产物选择 — 显式最终 Markdown 优先于依赖更多的中间任务', () => {
   const finalTask = selectUserFacingDeliveryTask([
     {

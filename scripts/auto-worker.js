@@ -26,32 +26,52 @@ import { extractDeclaredArtifacts } from '../src/core/artifact-extractor.js';
 import { selectReviewArtifacts } from '../src/core/artifact-manifest.js';
 import { resolveReferencedArtifactsFromOutput } from '../src/core/artifact-reference-registration.js';
 import { buildArtifactRepairPrompt, classifyGeneratedArtifact, isContentHeavyTask } from '../src/core/artifact-quality.js';
-import { collectSearchEvidence } from '../src/core/search-evidence.js';
+import { collectSearchEvidence, collectSearchEvidenceV2WithSearch } from '../src/core/search-evidence.js';
 import {
   buildEvidencePromptSection,
   shouldCollectSearchEvidence,
 } from '../src/core/auto-worker-evidence.js';
 import { composeNodePrompt } from '../src/core/workflow-node-permissions.js';
 import { requiresExternalSourceEvidence, validateSourceEvidenceArtifact } from '../src/core/source-evidence.js';
+import { buildTaskRunEvidencePath, buildTaskRunEvidenceDir } from '../src/core/artifact-evidence-extension.js';
+import { isContractFamily } from '../src/core/contract-kind-registry.js';
 import {
   buildSemanticOutputArtifacts,
   hasRequiredOutputType,
 } from '../src/core/semantic-html-renderer.js';
 import { buildKimiCliArgs } from '../src/core/kimi-cli-harness.js';
 import { runPiHarness } from '../src/core/pi-cli-harness.js';
+import { resolveArtifactPath } from '../src/server/artifact-path-resolver.js';
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync } from 'node:fs';
-import { join, basename } from 'node:path';
+import { join, basename, dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 
 const BROKER = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const KSWARM_API = process.env.KSWARM_API || 'http://127.0.0.1:4400';
+const KSWARM_DESKTOP_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
 const AGENT_ID = process.env.KSWARM_AGENT_ID || process.argv[2] || `auto-worker-${Date.now()}`;
 const LOGICAL_AGENT_ID = process.env.KSWARM_LOGICAL_AGENT_ID || AGENT_ID;
 const PROJECT_INSTANCE_ID = process.env.KSWARM_PROJECT_ID || '';
 const ALIAS = process.argv[3] || 'AutoWorker';
 const DELAY = Number(process.env.WORK_DELAY || 2000);
 const REFERENCED_ARTIFACT_FAILURE_CLASSES = ['declared_artifact_missing', 'declared_artifact_stale'];
+
+// design §3.5：把新证据文件名计算为相对 artifacts/ 目录的 task/run namespaced 路径
+// （tasks/<safeTaskId>/<runId>/search-evidence.json），而不是根目录扁平文件名。
+// buildTaskRunEvidencePath 返回的是含 'artifacts/' 前缀的 project-relative 路径，
+// 这里剥离该前缀，因为调用方已经把 workFolder/artifacts 当作 base 目录。
+// taskId/runId 缺失或非法（encodePathSegment 拒绝）时退回旧的根目录文件名，
+// 保持向后兼容，不让证据命名前置校验失败中止整个任务执行。
+function safeSearchEvidenceFilename(taskId, runId) {
+  if (!taskId || !runId) return 'search-evidence.json';
+  try {
+    const nested = buildTaskRunEvidencePath(taskId, runId, 'search-evidence.json');
+    return nested.startsWith('artifacts/') ? nested.slice('artifacts/'.length) : nested;
+  } catch {
+    return 'search-evidence.json';
+  }
+}
 
 function writeTaskJournal(workFolder, {
   projectId,
@@ -987,7 +1007,15 @@ async function handleWorkflowNodeHandoff(payload) {
     }
 
     if (artifactRoot && outputArtifact) {
-      const artifactPath = join(artifactRoot, outputArtifact);
+      // design §3.5：workflow node 输出路径同样必须经过共享 resolveArtifactPath
+      // 做 containment 校验，不能直接 join(artifactRoot, outputArtifact) 后写盘——
+      // 否则 outputArtifact 内的 ../ 可逃出 artifactRoot（即使当前来源是相对可信的
+      // workflow node 运行时配置，§3.5 要求迁移全部读写兄弟路径，不是条件性迁移）。
+      const resolvedOutputArtifact = resolveArtifactPath(artifactRoot, outputArtifact, { allowNested: true });
+      if (resolvedOutputArtifact.error) {
+        throw new Error(`invalid_artifact_path:${resolvedOutputArtifact.error}`);
+      }
+      const artifactPath = resolvedOutputArtifact.filePath;
       mkdirSync(join(artifactPath, '..'), { recursive: true });
       writeFileSync(artifactPath, reviewContent, 'utf-8');
       console.log(`[${ALIAS}]   → Wrote workflow artifact: ${artifactPath}`);
@@ -1545,8 +1573,23 @@ Strict JSON (no markdown fences):
         planRevisionNeeded: false,
       };
     } else {
-      console.log(`[${ALIAS}]   ⚠ No LLM/CLI for review — auto-passing`);
-      reviewResult = { passed: true, feedback: 'Auto-approved (no review capability)', planRevisionNeeded: false };
+      // design §14.1 test #29 / §4.1：删除无 review capability 时的
+      // auto-approved 兜底。此前的实现会在没有 LLM/CLI 可用时对所有
+      // non-source-critical 任务无条件伪造 { passed: true }，等价于让
+      // Agent 自证通过，绕过设计文档要求的独立 review。
+      //
+      // 现在的行为：报告 waiting_for_capable_agent（reasonCode:
+      // no_independent_reviewer），不再合成任何 passed 结论。这与
+      // reviewer-independence.js:buildNoIndependentReviewerGate 使用同一
+      // reasonCode，避免新增重叠的 projectGate enum。
+      console.log(`[${ALIAS}]   ⚠ No LLM/CLI for review — cannot auto-approve; requires an independent reviewer`);
+      reviewResult = {
+        passed: false,
+        feedback: '缺少可用的独立审核能力，无法对该任务的执行质量给出结论；需要等待合格的独立评审者可用。',
+        failureClass: 'no_independent_reviewer',
+        gateReasonCode: 'no_independent_reviewer',
+        planRevisionNeeded: false,
+      };
     }
   }
 
@@ -2258,6 +2301,7 @@ async function doTask(taskId, payload) {
   let projectRequirements = payload?.projectRequirements || '';
   let workFolder = payload?.workFolder || '';
   let currentTask = payload?.task || null;
+  let executionGateSchemaVersion = null;
 
   // Also check poProjects for goal/requirements (if we are PO for this project)
   const poInfo = projectId ? poProjects.get(projectId) : null;
@@ -2274,6 +2318,7 @@ async function doTask(taskId, payload) {
       if (!projectRequirements) projectRequirements = proj.requirements || '';
       if (!workFolder) workFolder = projData.workspace?.path || proj.workFolder || '';
       if (!projectName || projectName === 'Unknown Project') projectName = proj.name || projectName;
+      executionGateSchemaVersion = Number(proj.executionGateSchemaVersion) === 2 ? 2 : null;
 
       // Find this task's dependencies and read their completed artifacts
       const allTasks = projData.tasks || [];
@@ -2373,28 +2418,52 @@ async function doTask(taskId, payload) {
     projectName,
     projectGoal: goal,
     projectRequirements: requirements,
+    ...(executionGateSchemaVersion ? { executionGateSchemaVersion } : {}),
   };
   const taskContract = enrichTaskWithExecutionContract(contractTask);
   const contractContext = buildExecutionContractPrompt(taskContract);
   let searchEvidence = null;
   let searchEvidenceArtifact = null;
   if (shouldCollectSearchEvidence(taskContract.evidenceContract)) {
+    // design §5.1（external_source_v2 真实证据采集）：schema v2 项目使用
+    // collectSearchEvidenceV2WithSearch（真实落盘 snapshot + exact bytes
+    // hash），v1/未声明 schema 项目保持原有 collectSearchEvidence（内存摘要
+    // 级）不变，避免破坏现有全部通过的回归测试。
+    const isSchemaV2Evidence = taskContract.evidenceContract?.kind === 'external_source_v2';
     try {
-      searchEvidence = await collectSearchEvidence({
-        task: {
-          id: taskId,
-          title,
-          brief,
-          projectName,
-          projectGoal: goal,
-          projectRequirements: requirements,
-        },
-        contract: taskContract.evidenceContract,
-      });
+      if (isSchemaV2Evidence && workFolder) {
+        const snapshotDir = join(workFolder, buildTaskRunEvidenceDir(taskId, runId || 'no-run'), 'snapshots');
+        mkdirSync(snapshotDir, { recursive: true });
+        searchEvidence = await collectSearchEvidenceV2WithSearch({
+          task: {
+            id: taskId,
+            title,
+            brief,
+            projectName,
+            projectGoal: goal,
+            projectRequirements: requirements,
+          },
+          contract: taskContract.evidenceContract,
+          snapshotDir,
+          runId,
+        });
+      } else {
+        searchEvidence = await collectSearchEvidence({
+          task: {
+            id: taskId,
+            title,
+            brief,
+            projectName,
+            projectGoal: goal,
+            projectRequirements: requirements,
+          },
+          contract: taskContract.evidenceContract,
+        });
+      }
     } catch (err) {
       searchEvidence = {
-        version: 1,
-        kind: 'external_source_v1',
+        version: isSchemaV2Evidence ? 2 : 1,
+        kind: isSchemaV2Evidence ? 'external_source_v2' : 'external_source_v1',
         taskId,
         generatedAt: new Date().toISOString(),
         provider: 'duckduckgo-html',
@@ -2446,7 +2515,12 @@ async function doTask(taskId, payload) {
       return;
     }
     searchEvidenceArtifact = {
-      filename: 'search-evidence.json',
+      // design §3.5：新证据写入 task/run namespaced 路径（artifacts/tasks/<safeTaskId>/<runId>/），
+      // 不再默认写根目录 artifacts/search-evidence.json，避免两个不同 task 的证据
+      // 文件互相覆盖（Phase 0 反例 fixture #2：两个 task 竞争 shared evidence path）。
+      // buildTaskRunEvidencePath 失败（非法 taskId/runId）时退回旧的根目录路径，
+      // 保持向后兼容，不因证据命名前置校验失败而中止整个任务执行。
+      filename: safeSearchEvidenceFilename(taskId, runId),
       content: JSON.stringify(searchEvidence, null, 2),
       previewable: true,
       mimeType: 'application/json',
@@ -2699,7 +2773,10 @@ async function doTask(taskId, payload) {
     ...semanticOutputArtifacts,
   ];
   let reviewEvidence = null;
-  if (taskContract.evidenceContract?.kind === 'review_iteration_v1') {
+  // design §5.1.1（FIXED）：统一走 contract-kind-registry 的 family 判断，
+  // 不再硬编码只认 review_iteration_v1，防止未来的 review_iteration_v2
+  // 在这个生成点被静默漏检。
+  if (isContractFamily(taskContract.evidenceContract?.kind, 'review_iteration')) {
     reviewEvidence = buildReviewEvidenceFromContent(artifactContent, taskContract);
     artifactFiles.push({
       filename: 'review-evidence.json',
@@ -2720,7 +2797,29 @@ async function doTask(taskId, payload) {
   if (workFolder) {
     const artifactsDir = join(workFolder, 'artifacts');
     mkdirSync(artifactsDir, { recursive: true });
-    for (const file of artifactFiles) writeFileSync(join(artifactsDir, file.filename), file.content, 'utf-8');
+    for (const file of artifactFiles) {
+      const resolvedArtifact = resolveArtifactPath(
+        artifactsDir,
+        file.filename,
+        { allowNested: true }
+      );
+      if (resolvedArtifact.error) {
+        throw new Error(`invalid_artifact_path:${resolvedArtifact.error}`);
+      }
+      // design §3.5：file.filename 现在可能是 task/run namespaced 相对路径
+      // （例如 tasks/task-1/run-1/search-evidence.json），必须先创建父目录，
+      // 否则嵌套写入会因为父目录不存在而抛错。
+      mkdirSync(dirname(resolvedArtifact.filePath), { recursive: true });
+      const verifiedArtifact = resolveArtifactPath(
+        artifactsDir,
+        file.filename,
+        { allowNested: true }
+      );
+      if (verifiedArtifact.error) {
+        throw new Error(`invalid_artifact_path:${verifiedArtifact.error}`);
+      }
+      writeFileSync(verifiedArtifact.filePath, file.content, 'utf-8');
+    }
     noteArtifact();
     const writtenManifest = artifactFiles.length > 0
       ? buildArtifactManifest(workFolder, artifactFiles.map(file => file.filename), {
@@ -2755,6 +2854,13 @@ async function doTask(taskId, payload) {
       artifactManifest,
     });
     submittedArtifacts = artifactManifest.map(artifact => ({
+      // design §3.5：registerSubmittedArtifactsAsCanonical（hub.js）依赖
+      // result.artifacts[].artifactId 才能把这次提交的 artifact 注册进
+      // project.canonicalArtifacts；此前这里遗漏了 artifactId 字段，导致
+      // 真实生产提交的 artifacts 永远无法被 canonical registry 处理——即使
+      // hub 侧的注册逻辑本身完全正确，也会因为读不到 artifactId 被静默
+      // 跳过（hub.js 的 "!artifactId || !rawPath" 提前 continue）。
+      artifactId: artifact.artifactId,
       filename: artifact.filename,
       url: artifact.url || `/projects/${projectId}/artifacts/${encodeURIComponent(artifact.filename)}`,
       previewable: filePreviewable(artifact.filename),
@@ -2776,7 +2882,10 @@ async function doTask(taskId, payload) {
       try {
         const uploadRes = await fetch(`${KSWARM_API}/artifacts`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: {
+            'content-type': 'application/json',
+            'x-kswarm-mutation-token': KSWARM_DESKTOP_MUTATION_TOKEN,
+          },
           body: JSON.stringify({ filename: file.filename, content: file.content, projectId }),
         });
         const uploadData = await uploadRes.json();
@@ -2811,6 +2920,15 @@ async function doTask(taskId, payload) {
     artifacts: submittedArtifacts,
     artifactManifest,
     delivery: { semantic: 'document', source: ALIAS },
+    // design §3.5/§10.1：external_source_v2 落盘抓取产出的
+    // ArtifactEvidenceExtensionV1 记录（fetch 元数据 + claim 关联），随任务
+    // 提交一并传给 hub，供 registerSubmittedArtifactsAsCanonical 落地持久化
+    // 到 project.artifactEvidenceExtensions。此前这些记录只存在于磁盘
+    // search-evidence-v2.json 文件内容里，从未作为结构化字段提交，
+    // hub 侧完全没有机会持久化它们。
+    ...(Array.isArray(searchEvidence?.evidenceExtensions) && searchEvidence.evidenceExtensions.length > 0
+      ? { evidenceExtensions: searchEvidence.evidenceExtensions }
+      : {}),
     ...(workFolder ? { workspacePath: workFolder, workFolder } : {}),
     ...(reviewEvidence ? { reviewEvidence } : {}),
   };

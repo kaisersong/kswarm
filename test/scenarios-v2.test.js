@@ -172,6 +172,7 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
   hub.handleProgress('proj-001', 't5', 'started', 'xiaok-default', t5Run);
   hub.handleSubmitResult('proj-001', 't5', { success: true, summary: '最终方案文档整合完成' }, 'xiaok-default', t5Run);
   hub.handleMarkDone('proj-001', 't5', 'xiaok-default');
+  board.getTask('t5').reviewResult = { passed: true, feedback: '' };
 
   // ── Step 9: PO 确认全部完成，提交交付
   console.log('    [PO @xiaok] 所有任务完成，提交交付...');
@@ -180,8 +181,19 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
   const deliverResult = hub.handleDeliver('proj-001', {
     summary: '实时协作白板技术方案已完成',
     artifacts: ['tech-research.md', 'requirements.md', 'architecture.md', 'api-spec.md', 'final-proposal.md'],
-  }, 'xiaok-default');
-  assert(deliverResult.ok, 'PO 提交交付成功');
+  }, 'xiaok-default', { taskId: 't5' });
+  assert(deliverResult.ok, 'PO 提交交付候选成功');
+  assert(deliverResult.status === 'awaiting_user_approval', 'PO 提交后等待用户批准（design §8.2：handleDeliver 不再直接 delivered）');
+  assert(hub.getProject('proj-001').status !== 'delivered', '未经用户批准，项目状态不应为 delivered');
+
+  // ── Step 9b: 用户显式批准该 FinalDeliverable candidate 后才真正交付
+  const approveResult = hub.approveFinalDeliverable(
+    'proj-001',
+    deliverResult.finalDeliverable.deliverableId,
+    { approvalIdempotencyKey: 'scenario-1-approve' },
+    { requestSource: 'user', actorId: 'desktop-main' },
+  );
+  assert(approveResult.ok, '用户批准 FinalDeliverable 成功');
   assert(hub.getProject('proj-001').status === 'delivered', '项目状态 = delivered');
 
   // ── 验证：Hub 全程没做任何业务判断
@@ -190,7 +202,7 @@ scenario('1. 完整流程 — PO 主导，Hub 只路由', () => {
   assert(events.some(e => e.type === 'po.assigned'), 'Hub 只做了: 指派 PO');
   assert(events.some(e => e.type === 'tasks.created'), 'Hub 只做了: 收录 PO 提交的任务');
   assert(events.some(e => e.type === 'task.dispatched'), 'Hub 只做了: 按 PO 指定路由派发');
-  assert(events.some(e => e.type === 'project.delivered'), 'Hub 只做了: 记录交付');
+  assert(events.some(e => e.type === 'project.delivered'), 'Hub 只做了: 记录交付（用户批准后）');
   // Hub 没做: 分解目标、选择 agent、判断质量
 });
 

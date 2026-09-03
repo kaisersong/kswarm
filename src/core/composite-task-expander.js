@@ -1,4 +1,5 @@
 import { enrichTaskWithExecutionContract } from './execution-contract.js';
+import { isReviewerExcludedAtPlanningTime } from './reviewer-independence.js';
 
 export function expandCompositeTasks(taskList = [], context = {}) {
   const expanded = [];
@@ -85,5 +86,14 @@ function chooseReviewer(task = {}, context = {}) {
   const members = (context.members || [])
     .map(member => typeof member === 'string' ? member : member?.id)
     .filter(Boolean);
-  return members.find(member => member !== task.assignedAgent && member !== context.poAgent) || null;
+  // design §4.2："计划阶段只做 author/PO 排除和 capability 过滤"——委托
+  // reviewer-independence.js:isReviewerExcludedAtPlanningTime 的唯一实现，
+  // 不在本模块维护第二份 author/PO 排除逻辑（此前的实现用手写
+  // member !== task.assignedAgent && member !== context.poAgent 达成同样效果，
+  // 是一处需要收敛的兄弟路径重复）。
+  return members.find(member => !isReviewerExcludedAtPlanningTime({
+    reviewerId: member,
+    authorId: task.assignedAgent,
+    poId: context.poAgent,
+  }).excluded) || null;
 }

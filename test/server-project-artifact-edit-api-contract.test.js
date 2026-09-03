@@ -15,6 +15,7 @@ let total = 0;
 let passed = 0;
 let failed = 0;
 const failures = [];
+const mutationToken = 'test-desktop-mutation-token';
 
 function assert(cond, msg) {
   total++;
@@ -67,7 +68,10 @@ async function stopServer(child) {
 async function postJson(baseUrl, path, body) {
   const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'x-kswarm-mutation-token': mutationToken,
+    },
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => null);
@@ -98,6 +102,7 @@ const child = spawn(process.execPath, ['src/server/index.js'], {
     HOME: tempHome,
     KSWARM_PORT: String(port),
     BROKER_URL: 'http://127.0.0.1:9',
+    KSWARM_DESKTOP_MUTATION_TOKEN: mutationToken,
   },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -108,7 +113,17 @@ child.stderr.on('data', chunk => logs.push(String(chunk)));
 try {
   await waitForServer(baseUrl, child);
 
-  const projectId = 'proj-artifact-edit-api';
+  const created = await postJson(baseUrl, '/projects', {
+    name: 'Artifact Edit API Project',
+    goal: 'test artifact editing',
+    poAgent: 'xiaok-po',
+    members: ['xiaok-worker'],
+    autoStartPlanning: false,
+  });
+  assert(created.res.status === 201, `project creation returns 201 (got ${created.res.status})`);
+  assert(created.data?.project?.id, 'project creation returns an id');
+  const projectId = created.data.project.id;
+
   const upload = await postJson(baseUrl, '/artifacts', {
     projectId,
     filename: 'task-report.html',

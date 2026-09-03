@@ -1,5 +1,6 @@
 import { hasSpeculativeSourceLanguage } from './evidence-contract.js';
-import { validateSearchEvidence } from './search-evidence.js';
+import { validateSearchEvidence, validateSearchEvidenceV2 } from './search-evidence.js';
+import { lookupContractKind, isExplicitNoContractKind } from './contract-kind-registry.js';
 
 const SOURCE_TASK_PATTERN = /搜索|检索|收集|调研|资料|来源|出处|URL|链接|官网|新闻稿|公告|发布会|财报|电话会|研报|行业分析|公开资料|今年|本月|本周|最新|最近|search|source|citation|url|official|news|filing|earnings|latest|recent|current/i;
 const SOURCE_LINE_PATTERN = /来源|出处|URL|链接|官网|新闻|公告|发布会|财报|电话会|研报|报告|source|citation|url|official|news|filing|earnings/i;
@@ -23,18 +24,56 @@ export function validateSourceEvidenceArtifact({
 } = {}) {
   const task = { title, brief, acceptanceCriteria, projectGoal, projectRequirements };
   const contract = evidenceContract;
-  if (contract?.required && contract.kind === 'external_source_v1') {
-    if (contract.disallowSpeculativeLanguage !== false && hasSpeculativeSourceLanguage(content)) {
-      return failure('speculative_source_claim', { currentYear: new Date(now).getUTCFullYear() });
-    }
-    const bundle = validateSearchEvidence(searchEvidence || {}, contract);
-    if (!bundle.ok) {
-      return failure(bundle.reasons?.[0] || 'source_evidence_missing', {
-        reasons: bundle.reasons || [],
-      });
-    }
+  const contractKindEntry = contract?.kind ? lookupContractKind(contract.kind) : null;
+
+  // design §5.1.1：contract kind registry 分派。有 kind 但不在 registry
+  // 一律 unsupported_evidence_contract，不得 success（关闭原来的
+  // `contract.kind !== 'external_source_v1' -> success()` fail-open 分支）。
+  if (contract?.kind && !isExplicitNoContractKind(contract.kind) && !contractKindEntry) {
+    return failure('unsupported_evidence_contract', { kind: contract.kind });
   }
-  if (contract?.kind && contract.kind !== 'external_source_v1') return success();
+  if (contractKindEntry && !contractKindEntry.supported) {
+    return failure('unsupported_evidence_contract', { kind: contract.kind });
+  }
+
+  if (contractKindEntry?.family === 'external_source' && contractKindEntry.validator === 'v1') {
+    if (contract?.required) {
+      if (contract.disallowSpeculativeLanguage !== false && hasSpeculativeSourceLanguage(content)) {
+        return failure('speculative_source_claim', { currentYear: new Date(now).getUTCFullYear() });
+      }
+      const bundle = validateSearchEvidence(searchEvidence || {}, contract);
+      if (!bundle.ok) {
+        return failure(bundle.reasons?.[0] || 'source_evidence_missing', {
+          reasons: bundle.reasons || [],
+        });
+      }
+    }
+    return success();
+  }
+
+  // design §5.1/§5.1.1：external_source_v2 只认 fetchPageEvidenceV2 产出的真实
+  // 落盘证据 + 显式 claim→source 映射，不接受 v1 的摘要级 inline evidence。
+  // v2 validation 不做 disallowSpeculativeLanguage 关键词检查（那是 v1 的
+  // 保守启发式加分项，v2 用真实 fetched page + claim source ref 结构化校验
+  // 取代它，避免同一份内容被两条不同严格度的规则重复判定）。
+  if (contractKindEntry?.family === 'external_source' && contractKindEntry.validator === 'v2') {
+    if (contract?.required) {
+      const bundle = validateSearchEvidenceV2(searchEvidence || {}, contract);
+      if (!bundle.ok) {
+        return failure(bundle.reasons?.[0] || 'source_evidence_missing', {
+          reasons: bundle.reasons || [],
+          verdict: bundle.verdict,
+        });
+      }
+    }
+    return success();
+  }
+
+  // review_iteration_* 或其它非 external_source family 的显式 contract：
+  // 本函数只负责外部来源校验，不消费其它家族的证据契约，交由对应家族的
+  // validator（execution-contract.js）处理，这里维持原有的放行语义。
+  if (contractKindEntry) return success();
+  if (isExplicitNoContractKind(contract?.kind)) return success();
 
   if (!requiresExternalSourceEvidence(task)) return success();
 

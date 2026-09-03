@@ -11,6 +11,7 @@
  */
 
 import http from 'node:http';
+import { createHash, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
 import { createAgentStore } from '../core/agent-store.js';
@@ -18,8 +19,8 @@ import { getCapabilityCatalog } from '../core/capability-catalog.js';
 import { createTeamOperationStore } from '../core/team-operation-store.js';
 import { createMutationAuthority, createTeamProvisioningHub } from '../core/persistence-hub.js';
 import { createBrokerClient } from '../net/broker-client.js';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync } from 'node:fs';
-import { basename, join, extname, resolve, relative, isAbsolute } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { basename, dirname, join, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
@@ -69,6 +70,7 @@ import {
 } from './auto-worker-process.js';
 import { buildAgentChildEnv } from './agent-child-env.js';
 import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
+import { resolveArtifactPath } from './artifact-path-resolver.js';
 import { canSpawnAutoWorkerForTask } from '../core/runtime-execution-boundary.js';
 import { createBrokerTaskRequest } from './broker-task-request.js';
 import { normalizeProjectAgentSelection, reconcileProjectAgentSelectionWithEffectiveAgents } from '../core/agent-selection.js';
@@ -1605,36 +1607,11 @@ function getPreviewable(ext) {
 
 const TEXT_EDITABLE_ARTIFACT_EXTENSIONS = new Set(['.html', '.htm', '.md', '.markdown', '.json', '.txt', '.svg']);
 
+// design §3.5：resolveProjectArtifactFile 委托共享的 resolveArtifactPath
+// （src/server/artifact-path-resolver.js），不再维护独立的 sanitizer 实现；
+// project artifact 路由允许嵌套（用于 task/run namespaced 证据目录）。
 function resolveProjectArtifactFile(artifactsDir, rawPath) {
-  let decoded;
-  try {
-    decoded = decodeURIComponent(rawPath || '');
-  } catch {
-    return { error: 'invalid_artifact_path' };
-  }
-
-  const normalized = decoded.replace(/\\/g, '/');
-  const segments = normalized.split('/');
-  if (
-    !normalized ||
-    normalized.startsWith('/') ||
-    segments.some(segment => !segment || segment === '.' || segment === '..')
-  ) {
-    return { error: 'invalid_artifact_path' };
-  }
-
-  const baseDir = resolve(artifactsDir);
-  const filePath = resolve(baseDir, normalized);
-  const rel = relative(baseDir, filePath);
-  if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
-    return { error: 'invalid_artifact_path' };
-  }
-
-  return {
-    filePath,
-    artifactPath: normalized,
-    filename: basename(normalized),
-  };
+  return resolveArtifactPath(artifactsDir, rawPath, { allowNested: true });
 }
 
 function encodeArtifactRoutePath(artifactPath) {
@@ -2066,6 +2043,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowProposalMatch && req.method === 'POST') {
       const projectId = scriptWorkflowProposalMatch[1];
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.createScriptWorkflowProposal(projectId, body?.preview || body, {
         requestedBy: body?.requestedBy || 'human',
         scriptSource: body?.scriptSource ?? null,
@@ -2077,6 +2056,8 @@ async function handleRequest(req, res) {
     if (workflowProposalMatch && req.method === 'POST') {
       const [, projectId, workflowId] = workflowProposalMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.createWorkflowProposal(projectId, workflowId, {
         requestedBy: body?.requestedBy || 'human',
         policy: body?.policy || null,
@@ -2089,6 +2070,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowRunStartMatch && req.method === 'POST') {
       const projectId = scriptWorkflowRunStartMatch[1];
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.startScriptWorkflowRunFromProposal(body?.proposalId, {
         approvedBy: body?.approvedBy || body?.requestedBy || 'human',
         projectId,
@@ -2105,6 +2088,8 @@ async function handleRequest(req, res) {
     if (workflowRunStartMatch && req.method === 'POST') {
       const [, projectId, workflowId] = workflowRunStartMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.startWorkflowRunFromProposal(body?.proposalId, {
         approvedBy: body?.approvedBy || body?.requestedBy || 'human',
         projectId,
@@ -2125,6 +2110,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowParallelGroupMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowParallelGroupMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
@@ -2149,6 +2136,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowNodeMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowNodeMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
@@ -2158,7 +2147,7 @@ async function handleRequest(req, res) {
         prompt: body?.prompt,
         assignedAgent: body?.assignedAgent || null,
         options: body?.options || null,
-        permissions: body?.permissions || null,
+        permissions: body && Object.hasOwn(body, 'permissions') ? body.permissions : null,
         parallelGroupId: body?.parallelGroupId || null,
         fanoutItemKey: body?.fanoutItemKey || null,
         fanoutItemLabel: body?.fanoutItemLabel || null,
@@ -2180,6 +2169,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowNodeResultMatch && req.method === 'POST') {
       const [, projectId, workflowRunId, nodeId] = scriptWorkflowNodeResultMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
@@ -2205,6 +2196,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowNodeRetryMatch && req.method === 'POST') {
       const [, projectId, workflowRunId, nodeId] = scriptWorkflowNodeRetryMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
@@ -2226,6 +2219,8 @@ async function handleRequest(req, res) {
     if (scriptWorkflowCompleteMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowCompleteMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
       if (existingRun.projectId !== projectId) return json(res, { ok: false, error: 'workflow_run_project_mismatch' }, 400);
@@ -2244,6 +2239,8 @@ async function handleRequest(req, res) {
     if (workflowRunProgressMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = workflowRunProgressMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const batch = body?.batch || body;
       const existingRun = hub.getWorkflowRun(workflowRunId);
       if (!existingRun) return json(res, { ok: false, error: 'workflow_run_not_found' }, 404);
@@ -2260,6 +2257,8 @@ async function handleRequest(req, res) {
     if (workflowRunCancelMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = workflowRunCancelMatch;
       const body = await parseBody(req);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.cancelWorkflowRun(workflowRunId, {
         reason: body?.reason || 'human_cancelled',
       });
@@ -2862,7 +2861,34 @@ async function handleRequest(req, res) {
       writeFileSync(join(ws.artifacts, 'synthesis.md'), synthesis);
 
       // Deliver the project
-      const result = hub.handleDeliver(projectId, { synthesis: true }, fromAgent);
+      // design §8.2：把 handleDeliver 生成的 candidate 关联到真实产出最终
+      // 交付物的 task（selectUserFacingDeliveryTask 已在上面计算过一次用于
+      // 摘要注入，这里复用同一个选择逻辑），否则新增的
+      // evaluatePreApprovalPrerequisites 安全检查会因为 candidate 缺少
+      // taskId/workflowRunId 关联而以 final_deliverable_review_required 拒绝批准。
+      const finalTaskForDeliverable = selectUserFacingDeliveryTask(tasksBeforeDelivery);
+      const result = hub.handleDeliver(projectId, { synthesis: true }, fromAgent, {
+        ...(finalTaskForDeliverable?.id ? { taskId: finalTaskForDeliverable.id } : {}),
+      });
+      // design §8.2（handleDeliver 项 / cli/verify.js + server route caller）：
+      // handleDeliver 现在只注册一个 FinalDeliverable candidate 并返回
+      // awaiting_user_approval，不再代表"已交付"。下面这整套交付包聚合、写
+      // project.deliverable、'project_synthesized' 广播的后处理逻辑，历史上假设
+      // handleDeliver 成功 == 项目已交付；这个假设现在只在 alreadyDelivered
+      // 幂等分支下成立（项目此前已经过用户批准并真正 delivered）。新的 candidate
+      // 路径必须直接返回 candidate 信息，不做交付包聚合，不写 project.deliverable，
+      // 避免用户尚未批准就让 API/UI 消费方读到"已交付"的内容。
+      if (result.ok && result.status === 'awaiting_user_approval' && !result.alreadyDelivered) {
+        log('info', `PO synthesized project, awaiting user approval: ${projectId}`, {
+          deliverableId: result.finalDeliverable?.deliverableId || null,
+        });
+        broadcast({
+          type: 'project_delivery_candidate_registered',
+          projectId,
+          deliverableId: result.finalDeliverable?.deliverableId || null,
+        });
+        return json(res, result);
+      }
       if (result.ok) {
         log('info', `PO synthesized and delivered project: ${projectId}`);
         broadcast({ type: 'project_synthesized', projectId });
@@ -2971,8 +2997,17 @@ async function handleRequest(req, res) {
     }
 
     // ── Human adds tasks (any time, no PO restriction) ──
+    // design §7.2：这是 Room→Project 追加任务的真实用户任务入口
+    // （POST /projects/:id/tasks/human，签名 {tasks:[...]}，不是
+    // /projects/:id/tasks 那条要求 {tasks, fromAgent} 的 agent/planner 路由）。
+    // requestContext 不能取自 body：必须复用 resolveDesktopMutationContext(req)，
+    // 由 mutation token 映射出可信 {requestSource:'user', actorId:'desktop-main', ...}；
+    // 缺 token、agent token、body 伪造 requestSource:'user' 均拒绝。
     const humanTasksMatch = path.match(/^\/projects\/([^/]+)\/tasks\/human$/);
     if (humanTasksMatch && req.method === 'POST') {
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { error: context.error }, context.status || 401);
+
       const body = await parseBody(req);
       const { tasks: taskList } = body;
       if (!taskList) return json(res, { error: 'tasks required' }, 400);
@@ -2980,7 +3015,7 @@ async function handleRequest(req, res) {
       for (const t of taskList) {
         if (!t.id) t.id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       }
-      const result = hub.handleHumanAddTasks(humanTasksMatch[1], taskList);
+      const result = hub.handleHumanAddTasks(humanTasksMatch[1], taskList, context.requestContext);
       if (result.ok) {
         log('info', `Human added ${taskList.length} tasks to project ${humanTasksMatch[1]}`);
         broadcast({ type: 'tasks_created', projectId: humanTasksMatch[1], tasks: taskList, addedBy: 'human' });
@@ -3085,7 +3120,7 @@ async function handleRequest(req, res) {
       if (result.ok) {
         broadcast({ type: 'project_final_deliverable_candidate', projectId, finalDeliverable: result.finalDeliverable });
       }
-      return json(res, result, result.ok ? 200 : 400);
+      return json(res, result, result.ok ? 200 : result.error === 'idempotency_conflict' ? 409 : 400);
     }
 
     const finalDeliverableApproveMatch = path.match(/^\/projects\/([^/]+)\/final-deliverables\/([^/]+)\/approve$/);
@@ -3115,6 +3150,7 @@ async function handleRequest(req, res) {
       // project status is never flipped to a false 'delivered' state.
       let builtDelivery = null;
       const result = hub.handleDeliver(projectId, body.deliverable || {}, body.fromAgent, {
+        submissionIdempotencyKey: body?.submissionIdempotencyKey,
         validateDelivery: () => {
           try {
             builtDelivery = aggregateDelivery(ws.path, {
@@ -3145,7 +3181,7 @@ async function handleRequest(req, res) {
           };
         }
       }
-      return json(res, result);
+      return json(res, result, result.ok ? 200 : result.error === 'idempotency_conflict' ? 409 : 400);
     }
 
     // ── Close project (Human only!) ──
@@ -3163,41 +3199,80 @@ async function handleRequest(req, res) {
     // ── Artifacts: upload (per-project) ──
     if (path === '/artifacts' && req.method === 'POST') {
       const body = await parseBody(req);
-      const { filename, content, encoding, projectId } = body;
-      if (!filename || !content) return json(res, { error: 'filename and content required' }, 400);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
 
-      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-      
-      // Store in project workspace if projectId provided, else in global
-      let filePath;
-      let artifactUrl;
-      if (projectId) {
-        const ws = getProjectWorkspace(projectId);
-        filePath = join(ws.artifacts, safeName);
-        artifactUrl = `/projects/${projectId}/artifacts/${safeName}`;
-      } else {
-        const globalDir = join(KSWARM_HOME, 'artifacts');
-        mkdirSync(globalDir, { recursive: true });
-        filePath = join(globalDir, safeName);
-        artifactUrl = `/artifacts/${safeName}`;
+      const { filename, content, encoding, projectId, expectedSha256 } = body;
+      if (typeof projectId !== 'string' || !projectId.trim()) {
+        return json(res, { ok: false, error: 'project_id_required' }, 400);
       }
-      
-      const buf = encoding === 'base64' ? Buffer.from(content, 'base64') : content;
-      writeFileSync(filePath, buf);
+      if (!hub.getProject(projectId)) {
+        return json(res, { ok: false, error: 'project_not_found' }, 404);
+      }
+      if (typeof filename !== 'string' || !filename || typeof content !== 'string') {
+        return json(res, { ok: false, error: 'filename_and_content_required' }, 400);
+      }
+      if (encoding !== undefined && encoding !== 'utf8' && encoding !== 'base64') {
+        return json(res, { ok: false, error: 'invalid_artifact_encoding' }, 400);
+      }
+      if (expectedSha256 !== undefined && (
+        typeof expectedSha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(expectedSha256)
+      )) {
+        return json(res, { ok: false, error: 'invalid_expected_sha256' }, 400);
+      }
+
+      const ws = getProjectWorkspace(projectId);
+      const resolvedArtifact = resolveArtifactPath(ws.artifacts, filename, { allowNested: true });
+      if (resolvedArtifact.error) {
+        return json(res, { ok: false, error: resolvedArtifact.error }, 400);
+      }
+
+      const { filePath, artifactPath, filename: safeName } = resolvedArtifact;
+      const existed = existsSync(filePath);
+      let actualSha256 = null;
+      if (existed) {
+        actualSha256 = createHash('sha256').update(readFileSync(filePath)).digest('hex');
+        if (expectedSha256 === undefined) {
+          return json(res, { ok: false, error: 'artifact_already_exists', actualSha256 }, 409);
+        }
+        if (actualSha256 !== expectedSha256.toLowerCase()) {
+          return json(res, { ok: false, error: 'artifact_sha256_mismatch', actualSha256 }, 409);
+        }
+      } else if (expectedSha256 !== undefined) {
+        return json(res, { ok: false, error: 'artifact_sha256_mismatch', actualSha256 }, 409);
+      }
+
+      const bytes = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf8');
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      mkdirSync(dirname(filePath), { recursive: true });
+
+      const resolvedAfterMkdir = resolveArtifactPath(ws.artifacts, artifactPath, { allowNested: true });
+      if (resolvedAfterMkdir.error || resolvedAfterMkdir.filePath !== filePath) {
+        return json(res, { ok: false, error: resolvedAfterMkdir.error || 'artifact_path_escape' }, 400);
+      }
+
+      const temporaryPath = join(dirname(filePath), `.${safeName}.${randomUUID()}.tmp`);
+      try {
+        writeFileSync(temporaryPath, bytes, { flag: 'wx' });
+        renameSync(temporaryPath, filePath);
+      } finally {
+        if (existsSync(temporaryPath)) rmSync(temporaryPath, { force: true });
+      }
 
       const ext = extname(safeName);
-      log('info', `Artifact saved: ${safeName}`, { projectId: projectId || 'global', path: filePath });
-      const artifact = createArtifactRecord({
-        filename: safeName,
-        url: artifactUrl,
-        path: filePath,
-        previewable: getPreviewable(ext),
-        mimeType: MIME_TYPES[ext] || 'application/octet-stream',
-      });
-      return json(res, {
-        ok: true,
-        artifact,
-      }, 201);
+      log('info', `Artifact saved: ${artifactPath}`, { projectId, path: filePath, sha256 });
+      const artifact = {
+        ...createArtifactRecord({
+          filename: safeName,
+          url: `/projects/${encodeURIComponent(projectId)}/artifacts/${encodeArtifactRoutePath(artifactPath)}`,
+          path: filePath,
+          previewable: getPreviewable(ext),
+          mimeType: MIME_TYPES[ext] || 'application/octet-stream',
+          size: bytes.length,
+        }),
+        sha256,
+      };
+      return json(res, { ok: true, artifact }, existed ? 200 : 201);
     }
 
     // ── Artifacts: list for project ──
@@ -3205,6 +3280,16 @@ async function handleRequest(req, res) {
     if (projArtifactsListMatch && req.method === 'GET') {
       const artifacts = listProjectArtifacts(projArtifactsListMatch[1]);
       return json(res, { artifacts });
+    }
+
+    // design §9.1/§9.3：getProjectGateSnapshot 只读端点，供 Desktop preload
+    // 消费。返回值已经是 hub.js 层面构造好的 allowlist DTO，这里不额外
+    // 透传任何 hub 原始对象。
+    const projectGateSnapshotMatch = path.match(/^\/projects\/([^/]+)\/gate-snapshot$/);
+    if (projectGateSnapshotMatch && req.method === 'GET') {
+      const result = hub.getProjectGateSnapshot(projectGateSnapshotMatch[1]);
+      if (!result.ok) return json(res, result, result.error === 'project_not_found' ? 404 : 400);
+      return json(res, result);
     }
 
     // ── Artifacts: serve file (per-project) ──
@@ -3262,11 +3347,28 @@ async function handleRequest(req, res) {
     }
 
     // ── Artifacts: serve global file (legacy) ──
+    // design §3.5：legacy global GET 之前是未消毒的 traversal/read 旁路
+    // （原始正则捕获组直接 join，无 sanitizer/containment/read-auth，且带
+    // Access-Control-Allow-Origin:*，等价于匿名跨源任意文件读取面）。
+    // 现在委托共享的 resolveArtifactPath（allowNested=false，只能读顶层文件，
+    // 不是通用文件系统访问面），且只接受受信任的 Desktop mutation token，移除
+    // 通配 CORS 头。
+    //
+    // 注意：不能复用 resolveDesktopMutationContext/mutationAuthority.authorize
+    // 做这层鉴权——mutationAuthority 的 mutationPath() 判断把普通 GET 请求
+    // 天然归类为"非 mutation path"而直接放行，是为写操作设计的鉴权层，用在这里
+    // 保护一个读路由不会生效。这里显式独立校验 x-kswarm-mutation-token。
     const artifactMatch = path.match(/^\/artifacts\/(.+)$/);
     if (artifactMatch && req.method === 'GET') {
+      const providedToken = req.headers['x-kswarm-mutation-token'] || req.headers['X-KSwarm-Mutation-Token'];
+      if (!DESKTOP_MUTATION_TOKEN || providedToken !== DESKTOP_MUTATION_TOKEN) {
+        return json(res, { error: 'mutation_credential_required' }, 401);
+      }
+
       const globalDir = join(KSWARM_HOME, 'artifacts');
-      const filename = artifactMatch[1];
-      const filePath = join(globalDir, filename);
+      const resolved = resolveArtifactPath(globalDir, artifactMatch[1], { allowNested: false });
+      if (resolved.error) return json(res, { error: resolved.error }, 400);
+      const { filePath, filename } = resolved;
       if (!existsSync(filePath)) return json(res, { error: 'not_found' }, 404);
 
       const ext = extname(filename);
@@ -3276,7 +3378,6 @@ async function handleRequest(req, res) {
       res.writeHead(200, {
         'Content-Type': mime,
         'Content-Disposition': getPreviewable(ext) ? 'inline' : `attachment; filename="${filename}"`,
-        'Access-Control-Allow-Origin': '*',
       });
       return res.end(content);
     }

@@ -178,6 +178,35 @@ needs_changes
   assert.equal(result.ok, true);
 });
 
+// design §5.1：external_source_v2 现在有真实 validator（validateSearchEvidenceV2），
+// v1-shaped searchEvidence（无 fetchedAt/contentHash/snapshotRef/claims 结构）
+// 不能满足 v2 要求——拒绝原因从此前"整个 kind 不支持"演进为精确的
+// "source_evidence_incomplete"（v2 fetched page 缺失必需字段），核心验证意图
+// 不变（v1 shape 不能满足 v2），只是更精确，符合 §5.1.1 要求的演进方向。
+test('rejects v1-shaped searchEvidence for external_source_v2 (missing v2 fetchedAt/contentHash/snapshotRef fields)', () => {
+  const result = validateSourceEvidenceArtifact({
+    title: '收集金蝶2026年AI产品公开信息',
+    content: '来源：金蝶AI峰会2026 https://www.kingdee.com/kais2026',
+    evidenceContract: {
+      kind: 'external_source_v2',
+      required: true,
+      minResults: 1,
+      minFetchedPages: 1,
+    },
+    searchEvidence: {
+      queries: [{
+        query: '金蝶 AI 峰会 2026',
+        results: [{ title: '金蝶AI峰会2026', url: 'https://www.kingdee.com/kais2026' }],
+      }],
+      fetchedPages: [{ url: 'https://www.kingdee.com/kais2026', ok: true, excerpt: '可信来源' }],
+    },
+    now,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'source_evidence_incomplete');
+});
+
 let passed = 0;
 for (const { name, fn } of tests) {
   try {

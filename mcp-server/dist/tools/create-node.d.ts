@@ -11,6 +11,27 @@ export declare const createNodeSchema: {
     fanoutItemKey: z.ZodOptional<z.ZodString>;
     required: z.ZodDefault<z.ZodBoolean>;
     options: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    permissions: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        deniedCommandIds: z.ZodOptional<z.ZodArray<z.ZodEnum<["git-diff", "git-stash"]>, "many">>;
+        deniedCommands: z.ZodOptional<z.ZodArray<z.ZodEnum<["git diff", "git stash"]>, "many">>;
+        toolCategories: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodString, string, string>, "many">>;
+    }, "strict", z.ZodTypeAny, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }>, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }>>;
 };
 declare const schema: z.ZodObject<{
     projectId: z.ZodString;
@@ -23,6 +44,27 @@ declare const schema: z.ZodObject<{
     fanoutItemKey: z.ZodOptional<z.ZodString>;
     required: z.ZodDefault<z.ZodBoolean>;
     options: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    permissions: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        deniedCommandIds: z.ZodOptional<z.ZodArray<z.ZodEnum<["git-diff", "git-stash"]>, "many">>;
+        deniedCommands: z.ZodOptional<z.ZodArray<z.ZodEnum<["git diff", "git stash"]>, "many">>;
+        toolCategories: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodString, string, string>, "many">>;
+    }, "strict", z.ZodTypeAny, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }>, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }, {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    }>>;
 }, "strip", z.ZodTypeAny, {
     workflowRunId: string;
     projectId: string;
@@ -34,6 +76,11 @@ declare const schema: z.ZodObject<{
     assignedAgent?: string | undefined;
     parallelGroupId?: string | undefined;
     fanoutItemKey?: string | undefined;
+    permissions?: {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    } | undefined;
 }, {
     workflowRunId: string;
     projectId: string;
@@ -45,6 +92,11 @@ declare const schema: z.ZodObject<{
     assignedAgent?: string | undefined;
     parallelGroupId?: string | undefined;
     fanoutItemKey?: string | undefined;
+    permissions?: {
+        deniedCommandIds?: ("git-diff" | "git-stash")[] | undefined;
+        deniedCommands?: ("git diff" | "git stash")[] | undefined;
+        toolCategories?: string[] | undefined;
+    } | undefined;
 }>;
 export declare function handleCreateNode(httpClient: KSwarmHttpClient, args: z.infer<typeof schema>): Promise<string>;
 export {};

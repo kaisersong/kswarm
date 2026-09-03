@@ -1,8 +1,22 @@
 import { planTaskRoute } from './capability-router.js';
+import { evaluateDependencySatisfaction } from './gate-evaluator.js';
 
 export const ACTIVE_TASK_STATUSES = new Set(['dispatched', 'accepted', 'in_progress']);
 
-export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agentProfiles = null, now = Date.now(), agentConcurrency = {} } = {}) {
+export function planDispatch({
+  projectId,
+  tasks = [],
+  allActiveTasks = [],
+  agentProfiles = null,
+  now = Date.now(),
+  agentConcurrency = {},
+  dependencyPolicies = {},
+  gateEvaluationsByTaskId = {},
+  consumedArtifactIdsByTaskId = {},
+  consumedArtifactIdsByDependencyTaskId = {},
+  currentGateFactsByTaskId = {},
+  schemaV2 = false,
+} = {}) {
   const taskMap = new Map(tasks.map(task => [task.id, task]));
   const shouldCheckCapabilities = hasAgentProfiles(agentProfiles);
   const activeCounts = countActiveTasksByAgent(
@@ -18,7 +32,16 @@ export function planDispatch({ projectId, tasks = [], allActiveTasks = [], agent
   for (const task of tasks) {
     if (!isDispatchCandidate(task) || task.isCompositeParent) continue;
 
-    const pendingDeps = getPendingDependencies(task, taskMap);
+    const taskConsumedArtifactIds = Object.prototype.hasOwnProperty.call(consumedArtifactIdsByTaskId, task.id)
+      ? consumedArtifactIdsByTaskId[task.id]
+      : consumedArtifactIdsByDependencyTaskId;
+    const pendingDeps = getPendingDependencies(task, taskMap, {
+      dependencyPolicies,
+      gateEvaluationsByTaskId,
+      consumedArtifactIdsByDependencyTaskId: taskConsumedArtifactIds,
+      currentGateFactsByTaskId,
+      schemaV2,
+    });
     if (pendingDeps.length > 0) {
       blocked.push({ taskId: task.id, reason: 'dependency_pending', dependencies: pendingDeps });
       continue;
@@ -146,12 +169,37 @@ export function getActiveTasksAcrossBoards(boards) {
   return active;
 }
 
-function getPendingDependencies(task, taskMap) {
+/**
+ * 唯一依赖判定入口（design §8.2）：委托 gate-evaluator.js:evaluateDependencySatisfaction，
+ * 不再自行维护 `dep.status === 'done'` 的私有判断。
+ *
+ * 返回值保持向后兼容：依赖任务 ID 的数组（不满足的依赖）。
+ */
+function getPendingDependencies(task, taskMap, {
+  dependencyPolicies = {},
+  gateEvaluationsByTaskId = {},
+  consumedArtifactIdsByDependencyTaskId = {},
+  currentGateFactsByTaskId = {},
+  schemaV2 = false,
+} = {}) {
   const deps = Array.isArray(task.dependencies) ? task.dependencies : [];
-  return deps.filter(depId => {
-    const dep = taskMap.get(depId);
-    return !dep || dep.status !== 'done';
+  if (deps.length === 0) return [];
+
+  const dependencyTasks = deps
+    .map(depId => taskMap.get(depId))
+    .filter(Boolean);
+
+  const evaluation = evaluateDependencySatisfaction({
+    task,
+    dependencyTasks,
+    dependencyPolicies,
+    gateEvaluationsByTaskId,
+    consumedArtifactIdsByDependencyTaskId,
+    currentGateFactsByTaskId,
+    schemaV2,
   });
+
+  return evaluation.blockedDependencies.map(b => b.dependencyTaskId);
 }
 
 function deriveProjectGate({ dispatchedTasks, skipped, blocked, tasks }) {

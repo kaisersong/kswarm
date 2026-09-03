@@ -251,7 +251,18 @@ function getTaskArtifacts(task = {}) {
   return [
     ...(Array.isArray(result.artifacts) ? result.artifacts : []),
     ...(Array.isArray(result.artifactManifest) ? result.artifactManifest : []),
-  ].filter(artifact => artifact && artifact.filename);
+  ].filter(artifact => artifact && artifactIdentifiableFilename(artifact));
+}
+
+/**
+ * 不同 producer 对 artifact 对象使用的字段名不一致：worker/desktop runtime
+ * 提交的结果里常见 { path, kind, label }（无 filename），而
+ * artifact-manifest.js 构造的 canonical 记录用 { filename, path, ... }。
+ * 这里统一提取一个可用于识别"这是否是一个真实文件"的字符串，不改变
+ * getTaskArtifacts 返回的原始 artifact 对象结构，只影响是否通过这道筛选。
+ */
+function artifactIdentifiableFilename(artifact = {}) {
+  return artifact.filename || artifact.label || artifact.name || artifact.path || '';
 }
 
 function strongestFinalArtifactScore(task = {}) {

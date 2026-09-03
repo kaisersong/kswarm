@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { basename, extname, join } from 'node:path';
+import { basename, extname, join, sep } from 'node:path';
 
 export function createArtifactRecord({
   filename,
@@ -27,13 +27,17 @@ export function createArtifactRecord({
 
 export function listArtifactRecords({ artifactsDir, projectId, getPreviewable, mimeTypes }) {
   if (!existsSync(artifactsDir)) return [];
-  return readdirSync(artifactsDir).map(filename => {
-    const filePath = join(artifactsDir, filename);
+  return listArtifactFilesRecursive(artifactsDir).map(relativePath => {
+    const filePath = join(artifactsDir, relativePath);
     const stat = statSync(filePath);
-    const ext = extname(filename);
+    const ext = extname(relativePath);
+    // design §3.5：filename/path 必须保留完整相对嵌套路径（例如
+    // "tasks/item-1/run-1/review-evidence.json"），禁止用 basename 把
+    // canonical manifest 的 task/run 命名空间再次扁平化；顶层扁平文件的
+    // relativePath 本身就等于 basename，行为与既有调用方保持一致。
     return createArtifactRecord({
-      filename,
-      url: `/projects/${projectId}/artifacts/${filename}`,
+      filename: relativePath,
+      url: `/projects/${projectId}/artifacts/${encodeArtifactRelativePath(relativePath)}`,
       path: filePath,
       previewable: getPreviewable(ext),
       mimeType: mimeTypes[ext] || 'application/octet-stream',
@@ -41,6 +45,31 @@ export function listArtifactRecords({ artifactsDir, projectId, getPreviewable, m
       size: stat.size,
     });
   });
+}
+
+/**
+ * 递归列出 artifactsDir 下所有文件的相对路径（POSIX 分隔符），包含
+ * design §3.5 canonical 嵌套路径 `tasks/<task-id>/<run-id>/*`。
+ * 不做 containment 校验——输入是已经受信的本地 artifactsDir 根，遍历只读，
+ * 不涉及用户可控路径拼接；写入路径的 containment 由 resolveArtifactPath 负责。
+ */
+function listArtifactFilesRecursive(rootDir, relativeDir = '') {
+  const currentDir = relativeDir ? join(rootDir, relativeDir) : rootDir;
+  const entries = readdirSync(currentDir, { withFileTypes: true });
+  const results = [];
+  for (const entry of entries) {
+    const entryRelativePath = relativeDir ? join(relativeDir, entry.name) : entry.name;
+    if (entry.isDirectory()) {
+      results.push(...listArtifactFilesRecursive(rootDir, entryRelativePath));
+    } else if (entry.isFile()) {
+      results.push(entryRelativePath.split(sep).join('/'));
+    }
+  }
+  return results;
+}
+
+function encodeArtifactRelativePath(relativePath) {
+  return relativePath.split('/').map(part => encodeURIComponent(part)).join('/');
 }
 
 export function enrichArtifactRecordFromFile({ artifact, artifactsDir, getPreviewable, mimeTypes }) {

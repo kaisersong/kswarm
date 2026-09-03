@@ -121,10 +121,7 @@ test('KualityForge script preview can create a KSwarm dynamic workflow and revie
       required: true,
       evidenceRequired: true,
       permissions: {
-        allowShell: true,
-        allowWrite: false,
-        allowNetwork: false,
-        allowRenderer: false,
+        deniedCommandIds: ['git-diff'],
         deniedCommands: ['git diff'],
       },
       options: {
@@ -142,9 +139,10 @@ test('KualityForge script preview can create a KSwarm dynamic workflow and revie
     assert.equal(reviewer.workflowRun.nodes.find(node => node.id === reviewer.nodeId).parallelGroupId, group.parallelGroup.id);
 
     const reviewerNode = reviewer.workflowRun.nodes.find(node => node.id === reviewer.nodeId);
+    assert.deepEqual(reviewerNode.input.permissions.deniedCommandIds, ['git-diff']);
     assert.deepEqual(reviewerNode.input.permissions.deniedCommands, ['git diff']);
-    assert.equal(reviewerNode.input.permissions.allowShell, true);
-    assert.deepEqual(reviewer.dispatches[0].input.permissions.deniedCommands, ['git diff']);
+    assert.equal(Object.hasOwn(reviewerNode.input.permissions, 'allowShell'), false);
+    assert.deepEqual(reviewer.dispatches[0].input.permissions.deniedCommandIds, ['git-diff']);
 
     const dispatch = reviewer.dispatches[0];
     assert.ok(dispatch.nodeId);

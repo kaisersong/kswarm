@@ -25,6 +25,7 @@ import {
   normalizeTasksForProject,
   resolveTaskRef,
 } from './task-identity.js';
+import { evaluateDependencySatisfaction } from './gate-evaluator.js';
 
 const VALID_TRANSITIONS = {
   pending: ['dispatched', 'failed', 'blocked', 'cancelled'],
@@ -270,7 +271,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     const now = Date.now();
     const oldStatus = parent.status;
     parent.status = 'done';
-    parent.result = result;
+    parent.result = deriveParentExecutionResult(result);
     clearActiveFailureState(parent);
     parent.completedAt = now;
     parent.updatedAt = now;
@@ -287,7 +288,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     const now = Date.now();
     const oldStatus = parent.status;
     parent.status = 'done';
-    parent.result = result;
+    parent.result = deriveParentExecutionResult(result);
     clearActiveFailureState(parent);
     parent.completedAt = now;
     parent.updatedAt = now;
@@ -436,18 +437,51 @@ export function createTaskBoard(projectId = 'legacy-project') {
 
   /**
    * 依赖检查：哪些 pending 任务的所有前置已 done
+   *
+   * design §8.2：唯一依赖判定入口委托 gate-evaluator.js:evaluateDependencySatisfaction，
+   * 不再自行维护 `dep.status === 'done'` 的私有判断。TaskBoard 实例本身不持有
+   * project 对象，schemaV2/dependencyPolicies/gateEvaluationsByTaskId 等项目级上下文
+   * 由调用者（如 hub.js）显式传入；不传参数时保持 legacy `completed` 兼容行为，
+   * 不破坏现有调用方隐式假设。
+   *
+   * @param {Object} [gateContext]
+   * @param {Record<string, import('./gate-evaluator.js').DependencyPolicy>} [gateContext.dependencyPolicies]
+   * @param {Record<string, import('./gate-evaluator.js').GateEvaluationV1[]>} [gateContext.gateEvaluationsByTaskId]
+   * @param {Record<string, string[]>} [gateContext.consumedArtifactIdsByDependencyTaskId]
+   * @param {Record<string, any>} [gateContext.currentGateFactsByTaskId]
+   * @param {boolean} [gateContext.schemaV2=false]
    */
-  function getDispatchable() {
+  function getDispatchable(gateContext = {}) {
+    const {
+      dependencyPolicies = {},
+      gateEvaluationsByTaskId = {},
+      consumedArtifactIdsByDependencyTaskId = {},
+      currentGateFactsByTaskId = {},
+      schemaV2 = false,
+    } = gateContext;
     const allTasks = [...tasks.values()];
     return allTasks
       .filter(t => t.status === 'pending')
       .filter(t => !t.isCompositeParent)
       .filter(t => !t.unresolvedDependencies || t.unresolvedDependencies.length === 0)
-      .filter(t => (t.dependencies || []).every(depRef => {
-        const depId = resolveTaskId(depRef);
-        const dep = depId ? tasks.get(depId) : null;
-        return dep && dep.status === 'done';
-      }));
+      .filter(t => {
+        const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
+        if (deps.length === 0) return true;
+        const dependencyTasks = deps.map(depRef => {
+          const depId = resolveTaskId(depRef);
+          return depId ? tasks.get(depId) : null;
+        }).filter(Boolean);
+        const evaluation = evaluateDependencySatisfaction({
+          task: t,
+          dependencyTasks,
+          dependencyPolicies,
+          gateEvaluationsByTaskId,
+          consumedArtifactIdsByDependencyTaskId,
+          currentGateFactsByTaskId,
+          schemaV2,
+        });
+        return evaluation.ok;
+      });
   }
 
   /**
@@ -479,9 +513,12 @@ export function createTaskBoard(projectId = 'legacy-project') {
 
   /**
    * 阶段感知派发：只返回指定阶段中可派发的任务
+   *
+   * design §8.2：与 getDispatchable 共享同一套 gate 判定上下文透传规则，
+   * 不能只修 getDispatchable 而漏掉这条兄弟路径。
    */
-  function getDispatchableInPhase(phaseId) {
-    return getDispatchable().filter(t => t.phaseId === phaseId);
+  function getDispatchableInPhase(phaseId, gateContext = {}) {
+    return getDispatchable(gateContext).filter(t => t.phaseId === phaseId);
   }
 
   /**
@@ -600,6 +637,25 @@ export function createTaskBoard(projectId = 'legacy-project') {
     if (!reviewedAt || reviewedAt < submittedAt) {
       task.reviewResult = null;
     }
+  }
+
+  /**
+   * design §8.2（completeCompositeParent/completeRetryParent 项）：
+   * parent 不能整体复制 child/retry 的 result（会连带复制 reserved service-owned
+   * 字段，例如 gateEvaluation、projectGateSnapshot、reviewGateDecision，以及可能
+   * 被误读为"已通过独立评审"的 reviewResult）。只允许一个显式 allowlist：
+   * summary 与 canonical artifact 引用（artifacts / artifactManifest / evidenceRefs）。
+   * blocked/missing gate evaluation 不会因为 parent 完成而被伪造为满足 verified_pass。
+   */
+  function deriveParentExecutionResult(childResult = null) {
+    if (!childResult || typeof childResult !== 'object' || Array.isArray(childResult)) return null;
+    const derived = {};
+    if (typeof childResult.summary === 'string') derived.summary = childResult.summary;
+    if (Array.isArray(childResult.artifacts)) derived.artifacts = childResult.artifacts;
+    if (Array.isArray(childResult.artifactManifest)) derived.artifactManifest = childResult.artifactManifest;
+    if (Array.isArray(childResult.evidenceRefs)) derived.evidenceRefs = childResult.evidenceRefs;
+    if (childResult.provenance && typeof childResult.provenance === 'object') derived.provenance = childResult.provenance;
+    return derived;
   }
 
   function clearActiveFailureState(task) {

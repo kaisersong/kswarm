@@ -93,6 +93,65 @@ test('worker output unlocks reviewer and reviewer decision completes gate', () =
   assert.equal(gate.output.decision.status, 'passed');
 });
 
+test('review findings preserve trusted reviewer identity and reject self verification across task ids', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-review-condition');
+  const started = hub.startAgentReviewSmokeWorkflow('proj-review-condition');
+  const worker = hub.handleWorkflowNodeResult({
+    workflowRunId: started.workflowRun.id, nodeId: 'worker-diagnose-project',
+    attempt: started.dispatches[0].attempt, handoffId: started.dispatches[0].handoffId,
+    fromAgent: 'xiaok-worker', output: { summary: 'done' },
+  });
+  const dispatch = worker.dispatches[0];
+  const reviewed = hub.handleWorkflowNodeReview({
+    workflowRunId: started.workflowRun.id, nodeId: 'reviewer-adversarial-check',
+    attempt: dispatch.attempt, handoffId: dispatch.handoffId, fromAgent: 'xiaok-po',
+    reviewDecision: { status: 'needs_rework', reason: 'blocking', evidenceRefs: ['review:f1'] },
+    output: { reviewEvidence: { findings: [{
+      id: 'f1', blocking: true, reviewer: 'forged', agent: 'forged',
+      owner: { kind: 'task', id: 'fix-task' },
+    }] } },
+  });
+  assert.equal(reviewed.ok, true);
+  const [condition] = hub.listReviewConditions('proj-review-condition');
+  assert.equal(condition.originatingReviewerIdentity, 'xiaok-po');
+  assert.equal(condition.owner.id, 'fix-task');
+  const selfVerify = hub.resolveReviewConditionEntry(
+    'proj-review-condition', condition.conditionId,
+    { verifiedBy: 'xiaok-po', evidenceRefs: ['verify-task:different-id'] },
+    { requestSource: 'agent', actorId: 'xiaok-po' },
+  );
+  assert.equal(selfVerify.error, 'condition_self_resolution_forbidden');
+  const independent = hub.resolveReviewConditionEntry(
+    'proj-review-condition', condition.conditionId,
+    { verifiedBy: 'independent-verifier', evidenceRefs: ['artifact:proof'] },
+    { requestSource: 'agent', actorId: 'independent-verifier' },
+  );
+  assert.equal(independent.ok, true);
+});
+
+test('forged workflow reviewer identity is rejected without condition or workflow mutation', () => {
+  const hub = createHub({ silent: true });
+  createActiveProject(hub, 'proj-forged-reviewer');
+  const started = hub.startAgentReviewSmokeWorkflow('proj-forged-reviewer');
+  const worker = hub.handleWorkflowNodeResult({
+    workflowRunId: started.workflowRun.id, nodeId: 'worker-diagnose-project',
+    attempt: started.dispatches[0].attempt, handoffId: started.dispatches[0].handoffId,
+    fromAgent: 'xiaok-worker', output: { summary: 'done' },
+  });
+  const before = structuredClone(hub.getWorkflowRun(started.workflowRun.id));
+  const dispatch = worker.dispatches[0];
+  const result = hub.handleWorkflowNodeReview({
+    workflowRunId: started.workflowRun.id, nodeId: 'reviewer-adversarial-check',
+    attempt: dispatch.attempt, handoffId: dispatch.handoffId, fromAgent: 'attacker',
+    reviewDecision: { status: 'needs_rework', reason: 'blocking', evidenceRefs: ['review:f1'] },
+    output: { reviewEvidence: { findings: [{ id: 'f1', blocking: true }] } },
+  });
+  assert.equal(result.error, 'workflow_reviewer_identity_mismatch');
+  assert.deepEqual(hub.getWorkflowRun(started.workflowRun.id), before);
+  assert.deepEqual(hub.listReviewConditions('proj-forged-reviewer'), []);
+});
+
 test('reviewer needs_rework decision blocks the workflow gate', () => {
   const hub = createHub({ silent: true });
   createActiveProject(hub);

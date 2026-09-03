@@ -161,6 +161,41 @@ test('an archiving room suppresses the outbox item to a terminal state without r
   assert.ok(hub.getProject(project.id));
 });
 
+// design §8.2（submitTaskResult / Room event path 项）：
+// 真实存在的 task 但状态转换非法（例如从 pending 直接跳到 done）时，
+// submitTaskResult 之前会静默吞掉 transition 失败，仍然发布 task.done 事件
+// 和 Room outbox 通知，让用户看到一个从未真正发生的"任务已完成"。
+// 现在必须整体拒绝，不发布任何虚假的完成通知。
+test('a real but illegally-transitioned task must not publish a fabricated task.done room notification', async () => {
+  const brokerClient = createFakeBrokerClient();
+  const hub = createHub({ silent: true, brokerClient });
+  const project = await createRoomLinkedProject(hub);
+  assert.equal(hub.handleCreateTasks(project.id, [{
+    id: 'pending-task',
+    title: 'Still pending',
+    brief: 'This task has never been dispatched.',
+    assignedAgent: 'agent-worker',
+    dependencies: [],
+  }], 'agent-po').ok, true);
+  assert.equal(hub.handleApprove(project.id).ok, true);
+
+  const board = hub.getBoard(project.id);
+  const task = board.getAllTasks().find(t => t.localTaskId === 'pending-task' || t.id.endsWith('pending-task'));
+  assert.ok(task, 'task should exist on the board');
+  assert.equal(task.status, 'pending', 'task should still be pending (never dispatched)');
+
+  const result = hub.submitTaskResult({ projectId: project.id, taskId: task.id, agentId: 'agent-po', summary: 'fabricated done' });
+  assert.equal(result.ok, false, 'submitTaskResult must reject an illegal pending->done transition');
+  assert.equal(board.getTask(task.id).status, 'pending', 'task status must remain unchanged');
+
+  await hub.flushRoomEventOutbox();
+  const outbox = hub.getRoomEventOutbox({ projectId: project.id });
+  const fabricatedDoneEvents = outbox.items.filter(item =>
+    item.eventType === 'task.done' && item.sourceRefs?.taskId === task.id,
+  );
+  assert.equal(fabricatedDoneEvents.length, 0, 'no task.done room event should be published for the illegally-transitioned task');
+});
+
 test('a publish failure keeps the outbox item pending for the next flush', async () => {
   const brokerClient = createFakeBrokerClient();
   let failFirst = true;

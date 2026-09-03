@@ -1,6 +1,18 @@
 /**
  * Project Manager — Lifecycle and completion detection
  *
+ * ⚠️ DEMO-ONLY MODULE（design §8.2 核对结论，2026-09）：
+ * 本模块仅被 `src/cli/demo.js`、`test/e2e.test.js`、`test/scenarios.test.js` 引用，
+ * 不被 `src/server/index.js` 或 `src/core/hub.js` 消费，不在生产 dispatch/delivery
+ * 路径上。真实生产的 project 生命周期、依赖判定和最终交付均由 `src/core/hub.js`
+ * （`handleDeliver` / `approveFinalDeliverable` / `evaluateDependencySatisfaction`）
+ * 独立实现和维护，不共享本模块的任何状态或逻辑。
+ *
+ * `checkCompletion` 下面仍保留其原有的、无 gate 校验的 `project.status = 'delivered'`
+ * 行为，仅供 demo/legacy 测试路径使用；不得被任何新的生产代码路径调用或复用，
+ * 否则会绕开 `evaluateDependencySatisfaction` / `approveFinalDeliverable` 等唯一
+ * gate 收敛点，重新引入已被关闭的旁路。
+ *
  * Manages:
  * - Project creation with deliverable definition
  * - Task status tracking (synced from broker events)
@@ -69,6 +81,10 @@ export function createProjectManager() {
   /**
    * Get tasks that are ready to be dispatched.
    * (status=pending, all dependencies done)
+   *
+   * ⚠️ DEMO-ONLY：这是独立于 evaluateDependencySatisfaction 的私有依赖判定，
+   * 只适用于本模块的 demo/legacy 数据结构（`t.dependencies` 数组、无
+   * DependencyPolicy/GateEvaluation 概念）。不代表生产 dispatch 契约。
    */
   function getReadyTasks(projectId) {
     const project = projects.get(projectId);
@@ -99,6 +115,10 @@ export function createProjectManager() {
 
   /**
    * Check if project is complete.
+   *
+   * ⚠️ DEMO-ONLY：无 gate 校验的 legacy 行为，仅供本模块自身的 demo/legacy
+   * 数据结构使用。生产交付路径必须使用 hub.js:handleDeliver +
+   * approveFinalDeliverable，不得复用此函数的 project.status 写入逻辑。
    */
   function checkCompletion(projectId) {
     const project = projects.get(projectId);

@@ -20,6 +20,7 @@ export const DELETABLE_COLLECTIONS = Object.freeze([
   'workflowProposal',
   'finalDeliverable',
   'reviewGateDecision',
+  'reviewCondition',
 ]);
 
 export const ALL_COLLECTIONS = Object.freeze([...DELETABLE_COLLECTIONS, 'humanAction']);
@@ -71,6 +72,10 @@ export function decomposeState(state) {
     if (!g || !g.gateId) continue;
     entities.push({ collection: 'reviewGateDecision', key: g.gateId, projectId: g.projectId ?? null, value: g });
   }
+  for (const c of state.reviewConditions || []) {
+    if (!c || !c.conditionId) continue;
+    entities.push({ collection: 'reviewCondition', key: c.conditionId, projectId: c.projectId ?? null, value: c });
+  }
   let seq = 0;
   for (const a of state.humanActions || []) {
     if (!a || typeof a !== 'object') continue;
@@ -92,6 +97,7 @@ export function composeEntities(entities) {
     workflowProposals: [],
     finalDeliverables: [],
     reviewGateDecisions: [],
+    reviewConditions: [],
     humanActions: [],
   };
   for (const e of entities || []) {
@@ -102,6 +108,7 @@ export function composeEntities(entities) {
       case 'workflowProposal': state.workflowProposals.push(e.value); break;
       case 'finalDeliverable': state.finalDeliverables.push(e.value); break;
       case 'reviewGateDecision': state.reviewGateDecisions.push(e.value); break;
+      case 'reviewCondition': state.reviewConditions.push(e.value); break;
       case 'humanAction': state.humanActions.push(e.value); break;
       default: break;
     }
@@ -148,6 +155,8 @@ const PROJECT_FIRST_ARG = new Set([
   'handleDeliver',
   'registerFinalDeliverable',
   'approveFinalDeliverable',
+  'submitReviewConditionEvidence',
+  'resolveReviewConditionEntry',
   'handleAcceptTask',
   'handleProgress',
   'handleWorkerFailure',

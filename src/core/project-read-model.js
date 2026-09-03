@@ -56,7 +56,7 @@ export function deriveExecutionGraph({
   const nodes = [];
 
   for (const task of normalizedTasks) {
-    const historicalRetryAttempt = isHistoricalRetryAttempt(task, taskById);
+    const historicalRetryAttempt = isHistoricalRetryAttempt(task, taskLookup);
     nodes.push({
       stableNodeId: task.localTaskId || task.userFacingId || normalizeTaskDisplayId(project?.id, task.id) || task.id,
       displayId: task.localTaskId || task.userFacingId || normalizeTaskDisplayId(project?.id, task.id) || task.id,
@@ -129,6 +129,7 @@ export function deriveProjectLifecycle({
   artifacts = [],
   finalDeliverables = [],
   reviewGateDecisions = [],
+  reviewConditions = [],
   now = Date.now(),
 } = {}) {
   const executionGraph = deriveExecutionGraph({ project, tasks, workflowRuns, bindings, artifacts, finalDeliverables });
@@ -138,12 +139,39 @@ export function deriveProjectLifecycle({
   const gateDecision = approvedFinal
     ? selectGateDecisionForDeliverable(reviewGateDecisions, approvedFinal.deliverableId)
     : null;
+  const approvalFacts = approvedFinal
+    ? evaluateFinalDeliverableApprovalFacts({
+      projectId: project?.id,
+      finalDeliverable: approvedFinal,
+      tasks,
+      workflowRuns,
+      reviewConditions,
+    })
+    : { ok: false };
   const planRevisionRequired = Boolean(project?.planRevisionRequired);
   const allRequiredTerminalOk = executionGraph.nodes
     .filter(node => node.required !== false)
     .every(node => isExecutionNodeTerminalOk(node));
   const hasCandidateFinal = finalDeliverables.some(item => ['candidate', 'under_review'].includes(item?.status));
   const hasLegacyWorkflowCandidate = hasCandidateFinal && ['created', 'planning'].includes(legacyStatus);
+  // design §8.2/§8.3（canAutoClose 项）：verifyCommittedReviewGateDecision 本身
+  // 是纯函数，但完整调用需要 hydratedGateFacts（读盘重算 final artifact hash），
+  // 这里作为高频同步只读路径不引入该 I/O（architecture 待办，见实现状态文档）。
+  // 但 lifecycleVersion/manifestRevision 漂移检测不需要读盘——两者都已经是
+  // project 对象上的内存字段，且 schema v2 项目的 approval 完成后已把当时的
+  // lifecycleVersion/manifestRevision 固化进 reviewGateDecision（见 hub.js
+  // approveFinalDeliverable 写入的 decidedAtProjectVersion/decidedAtManifestRevision）；
+  // 批准完成之后 project 又发生一次 mutation（新增任务、canonical artifact
+  // 变化）就必须让已存在的 passing decision 不可再用于自动关闭。v1/未声明
+  // schema 的项目没有这两个字段（approveFinalDeliverable 只对 schema v2 项目
+  // 产出），保持现状不受影响，不能让 v1 从"可自动关闭"退化为"不可自动关闭"。
+  const hasVersionFacts = gateDecision
+    && gateDecision.decidedAtProjectVersion !== undefined
+    && gateDecision.decidedAtManifestRevision !== undefined;
+  const noRevisionDrift = !hasVersionFacts || (
+    Number(gateDecision.decidedAtProjectVersion) === Number(project?.lifecycleVersion || 0) &&
+    Number(gateDecision.decidedAtManifestRevision) === Number(project?.manifestRevision || 0)
+  );
   const canAutoClose = Boolean(
     approvedFinal &&
     !planRevisionRequired &&
@@ -151,8 +179,10 @@ export function deriveProjectLifecycle({
     gateDecision?.finalDeliverableId === approvedFinal.deliverableId &&
     gateDecision?.decision === 'passed' &&
     gateDecision?.autoCloseAllowed === true &&
+    noRevisionDrift &&
     allRequiredTerminalOk &&
-    deterministicChecksPassedForApprovedDeliverable(approvedFinal),
+    deterministicChecksPassedForApprovedDeliverable(approvedFinal) &&
+    approvalFacts.ok,
   );
 
   let state = normalizeLegacyLifecycleState(legacyStatus);
@@ -210,9 +240,55 @@ export function deriveProjectLifecycle({
   };
 }
 
-function isHistoricalRetryAttempt(task, taskById) {
+export function evaluateFinalDeliverableApprovalFacts({
+  projectId = null,
+  finalDeliverable = null,
+  tasks = [],
+  workflowRuns = [],
+  reviewConditions = [],
+} = {}) {
+  if (!finalDeliverable) return { ok: false, error: 'final_deliverable_not_found' };
+
+  let currentReview = null;
+  if (finalDeliverable.workflowRunId) {
+    const workflowRun = workflowRuns.find(run => run?.id === finalDeliverable.workflowRunId);
+    currentReview = workflowRun?.gateDecision || null;
+    if (currentReview && currentReview.status !== 'passed') {
+      return { ok: false, error: 'final_deliverable_review_failed' };
+    }
+  } else if (finalDeliverable.taskId) {
+    const matches = buildTaskLookup(projectId, tasks).get(String(finalDeliverable.taskId).trim()) || [];
+    currentReview = matches.length === 1 ? matches[0]?.reviewResult || null : null;
+    if (currentReview && currentReview.passed !== true) {
+      return { ok: false, error: 'final_deliverable_review_failed' };
+    }
+  }
+
+  const userMaySkipMissingReview = finalDeliverable.requiresReview === false
+    && finalDeliverable.submitted?.requestContext?.requestSource === 'user';
+  if (!currentReview && !userMaySkipMissingReview) {
+    return { ok: false, error: 'final_deliverable_review_required' };
+  }
+
+  const hasOpenBlockingCondition = reviewConditions.some(condition =>
+    (!projectId || condition?.projectId === projectId)
+      && condition?.blocking === true
+      && ['open', 'evidence_submitted'].includes(condition?.status),
+  );
+  if (hasOpenBlockingCondition) return { ok: false, error: 'open_review_conditions' };
+
+  return { ok: true };
+}
+
+/**
+ * task.parentTaskId / task.retryOfTaskId 可能是裸 ID、localTaskId 或其它未 namespace 的 ref
+ * （task-identity.js:normalizeTasksForProject 不会重写这些字段本身的取值），
+ * 因此这里必须复用 buildTaskLookup 产生的多 ref 索引来解析父任务，
+ * 不能直接用 `task.id -> task` 的 taskById 精确匹配（会因为 ref 不一致而漏判）。
+ */
+function isHistoricalRetryAttempt(task, taskLookup) {
   if (!task?.parentTaskId) return false;
-  const parent = taskById.get(task.parentTaskId);
+  const parent = (taskLookup.get(String(task.parentTaskId).trim()) || [])[0];
   return Boolean(parent && !['failed', 'blocked'].includes(parent.status));
 }
 
