@@ -22,9 +22,9 @@
 - 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
 - `desktop-v1.5.0` 的 Desktop release workflow 会 checkout 本仓库匹配的 `desktop-v1.5.0` tag，因此即使 KSwarm sidecar 版本不变，也必须先推送可复现快照，再启动 Xiaok release build。
 
-## Gate / Evidence / 产物流水线加固
+## v0.9.3 新特性：Gate / Evidence / 产物流水线加固
 
-这是在 `v0.9.2` 基础上的增量加固，未 bump 版本号。新增 canonical artifact registry、contract-kind registry、gate evaluator、gate evidence acceptor、reviewer independence 检查、risk floor、frozen-final-candidate 模块，用于更严格的项目完成治理，以及一个限制在工作区内的 artifact path resolver。
+KSwarm `v0.9.3` 新增 canonical artifact registry、contract-kind registry、gate evaluator、gate evidence acceptor、reviewer independence 检查、risk floor、frozen-final-candidate 模块，用于更严格的项目完成治理，以及一个限制在工作区内的 artifact path resolver。
 
 - **Canonical Artifact Registry**：提交的任务产物会注册进一条 canonical 记录，后续 gate 检查和最终交付审批读取同一份一致来源，而不是各自临时推导 artifact identity。
 - **Gate Evaluator 和 Evidence Acceptor**：质量评审 gate 现在通过 hydrated gate facts 评估、通过统一的 acceptor 路径接受证据，包括 TOCTOU-safe 的读取路径，防止 gate 检查时确认过的证据在使用前被替换。

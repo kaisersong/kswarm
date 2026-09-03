@@ -22,9 +22,9 @@ English | [简体中文](README.zh-CN.md)
 - The active packaged sidecar is KSwarm `0.9.2`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
 - The Desktop release workflow for `desktop-v1.5.0` checks out the matching `desktop-v1.5.0` tag from this repository, so the sidecar snapshot is reproducible and must be pushed before the Xiaok release build starts.
 
-## Gate, Evidence, and Artifact Pipeline Hardening
+## What's New in v0.9.3: Gate, Evidence, and Artifact Pipeline Hardening
 
-This is an incremental hardening pass on top of `v0.9.2`, not a version bump. It adds a canonical artifact registry, contract-kind registry, gate evaluator, gate evidence acceptor, reviewer independence check, risk floor, and frozen-final-candidate module for stricter project completion governance, plus a workspace-contained artifact path resolver.
+KSwarm `v0.9.3` adds a canonical artifact registry, contract-kind registry, gate evaluator, gate evidence acceptor, reviewer independence check, risk floor, and frozen-final-candidate module for stricter project completion governance, plus a workspace-contained artifact path resolver.
 
 - **Canonical Artifact Registry**: Submitted task artifacts are registered against a canonical record so later gate checks and final-deliverable approval read one consistent source instead of re-deriving artifact identity ad hoc.
 - **Gate Evaluator and Evidence Acceptor**: Quality-review gates now evaluate hydrated gate facts and accept evidence through a single acceptor path, including a TOCTOU-safe read path so evidence checked at gate time cannot be swapped out before use.

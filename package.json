@@ -1,6 +1,6 @@
 {
   "name": "kswarm",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "description": "Project-scoped Agent Swarm Hub. Routes, boards, gates — no business logic.",
   "license": "Apache-2.0",
   "type": "module",
