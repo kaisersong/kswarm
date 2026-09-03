@@ -22,6 +22,18 @@
 - 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
 - `desktop-v1.5.0` 的 Desktop release workflow 会 checkout 本仓库匹配的 `desktop-v1.5.0` tag，因此即使 KSwarm sidecar 版本不变，也必须先推送可复现快照，再启动 Xiaok release build。
 
+## Gate / Evidence / 产物流水线加固
+
+这是在 `v0.9.2` 基础上的增量加固，未 bump 版本号。新增 canonical artifact registry、contract-kind registry、gate evaluator、gate evidence acceptor、reviewer independence 检查、risk floor、frozen-final-candidate 模块，用于更严格的项目完成治理，以及一个限制在工作区内的 artifact path resolver。
+
+- **Canonical Artifact Registry**：提交的任务产物会注册进一条 canonical 记录，后续 gate 检查和最终交付审批读取同一份一致来源，而不是各自临时推导 artifact identity。
+- **Gate Evaluator 和 Evidence Acceptor**：质量评审 gate 现在通过 hydrated gate facts 评估、通过统一的 acceptor 路径接受证据，包括 TOCTOU-safe 的读取路径，防止 gate 检查时确认过的证据在使用前被替换。
+- **Reviewer Independence**：如果 reviewer 是被评审 artifact 的唯一生产者，dispatch 阶段直接拒绝，堵住"自己审自己"的漏洞；共同生产或与该 artifact 无关的 reviewer 不受影响。
+- **Risk Floor 与依赖策略**：`hub-create-tasks` 和 `hub-human-add-tasks` 现在应用明确的依赖策略，提交的 plan 携带 risk floor，使下游 gate 无论任务如何创建都有一致的最低门槛。
+- **Frozen Final Candidate**：批准最终交付物时会冻结批准时对应的候选快照，防止批准悄悄漂移到底层 artifact 的另一个版本。
+- **Artifact Path Resolver 容器化**：artifact 上传和全局 artifact 路由会拒绝逃出项目工作区根目录的路径，配套嵌套路径和安全性回归测试。
+- **回归测试覆盖**：新增聚焦测试套件覆盖 gate-bypass 回归、`submit_result` 时的 canonical artifact 注册、已移除的"无独立 reviewer 时自动通过"兜底逻辑、project-read-model 在 revision drift 时的自动关闭，以及一个端到端 hash-mismatch 修复场景。
+
 ## v0.9.2 新特性
 
 - **Workflow 节点间上游 Output 传递**：`compactNodeOutput(node)` 提取已完成节点的结构化 compact（摘要 + 产物路径 + 小字段，单字段 ≤2KB，单节点 ≤4KB）。`enrichWorkflowNodeInput(workflowRun, input, { nodeId })` 收集所有已完成 `dependsOn` 上游（总量 10KB cap，溢出优雅降级为 summary-only）。`dispatchWorkflowNode` 把含 `upstreamOutputs` 的 enriched input 传给 broker/desktop，但持久化前 strip 掉（派生数据不落盘）。`dispatchWorkflowScriptAgentNode` 新增可选 `{ dependsOn }` 参数。

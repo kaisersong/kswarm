@@ -22,6 +22,18 @@ English | [简体中文](README.zh-CN.md)
 - The active packaged sidecar is KSwarm `0.9.2`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, PO review verdict tolerance, and resume_workflow strategy for blocked script-generated workflows.
 - The Desktop release workflow for `desktop-v1.5.0` checks out the matching `desktop-v1.5.0` tag from this repository, so the sidecar snapshot is reproducible and must be pushed before the Xiaok release build starts.
 
+## Gate, Evidence, and Artifact Pipeline Hardening
+
+This is an incremental hardening pass on top of `v0.9.2`, not a version bump. It adds a canonical artifact registry, contract-kind registry, gate evaluator, gate evidence acceptor, reviewer independence check, risk floor, and frozen-final-candidate module for stricter project completion governance, plus a workspace-contained artifact path resolver.
+
+- **Canonical Artifact Registry**: Submitted task artifacts are registered against a canonical record so later gate checks and final-deliverable approval read one consistent source instead of re-deriving artifact identity ad hoc.
+- **Gate Evaluator and Evidence Acceptor**: Quality-review gates now evaluate hydrated gate facts and accept evidence through a single acceptor path, including a TOCTOU-safe read path so evidence checked at gate time cannot be swapped out before use.
+- **Reviewer Independence**: A reviewer who is the sole producer of the artifact under review is rejected at dispatch time, closing a self-review loophole; co-produced or unrelated-producer reviewers are unaffected.
+- **Risk Floor and Dependency Policy**: `hub-create-tasks` and `hub-human-add-tasks` now apply an explicit dependency policy, and submitted plans carry a risk floor so downstream gates have a consistent minimum bar regardless of how a task was created.
+- **Frozen Final Candidate**: Approving a final deliverable now freezes the candidate snapshot it was approved against, preventing an approval from silently drifting to a different underlying artifact revision.
+- **Artifact Path Resolver Containment**: Artifact upload and the global artifact route reject paths that escape the project workspace root, with nested-path and security-focused regression coverage.
+- **Regression Coverage**: New focused suites cover gate-bypass regression, canonical artifact registration on `submit_result`, the removed "auto-approved without independent reviewer" fallback, project-read-model auto-close on revision drift, and an end-to-end hash-mismatch remediation scenario.
+
 ## What's New in v0.9.2
 
 - **Workflow Node Upstream Output Handoff** — `compactNodeOutput(node)` extracts a structured compact of a completed node's output: summary, artifact paths, and small inline fields (capped per-field 2KB, per-node 4KB). `enrichWorkflowNodeInput(workflowRun, input, { nodeId })` collects all completed `dependsOn` upstream outputs (10KB total cap, graceful summary-only fallback on overflow). `dispatchWorkflowNode` passes the enriched input to broker/desktop but strips `upstreamOutputs` before persisting to node state (derived data, not stored). `dispatchWorkflowScriptAgentNode` gains an optional `{ dependsOn }` parameter for script-created nodes.
