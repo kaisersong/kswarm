@@ -8,19 +8,19 @@
 
 ---
 
-## Xiaok Desktop v1.5.0 集成基线
+## Xiaok Desktop v1.5.1 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.5.0 随包发布的项目与工作流控制面。Desktop 负责 Room 交互与用户确认；KSwarm 负责持久化 project state、task state、workflow run、review gate 和交付物元数据。
+- KSwarm 仍是 Xiaok Desktop v1.5.1 随包发布的项目与工作流控制面。Desktop 负责 Room 交互与用户确认；KSwarm 负责持久化 project state、task state、workflow run、review gate 和交付物元数据。
 - Room-first 创建通过 `/projects/room-first` 提供：创建前校验 Room 成员身份与来源消息，项目事件经持久化 outbox 发出，并保持 Room 与 Project 的事实归属边界。
 - 托管与自运行智能体路由在身份缺失或冲突时默认拒绝；Room membership lease 覆盖派发过程，项目事件可以投影回来源 Room，但 KSwarm 不成为 transcript owner。
 - Pi 已接入受限的一次性 CLI harness 与真实 readiness probe。DeepSeek harness 已接线，但在固定版本的 `dsh --profile headless` 通过真实探针合同前仍标记为不支持。
 - **Workflow 节点现在可以自动接收上游产出**：`enrichWorkflowNodeInput` 通过 `dependsOn` 边收集已完成上游节点的 output 并注入到 dispatched input。Desktop `buildKSwarmWorkflowNodePrompt` 将其渲染为结构化”上游参考”段。所有新逻辑遵循降级优先：任何失败都静默跳过注入（不阻塞 dispatch）。
 - Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
-- Xiaok Desktop v1.5.0 会把已持久化的 workflow 拓扑渲染为带并行组、汇聚节点、run/handoff 元数据和上下游详情的有向 Graph。KSwarm `0.9.2` 的 SQLite durable project state 仍是该视图背后的事实来源，renderer 不自行编造 workflow 状态。
+- Xiaok Desktop v1.5.1 会把已持久化的 workflow 拓扑渲染为带并行组、汇聚节点、run/handoff 元数据和上下游详情的有向 Graph。KSwarm `0.9.3` 的 SQLite durable project state 仍是该视图背后的事实来源，renderer 不自行编造 workflow 状态。
 - 用户 Loop、模型目录更新、MCP 2.0 renderer 插件、AI 录音和 Computer Use 仍由 Desktop / plugin 侧负责，不要求 KSwarm 协议迁移；任务完成、项目交付、workflow 进度和 artifact handoff 继续沿用现有 project/task/workflow snapshot 合同。
 - AI 录音与转写仍由 Desktop 知识库栈负责，不属于 KSwarm 控制面。保存后的纪要可以作为知识库来源参与项目工作，但 KSwarm 不管理麦克风采集、ASR 凭据、本地模型下载、标点恢复或转写总结。
-- 当前随包 sidecar 为 KSwarm `0.9.2`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、PO review verdict 容错，以及 blocked script-generated workflow 的 resume_workflow 策略。
-- `desktop-v1.5.0` 的 Desktop release workflow 会 checkout 本仓库匹配的 `desktop-v1.5.0` tag，因此即使 KSwarm sidecar 版本不变，也必须先推送可复现快照，再启动 Xiaok release build。
+- 当前随包 sidecar 为 KSwarm `0.9.3`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、加固后的 gate/evidence/artifact 治理，以及带认证的 CAS artifact 写入。
+- `desktop-v1.5.1` 的 Desktop release workflow 会 checkout 本仓库匹配的 `desktop-v1.5.1` tag，因此必须先推送可复现快照，再启动 Xiaok release build。
 
 ## v0.9.3 新特性：Gate / Evidence / 产物流水线加固
 
@@ -280,6 +280,10 @@ npm run test:e2e-p0   # P0 集成场景
 ---
 
 ## 版本历史
+
+**v0.9.3** — Gate、evidence 与 artifact 流水线加固：canonical artifact/contract registry、默认拒绝的 evidence contract、reviewer independence、frozen final candidate、带认证的 CAS 写入，以及限制在工作区内的 artifact 路径。
+
+**v0.9.2** — Desktop 派发 workflow 节点的上游 output 传递、字段清理与降级日志。
 
 **v0.9.1** — PO review 与 workflow 恢复修复：PO 明确通过验收时，缺失 evidence 格式（verdict 字段）不再阻断任务；`handleContinueProject` 支持对 blocked script-generated workflow 使用 `resume_workflow` 策略，允许被阻塞的 workflow 解除阻塞并恢复执行，无需从头重跑。
 
