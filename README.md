@@ -31,7 +31,10 @@ This is an incremental hardening pass on top of `v0.9.2`, not a version bump. It
 - **Reviewer Independence**: A reviewer who is the sole producer of the artifact under review is rejected at dispatch time, closing a self-review loophole; co-produced or unrelated-producer reviewers are unaffected.
 - **Risk Floor and Dependency Policy**: `hub-create-tasks` and `hub-human-add-tasks` now apply an explicit dependency policy, and submitted plans carry a risk floor so downstream gates have a consistent minimum bar regardless of how a task was created.
 - **Frozen Final Candidate**: Approving a final deliverable now freezes the candidate snapshot it was approved against, preventing an approval from silently drifting to a different underlying artifact revision.
-- **Artifact Path Resolver Containment**: Artifact upload and the global artifact route reject paths that escape the project workspace root, with nested-path and security-focused regression coverage.
+- **Review Conditions and Final Approval**: Blocking review conditions retain service-owned reviewer identity and evidence references; final-deliverable approval runs an authoritative preflight for current review state, unresolved conditions, artifact integrity, and idempotent replay before any mutation.
+- **Fail-Closed v2 Evidence Contracts**: Registered v2 contract families without an implemented validator return `unsupported_evidence_contract`; dependency gates require one fresh, independent evaluation bound to current source and consumed artifact identities.
+- **Authenticated CAS Artifact Upload**: Artifact mutation requires a desktop mutation token and an existing `projectId`; creates are exclusive by default, updates require a matching `expectedSha256`, and returned hashes are computed from the stored bytes.
+- **Artifact Path Resolver Containment**: HTTP upload, global reads, and auto-worker direct writes share containment validation that rejects traversal and symlink escapes before bytes are written.
 - **Regression Coverage**: New focused suites cover gate-bypass regression, canonical artifact registration on `submit_result`, the removed "auto-approved without independent reviewer" fallback, project-read-model auto-close on revision drift, and an end-to-end hash-mismatch remediation scenario.
 
 ## What's New in v0.9.2

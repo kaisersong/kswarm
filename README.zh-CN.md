@@ -31,7 +31,10 @@
 - **Reviewer Independence**：如果 reviewer 是被评审 artifact 的唯一生产者，dispatch 阶段直接拒绝，堵住"自己审自己"的漏洞；共同生产或与该 artifact 无关的 reviewer 不受影响。
 - **Risk Floor 与依赖策略**：`hub-create-tasks` 和 `hub-human-add-tasks` 现在应用明确的依赖策略，提交的 plan 携带 risk floor，使下游 gate 无论任务如何创建都有一致的最低门槛。
 - **Frozen Final Candidate**：批准最终交付物时会冻结批准时对应的候选快照，防止批准悄悄漂移到底层 artifact 的另一个版本。
-- **Artifact Path Resolver 容器化**：artifact 上传和全局 artifact 路由会拒绝逃出项目工作区根目录的路径，配套嵌套路径和安全性回归测试。
+- **ReviewCondition 与最终审批**：阻塞条件保存 service-owned reviewer identity 和 evidence refs；最终交付审批会在任何状态修改前，对 current review、未解决条件、artifact 完整性和幂等重放执行权威 preflight。
+- **v2 Evidence Contract 默认拒绝**：已注册但没有 validator 的 v2 contract family 返回 `unsupported_evidence_contract`；dependency gate 要求同一份新鲜、独立的 evaluation 绑定当前 source 与 consumed artifact identity。
+- **认证与 CAS Artifact 上传**：artifact mutation 必须携带 desktop mutation token 和已存在的 `projectId`；默认只能新建，更新必须提供匹配的 `expectedSha256`，返回 hash 按实际存储 bytes 计算。
+- **Artifact Path Resolver 容器化**：HTTP 上传、全局读取和 auto-worker 直接写入共用 containment 校验，在落盘前拒绝 traversal 与 symlink escape。
 - **回归测试覆盖**：新增聚焦测试套件覆盖 gate-bypass 回归、`submit_result` 时的 canonical artifact 注册、已移除的"无独立 reviewer 时自动通过"兜底逻辑、project-read-model 在 revision drift 时的自动关闭，以及一个端到端 hash-mismatch 修复场景。
 
 ## v0.9.2 新特性
