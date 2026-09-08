@@ -2,25 +2,32 @@
 
 > You have multiple AI agents — but coordinating them is harder than the work itself. KSwarm lets you define a goal, and it handles the rest: planning, dispatching, quality review, and delivery. Your agents become a team.
 
-A multi-agent project coordination system built on [Intent Broker](https://github.com/nicepkg/intent-broker). Define a goal, KSwarm decomposes it into phased tasks, dispatches to the best available agents, reviews quality, and delivers results.
+A multi-agent project coordination system built on [Intent Broker](https://github.com/kaisersong/intent-broker). Define a goal, KSwarm decomposes it into phased tasks, dispatches to the best available agents, reviews quality, and delivers results.
 
 English | [简体中文](README.zh-CN.md)
 
 ---
 
-## Xiaok Desktop v1.5.1 Integration Baseline
+## Xiaok Desktop Integration Baseline
 
-- KSwarm remains the project and workflow control plane packaged with Xiaok Desktop v1.5.1. Desktop owns Room interaction and user confirmation; KSwarm owns durable project state, task state, workflow runs, review gates, and deliverable metadata.
-- Room-first creation is available through `/projects/room-first`. It validates Room membership and source-message provenance before creating a project, emits project events through the durable outbox, and keeps the Room/Project ownership boundary explicit.
-- Hosted and self-running agent routes now fail closed on missing or conflicting transport identity. Room membership leases cover dispatch, and project events can be projected back to the originating Room without making KSwarm the transcript owner.
-- Pi is available through a bounded one-shot CLI harness with real readiness probing. DeepSeek harness wiring is present but remains unsupported until a pinned `dsh --profile headless` binary passes the real probe contract.
-- **Workflow nodes can now automatically receive upstream output**: `enrichWorkflowNodeInput` collects completed upstream node outputs via `dependsOn` edges and injects them into the dispatched input. Desktop `buildKSwarmWorkflowNodePrompt` renders these as a structured "upstream reference" section. All new logic follows degradation-first: any failure skips injection silently (never blocks dispatch).
-- Completion evidence is consumed by Xiaok loop diagnostics. KSwarm project snapshots, task artifacts, workflow node outputs, and deliverable records remain the source data Desktop uses to verify that a completed project actually has inspectable artifact evidence.
-- Xiaok Desktop v1.5.1 renders persisted workflow topology as a directed Graph with parallel groups, fan-in nodes, run/handoff metadata, and upstream/downstream details. KSwarm `0.9.3` durable SQLite project state remains the source of truth behind that view; the renderer does not invent workflow state.
-- User Loops, model catalog updates, MCP 2.0 renderer plugins, AI recording, and Computer Use remain Desktop/plugin responsibilities. They do not require a KSwarm protocol migration: task completion, project delivery, workflow progress, and artifact handoff still use the existing project/task/workflow snapshot contract.
-- AI recording and transcription remain owned by the Desktop Knowledge Base stack, not by KSwarm. Saved notes can later become knowledge sources for project work, but KSwarm does not manage microphone capture, ASR credentials, local model downloads, punctuation restoration, or transcript summarization.
-- The active packaged sidecar is KSwarm `0.9.3`, including upstream output handoff, suspend/resume recovery, durable parallel workflow contracts, hardened gate/evidence/artifact governance, and authenticated CAS artifact writes.
-- The Desktop release workflow for `desktop-v1.5.1` checks out the matching `desktop-v1.5.1` tag from this repository, so the sidecar snapshot is reproducible and must be pushed before the Xiaok release build starts.
+Checked against source on **September 7, 2026**; the KSwarm package version is **0.9.3**. The published Xiaok Desktop version is **1.5.1**, whose release workflow checks out this repository's `desktop-v1.5.1` tag. Later working-tree changes do not automatically enter published installers.
+
+- **Project source of truth:** KSwarm persists projects, tasks, workflow runs, parallel groups, review gates, and artifact metadata. Desktop displays Kanban, Graph, task details, interventions, and delivery state.
+- **Room-first creation:** discuss in a Room, then create a project through a trusted user-confirmed path. `/projects/room-first` validates credentials, membership, and source messages; Xiaok's agent tool only prepares a proposal.
+- **Execution and recovery:** real Desktop or external agent runtimes execute work, with Intent Broker carrying requests and results. Leases, health checks, suspend/resume recovery, and explicit failures support retries.
+- **Workflow handoff:** downstream nodes can receive bounded upstream summaries and artifact references. KSwarm persists checkpoints, parallel groups, dependencies, and delivery gates; the UI does not infer completion.
+- **Delivery evidence:** the artifact registry, independent review, evidence contracts, frozen final candidates, and authenticated CAS writes govern delivery. A summary or successful broker delivery does not replace a valid artifact.
+- **Conversation boundary:** Xiaok's automatic SubAgents belong to a conversation and do not create KSwarm projects. Prompts, SubAgent presentation, goals, scheduled tasks, recording, and Computer Use belong to Xiaok or its plugins.
+
+### Related Projects
+
+| Project | Responsibility and integration |
+|---|---|
+| [xiaok-cli](https://github.com/kaisersong/xiaok-cli) | CLI and Desktop: user interaction, model execution, tools, knowledge, and automation; Desktop packages and manages the KSwarm sidecar. |
+| [intent-broker](https://github.com/kaisersong/intent-broker) | Participants, presence, durable Rooms, events, task handoffs, and reply delivery. |
+| [kai-xiaok-plugins](https://github.com/kaisersong/kai-xiaok-plugins) | Skills and MCP tools for reports, slides, canvas, meeting transcription fallback, and macOS Computer Use. |
+
+For source builds, keep all four repositories under one parent directory. Desktop packages KSwarm's `src`, `scripts`, `package.json`, `ws` dependency, and a generated worker override. Align sibling snapshots and run Xiaok's packaging contracts before release; see [Xiaok development](https://github.com/kaisersong/xiaok-cli#development).
 
 ## What's New in v0.9.3: Gate, Evidence, and Artifact Pipeline Hardening
 
@@ -136,7 +143,7 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 - **Evidence Contracts** — Recent/monthly research tasks can require source evidence and current-date grounding before review passes
 - **Formal Delivery Files** — Final delivery aliases use project/goal-based filenames instead of internal task IDs
 - **Runtime Boundary Enforcement** — KSwarm maintenance workers can manage state, logs, and packaging, but user tasks are handed to real agents
-- **Persistence** — Projects survive server restarts (debounced JSON state file)
+- **Persistence** — Production state uses per-entity SQLite with legacy JSON migration; an explicitly selected JSON backend remains for compatibility and tests
 
 ### Web UI
 
@@ -150,35 +157,36 @@ KSwarm uses a structured **Plan-Do** model, not fire-and-forget task decompositi
 
 - **Multi-runtime Support** — Claude Code, Codex CLI, XiaoK, or any broker-compatible agent
 - **Capability Matching** — Assign tasks based on agent skills
-- **Health Monitor** — Detects stuck tasks (10min timeout), reassigns or PO takes over
+- **Health Monitor** — Uses runtime probes, heartbeats, and configured watchdog limits to surface stalled work and drive recovery
 - **Concurrent Execution** — Multiple agents work in parallel within a phase
 
 ---
 
 ## Quick Start
 
+Use Node.js ≥ 22.22.0, a running Intent Broker, and at least one configured agent runtime that passes its health probe. Start each block from the `kswarm` repository root, using separate terminals for long-running processes. When Desktop manages the sidecar, use Desktop's service controls to avoid duplicate instances.
+
+Install dependencies and start the API (port 4400 by default):
+
 ```bash
-# Prerequisites: intent-broker running on localhost:4318
-# cd ~/intent-broker && npm start
-
-cd kswarm
-npm install
-
-# Start the API server (port 4400)
-node src/server/index.js
-
-# Start the web UI (port 5173)
-cd web && npx vite --port 5173
-
-# Start PO agent (will handle planning + dispatch + review)
-node scripts/auto-worker.js cli-claude Claude
-
-# (Optional) Start additional worker agents
-node scripts/auto-worker.js cli-codex Codex
-node scripts/auto-worker.js 79aac2f5-ace AQ
+npm ci
+npm run server
 ```
 
-Open http://localhost:5173 — create a project, set a goal, and watch agents collaborate.
+Start the standalone Web UI in another terminal:
+
+```bash
+npm ci --prefix web
+npm run dev --prefix web -- --port 5173
+```
+
+Open http://localhost:5173. To start an external CLI worker, replace the arguments with a registered agent ID and alias:
+
+```bash
+node scripts/auto-worker.js <agent-id> <alias>
+```
+
+KSwarm does not supply model credentials or inference. Desktop seed agents execute in the full Desktop runtime.
 
 ---
 
@@ -186,19 +194,16 @@ Open http://localhost:5173 — create a project, set a goal, and watch agents co
 
 ### Create a Project
 
-Via Web UI or API:
+Define the goal, members, and output requirements in a Desktop Room, then confirm project creation. Room-first HTTP creation requires trusted Desktop mutation credentials, `requestSource: "user"`, Room membership, and source-message provenance. The legacy `/projects` creation endpoint also requires credentials; anonymous curl is not a confirmation bypass.
+
+For standalone development, first inspect service health and project listings:
 
 ```bash
-curl -X POST http://localhost:4400/projects \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "Product Strategy",
-    "goal": "Create a 6-month product strategy with competitive analysis",
-    "requirements": "At least 3 rounds of adversarial review",
-    "poAgent": "cli-claude",
-    "members": ["cli-codex", "79aac2f5-ace"]
-  }'
+curl http://localhost:4400/health
+curl http://localhost:4400/projects
 ```
+
+See the [HTTP routes](src/server/index.js) for request contracts.
 
 ### Project Lifecycle
 
@@ -211,7 +216,8 @@ Created → [Human Approves] → Active → [Tasks Execute] → Delivered → [H
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/projects` | GET | List all projects |
-| `/projects` | POST | Create project |
+| `/projects` | POST | Trusted user project creation |
+| `/projects/room-first` | POST | Create from a confirmed Room and source messages |
 | `/projects/:id` | GET | Project detail (tasks, plan, artifacts) |
 | `/projects/:id/approve` | POST | Approve project (starts execution) |
 | `/projects/:id/retry-plan` | POST | Re-trigger PO planning after an interrupted or stale plan attempt |
@@ -245,14 +251,14 @@ kswarm/
 │   ├── core/
 │   │   ├── hub.js           # State machine + project/task management
 │   │   ├── task-board.js    # Task state machine + transitions
-│   │   ├── persistence.js   # JSON file persistence
+│   │   ├── persistence.js   # SQLite persistence + legacy JSON adapter
 │   │   └── event-log.js     # Event logging
 │   ├── server/
 │   │   └── index.js         # HTTP API + WebSocket server
 │   └── net/
 │       └── broker-client.js  # Intent Broker WebSocket client
 ├── scripts/
-  │   └── auto-worker.js       # PO + Worker agent runtime with run telemetry
+│   └── auto-worker.js       # PO + Worker agent runtime with run telemetry
 ├── web/
 │   └── src/                  # React + Tailwind frontend
 ├── test/                     # Unit + integration tests
@@ -263,8 +269,8 @@ kswarm/
 
 ## Requirements
 
-- Node.js ≥ 18
-- [Intent Broker](https://github.com/nicepkg/intent-broker) running locally
+- Node.js ≥ 22.22.0
+- [Intent Broker](https://github.com/kaisersong/intent-broker) running locally
 - At least one LLM-powered agent (Claude Code, Codex CLI, etc.)
 
 ---

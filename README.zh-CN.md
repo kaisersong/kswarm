@@ -2,25 +2,32 @@
 
 > 你有多个 AI agent，但协调它们比干活本身还难。KSwarm 让你只定义目标，剩下的——规划、派发、质量验收、交付——全部自动完成。你的 agent 变成了一支团队。
 
-基于 [Intent Broker](https://github.com/nicepkg/intent-broker) 的多智能体项目协调系统。定义一个目标，KSwarm 将其分解为分阶段任务，派发给最合适的 agent，审核质量，交付结果。
+基于 [Intent Broker](https://github.com/kaisersong/intent-broker) 的多智能体项目协调系统。定义一个目标，KSwarm 将其分解为分阶段任务，派发给最合适的 agent，审核质量，交付结果。
 
 [English](README.md) | 简体中文
 
 ---
 
-## Xiaok Desktop v1.5.1 集成基线
+## Xiaok Desktop 集成基线
 
-- KSwarm 仍是 Xiaok Desktop v1.5.1 随包发布的项目与工作流控制面。Desktop 负责 Room 交互与用户确认；KSwarm 负责持久化 project state、task state、workflow run、review gate 和交付物元数据。
-- Room-first 创建通过 `/projects/room-first` 提供：创建前校验 Room 成员身份与来源消息，项目事件经持久化 outbox 发出，并保持 Room 与 Project 的事实归属边界。
-- 托管与自运行智能体路由在身份缺失或冲突时默认拒绝；Room membership lease 覆盖派发过程，项目事件可以投影回来源 Room，但 KSwarm 不成为 transcript owner。
-- Pi 已接入受限的一次性 CLI harness 与真实 readiness probe。DeepSeek harness 已接线，但在固定版本的 `dsh --profile headless` 通过真实探针合同前仍标记为不支持。
-- **Workflow 节点现在可以自动接收上游产出**：`enrichWorkflowNodeInput` 通过 `dependsOn` 边收集已完成上游节点的 output 并注入到 dispatched input。Desktop `buildKSwarmWorkflowNodePrompt` 将其渲染为结构化”上游参考”段。所有新逻辑遵循降级优先：任何失败都静默跳过注入（不阻塞 dispatch）。
-- Completion evidence 会进入 Xiaok 的 loop diagnostics。KSwarm project snapshot、task artifact、workflow node output 和 deliverable record 仍是 Desktop 验证”项目已完成且有可检查产物证据”的源数据。
-- Xiaok Desktop v1.5.1 会把已持久化的 workflow 拓扑渲染为带并行组、汇聚节点、run/handoff 元数据和上下游详情的有向 Graph。KSwarm `0.9.3` 的 SQLite durable project state 仍是该视图背后的事实来源，renderer 不自行编造 workflow 状态。
-- 用户 Loop、模型目录更新、MCP 2.0 renderer 插件、AI 录音和 Computer Use 仍由 Desktop / plugin 侧负责，不要求 KSwarm 协议迁移；任务完成、项目交付、workflow 进度和 artifact handoff 继续沿用现有 project/task/workflow snapshot 合同。
-- AI 录音与转写仍由 Desktop 知识库栈负责，不属于 KSwarm 控制面。保存后的纪要可以作为知识库来源参与项目工作，但 KSwarm 不管理麦克风采集、ASR 凭据、本地模型下载、标点恢复或转写总结。
-- 当前随包 sidecar 为 KSwarm `0.9.3`，包含上游 output 传递、suspend/resume 恢复、持久化并行 workflow contract、加固后的 gate/evidence/artifact 治理，以及带认证的 CAS artifact 写入。
-- `desktop-v1.5.1` 的 Desktop release workflow 会 checkout 本仓库匹配的 `desktop-v1.5.1` tag，因此必须先推送可复现快照，再启动 Xiaok release build。
+文档按 **2026-09-07** 的源码核对，KSwarm 包版本为 **0.9.3**。Xiaok Desktop 已发布版本为 **1.5.1**；其 release workflow 固定检出本仓库的 `desktop-v1.5.1` 标签。当前工作区的新增改动不会自动进入已发布安装包。
+
+- **项目事实来源**：KSwarm 持久化 project、task、workflow run、并行组、review gate 和产物元数据；Desktop 展示看板、Graph、任务详情、干预与交付状态。
+- **Room-first 创建**：用户先在协作空间讨论，再通过受信任的确认路径创建项目。`/projects/room-first` 校验凭据、成员和源消息；Xiaok 的 agent 工具只准备提案。
+- **执行与恢复**：任务交给真实 Desktop 或外部 agent runtime，通过 Intent Broker 传递请求和结果；lease、健康检查、休眠恢复和明确的失败状态支持重试。
+- **工作流交接**：下游节点可读取有大小限制的上游摘要和产物引用；检查点、并行组、依赖与交付门禁保存在 KSwarm，前端不推导“完成”。
+- **交付依据**：artifact registry、独立评审、evidence contract、冻结候选产物与带认证的 CAS 写入约束项目交付。文字总结或 broker 投递成功不能替代有效产物。
+- **会话内协作边界**：Xiaok 自动启动的 SubAgent 属于当前会话，不等于创建 KSwarm 项目。提示词、SubAgent 展示、Goal、定时任务、录音和 Computer Use 由 Xiaok 或插件负责。
+
+### 关联项目
+
+| 项目 | 职责与集成 |
+|---|---|
+| [xiaok-cli](https://github.com/kaisersong/xiaok-cli) | CLI 与 Desktop；用户交互、模型执行、工具、知识库、自动化；Desktop 打包并管理 KSwarm sidecar。 |
+| [intent-broker](https://github.com/kaisersong/intent-broker) | participant、presence、持久化协作空间、事件、任务交接和回复投递。 |
+| [kai-xiaok-plugins](https://github.com/kaisersong/kai-xiaok-plugins) | 报告、幻灯片、画布、会议转写回退和 macOS Computer Use 的 skill / MCP 能力。 |
+
+源码构建时四个仓库放在同一父目录。Desktop 会打包 KSwarm 的 `src`、`scripts`、`package.json`、`ws` 依赖以及生成的 worker override；发布前需对齐关联仓库快照，并在 Xiaok 跑 packaging contract。构建步骤见 [Xiaok 中文 README](https://github.com/kaisersong/xiaok-cli/blob/master/README.zh-CN.md#开发)。
 
 ## v0.9.3 新特性：Gate / Evidence / 产物流水线加固
 
@@ -136,7 +143,7 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 - **证据合同** — 本月/最近类调研任务可要求来源证据和当前日期基线，证据不足时不通过验收
 - **正式交付文件** — 最终交付 alias 使用项目/目标生成的文件名，而不是内部 task ID
 - **运行时边界约束** — KSwarm maintenance worker 只处理状态、日志、打包等项目管理工作，用户任务交给真正 agent 执行
-- **持久化** — 项目数据在服务器重启后保留（防抖 JSON 状态文件）
+- **持久化** — 生产状态使用按实体持久化的 SQLite，并支持旧 JSON 迁移；显式 JSON backend 保留给兼容场景和测试
 
 ### Web UI
 
@@ -150,35 +157,36 @@ KSwarm 采用结构化的 **Plan-Do** 模式，不是简单的目标拆解后扔
 
 - **多运行时** — Claude Code、Codex CLI、小K 或任何兼容 broker 的 agent
 - **能力匹配** — 根据 agent 技能分配任务
-- **健康监控** — 检测卡住的任务（10 分钟超时），重新分配或 PO 接管
+- **健康监控** — 结合 runtime probe、心跳和配置的 watchdog 阈值识别停滞任务并触发恢复
 - **并行执行** — 同一阶段内多个 agent 并行工作
 
 ---
 
 ## 快速开始
 
+需要 Node.js ≥ 22.22.0、已运行的 Intent Broker，以及至少一个已配置且能通过健康探测的 agent runtime。以下各段均从 `kswarm` 仓库根目录执行；长期运行的进程使用独立终端。若由 Desktop 管理 sidecar，优先使用 Desktop 服务控制，避免重复启动。
+
+安装依赖并启动 API（默认端口 4400）：
+
 ```bash
-# 前提：intent-broker 在本地运行（端口 4318）
-# cd ~/intent-broker && npm start
-
-cd kswarm
-npm install
-
-# 启动 API 服务（端口 4400）
-node src/server/index.js
-
-# 启动 Web UI（端口 5173）
-cd web && npx vite --port 5173
-
-# 启动 PO agent（负责规划 + 派发 + 验收）
-node scripts/auto-worker.js cli-claude Claude
-
-# （可选）启动更多 worker agent
-node scripts/auto-worker.js cli-codex Codex
-node scripts/auto-worker.js 79aac2f5-ace AQ
+npm ci
+npm run server
 ```
 
-打开 http://localhost:5173 — 创建项目、设定目标，观看 agent 协作。
+在另一终端启动独立 Web UI：
+
+```bash
+npm ci --prefix web
+npm run dev --prefix web -- --port 5173
+```
+
+访问 http://localhost:5173。外部 CLI worker 可通过以下入口启动，参数替换为实际注册的 agent ID 和代号：
+
+```bash
+node scripts/auto-worker.js <agent-id> <alias>
+```
+
+KSwarm 本身不提供模型账号或模型推理；Desktop seed agent 由完整 Desktop runtime 执行。
 
 ---
 
@@ -186,19 +194,16 @@ node scripts/auto-worker.js 79aac2f5-ace AQ
 
 ### 创建项目
 
-通过 Web UI 或 API：
+在 Desktop 协作空间中明确目标、成员和产物要求，确认后创建项目。Room-first HTTP 创建需要受信任的 Desktop mutation 凭据、`requestSource: "user"`、Room 成员和源消息依据；旧 `/projects` 创建接口也要求凭据，不能用匿名 curl 绕过确认。
+
+独立开发时可先只读检查服务与项目列表：
 
 ```bash
-curl -X POST http://localhost:4400/projects \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "产品策略",
-    "goal": "制定6个月的产品策略，含竞争分析",
-    "requirements": "至少3轮对抗性评审",
-    "poAgent": "cli-claude",
-    "members": ["cli-codex", "79aac2f5-ace"]
-  }'
+curl http://localhost:4400/health
+curl http://localhost:4400/projects
 ```
+
+具体请求合同以 [HTTP 路由](src/server/index.js) 为准。
 
 ### 项目生命周期
 
@@ -211,7 +216,8 @@ curl -X POST http://localhost:4400/projects \
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/projects` | GET | 列出所有项目 |
-| `/projects` | POST | 创建项目 |
+| `/projects` | POST | 受信任用户创建项目 |
+| `/projects/room-first` | POST | 从已确认的协作空间与源消息创建项目 |
 | `/projects/:id` | GET | 项目详情（任务、计划、产物） |
 | `/projects/:id/approve` | POST | 审批项目（开始执行） |
 | `/projects/:id/retry-plan` | POST | PO 制定计划中断或过期后重新触发规划 |
@@ -245,7 +251,7 @@ kswarm/
 │   ├── core/
 │   │   ├── hub.js           # 状态机 + 项目/任务管理
 │   │   ├── task-board.js    # 任务状态机 + 转换
-│   │   ├── persistence.js   # JSON 文件持久化
+│   │   ├── persistence.js   # SQLite 持久化 + 旧 JSON adapter
 │   │   └── event-log.js     # 事件日志
 │   ├── server/
 │   │   └── index.js         # HTTP API + WebSocket 服务
@@ -263,8 +269,8 @@ kswarm/
 
 ## 依赖要求
 
-- Node.js ≥ 18
-- [Intent Broker](https://github.com/nicepkg/intent-broker) 在本地运行
+- Node.js ≥ 22.22.0
+- [Intent Broker](https://github.com/kaisersong/intent-broker) 在本地运行
 - 至少一个 LLM 驱动的 agent（Claude Code、Codex CLI 等）
 
 ---
