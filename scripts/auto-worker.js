@@ -906,6 +906,10 @@ const poProjects = new Map(); // projectId → { name, goal, requirements, membe
 
 async function handleIntent(intent) {
   const { kind, taskId, payload } = intent;
+  if(payload?.workspaceContext||payload?.requiredProtocol==='room_workspace_v1'){
+    console.warn(`[${ALIAS}] workspace_runtime_protocol_required: this auto-worker cannot track Room workspace resources; task not executed`);
+    return;
+  }
 
   if (kind === 'assign_po' && payload?.projectId) {
     console.log(`[${ALIAS}] 📋 Assigned as PO for project: ${payload.projectName || payload.projectId}`);

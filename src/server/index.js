@@ -14,6 +14,7 @@ import http from 'node:http';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
+import { recoverProjectsIndependently } from '../core/project-recovery-isolation.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { getCapabilityCatalog } from '../core/capability-catalog.js';
 import { createTeamOperationStore } from '../core/team-operation-store.js';
@@ -104,7 +105,7 @@ const runtimeInstancePool = createRuntimeInstancePool({
 });
 
 // Project workspace base — each project gets its own folder
-const KSWARM_HOME = join(homedir(), '.kswarm');
+const KSWARM_HOME = process.env.KSWARM_DATA_ROOT ? resolve(process.env.KSWARM_DATA_ROOT) : join(homedir(), '.kswarm');
 const PROJECTS_DIR = join(KSWARM_HOME, 'projects');
 mkdirSync(PROJECTS_DIR, { recursive: true });
 const qualityOverlayStore = createQualityOverlayStore(join(KSWARM_HOME, 'quality-overlays.json'));
@@ -139,6 +140,7 @@ function createHubOrExit() {
     return createHub({
       eventLogDir: join(KSWARM_HOME, 'events'),
       silent: false,
+      projectStorageRoot: PROJECTS_DIR,
       // Durable per-entity SQLite backend; migrate the legacy JSON snapshot on
       // first boot. backend is chosen explicitly (never inferred from extension).
       dataDir: {
@@ -153,6 +155,11 @@ function createHubOrExit() {
         getRoomSnapshot: (...args) => brokerClient?.getRoomSnapshot(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
         acquireRoomMembershipLease: (...args) => brokerClient?.acquireRoomMembershipLease(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
         publishRoomProjectEvent: (...args) => brokerClient?.publishRoomProjectEvent(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
+        verifyWorkspaceMappingTicket: (...args) => brokerClient?.verifyWorkspaceMappingTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
+        verifyWorkspaceClaim: (...args) => brokerClient?.verifyWorkspaceClaim(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
+        verifyWorkspaceCommitTicket: (...args) => brokerClient?.verifyWorkspaceCommitTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
+        workspaceMappingApplied: (...args) => brokerClient?.workspaceMappingApplied(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
+        workspaceMappingRejected: (...args) => brokerClient?.workspaceMappingRejected(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
       },
       runtimeInstanceAllocator: {
         getAgentConcurrency: () => getEffectiveAgentConcurrency({
@@ -204,10 +211,16 @@ function initProjectWorkspace(projectId, customPath) {
 
 function getProjectWorkspace(projectId) {
   const project = hub.getProject(projectId);
+  if (project?.requiredProtocol === 'room_workspace_v1') {
+    const mapping=project.workspaceMapping;
+    if (!mapping || mapping.state !== 'active') throw new Error('workspace_mapping_required');
+    return {path:mapping.workFolder,artifacts:mapping.artifactsDir,custom:true};
+  }
   return getProjectWorkspaceRecord(projectWorkspaces, PROJECTS_DIR, projectId, project?.workFolder);
 }
 
 function setProjectWorkspace(projectId, newPath) {
+  if (hub.getProject(projectId)?.requiredProtocol === 'room_workspace_v1') throw new Error('workspace_mapping_ticket_required');
   const ws = setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
   const project = hub.getProject(projectId);
   if (project) {
@@ -334,6 +347,11 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
     if (!task?.assignedAgent) continue;
+    const workspaceAdmission=await hub.authorizeWorkspaceDelivery(projectId,taskId);
+    if (!workspaceAdmission.ok) {
+      log('warn','Workspace delivery rejected',{projectId,taskId,error:workspaceAdmission.error});
+      continue;
+    }
     const route = task.assignedRuntimeInstance
       ? {
           targetParticipantId: task.assignedRuntimeInstance,
@@ -345,7 +363,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
     const targetParticipantId = route.targetParticipantId;
     try {
       const taskRequest = createBrokerTaskRequest({
-        handoffRoot: join(KSWARM_HOME, 'handoff-packages', projectId),
+        handoffRoot: join(PROJECTS_DIR, projectId),
         project,
         workspace: ws,
         task,
@@ -394,7 +412,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
         if (fallbackAgent?.fallbackToDesktopModel === true && targetParticipantId !== XIAOK_DESKTOP_HOST_PARTICIPANT_ID) {
           recordAgentRuntimeFailure(task.assignedAgent, 'runtime_offline', delivery.error || 'delivery_failed');
           const fallbackRequest = createBrokerTaskRequest({
-            handoffRoot: join(KSWARM_HOME, 'handoff-packages', projectId),
+            handoffRoot: join(PROJECTS_DIR, projectId),
             project,
             workspace: ws,
             task,
@@ -1062,10 +1080,12 @@ async function runStartupRecovery({ force = false } = {}) {
   recoveryRunning = true;
   try {
     const onlineAgents = await getOnlineAgentIds();
-    for (const project of hub.listProjects()) {
-      if (project.status !== 'active') continue;
+    await recoverProjectsIndependently({projects:hub.listProjects(),
+      onDeferred:(project,reason)=>log('info','Project recovery deferred to workspace owner',{projectId:project.id,reason}),
+      onError:(project,error)=>log('warn','Project recovery failed',{projectId:project.id,error:String(error?.message||error)}),
+      recoverProject:async(project)=>{
       const board = hub.getBoard(project.id);
-      if (!board) continue;
+      if (!board) return;
       const ws = getProjectWorkspace(project.id);
       const journals = readRunJournals(ws.path);
       const recoveryPlan = planProjectRecovery({
@@ -1074,7 +1094,7 @@ async function runStartupRecovery({ force = false } = {}) {
         journals,
         onlineAgents,
       });
-      if (recoveryPlan.actions.length === 0) continue;
+      if (recoveryPlan.actions.length === 0) return;
 
       log('info', `Startup recovery started for project ${project.id}`, { actions: recoveryPlan.actions.length });
       broadcast({ type: 'project_recovery_started', projectId: project.id, actions: recoveryPlan.actions.length });
@@ -1122,7 +1142,7 @@ async function runStartupRecovery({ force = false } = {}) {
         log('info', `Deferred recovery scheduled for project ${project.id}`, { graceMs: DEFER_RECOVERY_GRACE_MS });
         scheduleStartupRecovery(DEFER_RECOVERY_GRACE_MS);
       }
-    }
+    }});
   } finally {
     recoveryCompletedAt = Date.now();
     recoveryRunning = false;
@@ -1731,7 +1751,28 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES });
+      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, ...hub.getWorkspaceProtocolBaseline() });
+    }
+
+    const workspaceRoute=path.match(/^\/projects\/([^/]+)\/workspace-(mapping|dispatch|result)$/);
+    if (workspaceRoute) {
+      // Also authenticate reads: generic mutationAuthority intentionally permits GET.
+      if (!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token'] !== DESKTOP_MUTATION_TOKEN) return json(res,{ok:false,error:'mutation_credential_required'},401);
+      const projectId=workspaceRoute[1], action=workspaceRoute[2];
+      if (req.method === 'GET' && action === 'mapping') {
+        if(url.searchParams.get('dispatchCandidates')==='true')await refreshBrokerOnlineAgentIds();
+        return json(res,hub.getWorkspaceMapping(projectId,url.searchParams.get('operationId'),url.searchParams.has('logicalAgentId')?url.searchParams.get('logicalAgentId'):undefined,url.searchParams.get('dispatchCandidates')==='true'));
+      }
+      if (req.method !== 'POST') return json(res,{ok:false,error:'method_not_allowed'},405);
+      const context=resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res,{ok:false,error:context.error},context.status);
+      const body=await parseBody(req);
+      if(action==='dispatch')await refreshBrokerOnlineAgentIds();
+      const result=action === 'mapping' ? await hub.applyWorkspaceMapping(projectId,body,context.requestContext)
+        : action === 'dispatch' ? await hub.dispatchWorkspaceTask(projectId,body)
+        : await hub.submitWorkspaceTaskResult(projectId,body);
+      if (result.ok && action === 'dispatch' && (!result.reused||body.redeliver===true)) await sendBrokerRequestTasks(projectId,result.dispatched || []);
+      return json(res,result,result.ok?200:409);
     }
 
     // ── Runtime power control (localhost only) ──
@@ -1807,6 +1848,13 @@ async function handleRequest(req, res) {
           linkedBy: { kind: 'user', userId: 'user.local' },
         }, context.requestContext);
 
+        const workspaceBound=project.requiredProtocol === 'room_workspace_v1' || body.requiredProtocol === 'room_workspace_v1';
+        if (workspaceBound) {
+          project.requiredProtocol='room_workspace_v1';
+          project.workspaceMapping={state:'mapping_required',roomId:project.primaryRoomId,projectId:project.id};
+          hub.persistState();
+          return json(res,{ok:true,project,preparation:{state:'mapping_required'},planningStart:{sent:false,reason:'workspace_mapping_required'}},201);
+        }
         const ws = initProjectWorkspace(project.id, workFolder);
         project.workFolder = ws.path;
         await ensureProjectAgentsStarted(project);

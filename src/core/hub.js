@@ -44,6 +44,7 @@ import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
 import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
+import { validateMappingPayload, validateWorkspaceClaim, workspaceDigest } from './room-workspace.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
 import { planAgentReplacement } from './agent-replacement.js';
 import { applyWorkflowEvent, createWorkflowRun, refreshWorkflowRunState } from './workflow-run.js';
@@ -102,7 +103,7 @@ import { reconcileProjectAgentSelectionWithEffectiveAgents } from './agent-selec
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null, brokerClient = null } = {}) {
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, projectStorageRoot = null, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null, brokerClient = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const workflowRuns = new Map();
@@ -112,6 +113,128 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   const reviewConditions = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const persistence = injectedPersistence || (dataDir ? createPersistence(dataDir) : null);
+  const storageFile = typeof dataDir === 'string' ? dataDir : dataDir?.filePath;
+  const managedProjectRoot = projectStorageRoot || (storageFile ? join(dirname(storageFile), 'projects') : join(tmpdir(), 'kswarm-managed-projects'));
+  const verifiedWorkspaceCalls = new WeakSet();
+
+  async function applyWorkspaceMapping(projectId, request = {}, requestContext = {}) {
+    if (requestContext.requestSource !== 'user') return {ok:false,error:'request_source_denied'};
+    assertPersistenceHealthy();
+    const project=projects.get(projectId);
+    if (!project) return {ok:false,error:'project_not_found'};
+    if (typeof brokerClient?.verifyWorkspaceMappingTicket !== 'function') return {ok:false,error:'workspace_broker_unavailable'};
+    let verified;
+    try {
+      verified=await brokerClient.verifyWorkspaceMappingTicket({roomId:project.primaryRoomId,projectId,ticketId:request.ticketId,operationId:request.operationId,payloadDigest:request.payloadDigest});
+      if (!verified?.ok) return {ok:false,error:verified?.error || verified?.code || 'mapping_ticket_invalid'};
+      const valid=validateMappingPayload(project,request,verified.ticket);
+      if (!valid.ok) return valid;
+    } catch (error) { return {ok:false,error:error?.code || error?.message || 'mapping_ticket_invalid'}; }
+    const existing=project.workspaceMappingOperations?.[request.operationId];
+    if (existing) {
+      if (existing.payloadDigest !== request.payloadDigest || existing.ticketId !== request.ticketId) return {ok:false,error:'mapping_operation_conflict'};
+      await flushWorkspaceMappingReceipt(projectId,existing);
+      return {ok:true,reused:true,mapping:structuredClone(existing.mapping),receipt:structuredClone(existing)};
+    }
+    if (project.projectRevision !== verified.ticket.expectedProjectRevision) {
+      try { await brokerClient?.workspaceMappingRejected?.({roomId:project.primaryRoomId,projectId,ticketId:request.ticketId,operationId:request.operationId,payloadDigest:request.payloadDigest}); } catch { /* Caller may repeat the authoritative rejection. */ }
+      return {ok:false,error:'stale_project_revision'};
+    }
+    const mapping={...structuredClone(request.payload),mappingRevision:(project.workspaceMapping?.mappingRevision || 0)+1,state:'active',operationId:request.operationId};
+    mapping.directoryIdentities=Object.fromEntries(['workFolder','artifactsDir'].map(key=>{const info=statSync(mapping[key]);return [key,{dev:info.dev,ino:info.ino}];}));
+    const receipt={ticketId:request.ticketId,operationId:request.operationId,projectId,roomId:project.primaryRoomId,payloadDigest:request.payloadDigest,mappingRevision:mapping.mappingRevision,mapping,status:'pending'};
+    // No await between the CAS check and the durable write. All callers share Hub.
+    const prior=structuredClone(project);
+    project.workspaceMapping=mapping;
+    project.workspaceMappingOperations={...project.workspaceMappingOperations,[request.operationId]:receipt};
+    project.workFolder=mapping.workFolder;project.artifactsDir=mapping.artifactsDir;
+    project.requiredProtocol='room_workspace_v1';project.projectRevision+=1;
+    try { persistState({type:'project',projectId}); } catch(error) { projects.set(projectId,prior);throw error; }
+    await flushWorkspaceMappingReceipt(projectId,receipt);
+    return {ok:true,mapping:structuredClone(mapping),receipt:structuredClone(receipt)};
+  }
+
+  async function flushWorkspaceMappingReceipt(projectId, receipt) {
+    if (receipt.status === 'applied') return;
+    try {
+      const result=await brokerClient?.workspaceMappingApplied?.({roomId:receipt.roomId,ticketId:receipt.ticketId,operationId:receipt.operationId,projectId,payloadDigest:receipt.payloadDigest,mappingRevision:receipt.mappingRevision});
+      if (result?.ok) { receipt.status='applied';persistState({type:'project',projectId}); }
+    } catch { /* Durable pending receipt is retried by the same operation. */ }
+  }
+
+  function getWorkspaceMapping(projectId, operationId, logicalAgentId, includeDispatchCandidates=false) {
+    const p=projects.get(projectId);
+    if (!p) return {ok:false,error:'project_not_found'};
+    if(logicalAgentId!==undefined && (!normalizeAgentId(logicalAgentId)||![p.poAgent,...(p.members||[])].map(normalizeAgentId).includes(normalizeAgentId(logicalAgentId))))return {ok:false,error:'project_membership_required'};
+    return {ok:true,mapping:structuredClone(p.workspaceMapping || null),receipt:structuredClone(p.workspaceMappingOperations?.[operationId] || null),
+      ...(logicalAgentId===undefined&&!includeDispatchCandidates?{}:{project:structuredClone(p),tasks:structuredClone(boards.get(projectId)?.getAllTasks()||[])}),
+      ...(includeDispatchCandidates?{dispatchCandidates:structuredClone(getDispatchPlan(projectId)?.dispatchedTasks||[])}:{})};
+  }
+
+  async function verifyWorkspaceTask(projectId, input) {
+    const project=projects.get(projectId), task=boards.get(projectId)?.getTask(input.taskId);
+    if (!project || !task) return {ok:false,error:'task_not_found'};
+    if (!input.claimId || typeof brokerClient?.verifyWorkspaceClaim !== 'function') return {ok:false,error:'workspace_claim_required'};
+    let response;
+    try { response=await brokerClient.verifyWorkspaceClaim({roomId:project.primaryRoomId,projectId,claimId:input.claimId,mappingRevision:project.workspaceMapping?.mappingRevision}); }
+    catch { return {ok:false,error:'workspace_broker_unavailable'}; }
+    const valid=validateWorkspaceClaim(project,response,task.id);
+    if (!valid.ok) return valid;
+    if (valid.claim.claimId !== input.claimId) return {ok:false,error:'workspace_claim_mismatch'};
+    return {...valid,project,task};
+  }
+
+  async function authorizeWorkspaceDelivery(projectId,taskId) {
+    const project=projects.get(projectId),task=boards.get(projectId)?.getTask(taskId);
+    if (project?.requiredProtocol !== 'room_workspace_v1') return {ok:true};
+    const checked=await verifyWorkspaceTask(projectId,{taskId,claimId:task?.workspaceContext?.claimId});
+    if (!checked.ok) return checked;
+    return checked.claim.runId === task.activeRunId ? {ok:true} : {ok:false,error:'workspace_run_mismatch'};
+  }
+
+  async function dispatchWorkspaceTask(projectId, input = {}) {
+    assertPersistenceHealthy();
+    const checked=await verifyWorkspaceTask(projectId,input);
+    if (!checked.ok) return checked;
+    const {project,task,claim}=checked;
+    if (selectTaskExecutionStrategy({project,task}).strategy === 'workflow') return {ok:false,error:'workspace_workflow_protocol_required'};
+    if (task.activeRunId === claim.runId && task.workspaceContext?.claimId === claim.claimId) return {ok:true,reused:true,dispatched:[task.id]};
+    if (task.activeRunId) return {ok:false,error:'workspace_task_already_running'};
+    const options={onlyTaskIds:[task.id],workspaceContext:structuredClone(claim)};
+    verifiedWorkspaceCalls.add(options);
+    try {
+      const result=handleRequestDispatch(projectId,project.poAgent,options);
+      persistState({type:'project',projectId});
+      return result;
+    } finally { verifiedWorkspaceCalls.delete(options); }
+  }
+
+  async function submitWorkspaceTaskResult(projectId,input={}) {
+    assertPersistenceHealthy();
+    const project=projects.get(projectId),task=boards.get(projectId)?.getTask(input.taskId),claim=task?.workspaceContext;
+    if (!project || !task || !claim || claim.claimId !== input.claimId) return {ok:false,error:'workspace_run_mismatch'};
+    if (!input.ticketId || !input.submissionId || typeof brokerClient?.verifyWorkspaceCommitTicket !== 'function') return {ok:false,error:'workspace_commit_ticket_required'};
+    const payload={projectId,taskId:task.id,claimId:claim.claimId,runId:claim.runId,result:input.result};
+    let digest,verified;
+    try {
+      digest=workspaceDigest('project-result',payload);
+      if (digest !== input.payloadDigest) return {ok:false,error:'workspace_result_digest_mismatch'};
+      verified=await brokerClient.verifyWorkspaceCommitTicket({roomId:project.primaryRoomId,projectId,claimId:claim.claimId,ticketId:input.ticketId,submissionId:input.submissionId,payloadDigest:digest});
+    } catch { return {ok:false,error:'workspace_ticket_unavailable'}; }
+    const ticket=verified?.ticket;
+    if (!verified?.ok || ticket?.ticketId !== input.ticketId || ticket.payloadDigest !== digest || ticket.subject?.claimId !== claim.claimId
+      || ticket.contextScope?.kind !== 'project' || ticket.contextScope.projectId !== projectId) return {ok:false,error:'workspace_ticket_mismatch'};
+    const prior=project.workspaceResultOperations?.[input.ticketId];
+    if (prior) return prior.payloadDigest === digest ? {ok:true,reused:true} : {ok:false,error:'workspace_result_conflict'};
+    if (task.activeRunId !== claim.runId || project.workspaceMapping?.mappingRevision !== claim.mappingRevision) return {ok:false,error:'workspace_run_mismatch'};
+    const result={...input.result,workspacePath:project.workspaceMapping.workFolder,workFolder:project.workspaceMapping.workFolder};
+    verifiedWorkspaceCalls.add(result);
+    try {
+      const submitted=handleSubmitResult(projectId,task.id,result,task.assignedAgent,claim.runId);
+      if (submitted.ok) project.workspaceResultOperations={...project.workspaceResultOperations,[input.ticketId]:{payloadDigest:digest,submissionId:input.submissionId,claimId:claim.claimId,runId:claim.runId}};
+      persistState({type:'project',projectId});return submitted;
+    } finally { verifiedWorkspaceCalls.delete(result); }
+  }
 
   // Human action log — tracks all human decisions. Append-only + durable per-row.
   const humanActions = [];
@@ -123,6 +246,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     const saved = persistence.load();
     if (saved && saved.projects) {
       for (const p of saved.projects) {
+        if (p.requiredProtocol && p.requiredProtocol !== 'room_workspace_v1') {
+          persistence.close?.();
+          throw new Error(`workspace_protocol_unsupported:${p.requiredProtocol}`);
+        }
         const project = normalizeRecoveredProject(p);
         projects.set(project.id, project);
       }
@@ -168,6 +295,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       reviewConditions: [...reviewConditions.values()],
       humanActions,
     };
+  }
+
+  function getWorkspaceProtocolBaseline() {
+    return {protocols:{room_workspace_v1:{contextVersion:1,resultVersion:1,releaseVersion:1}},workspaceBaseline:{requiredProtocols:[...new Set([...projects.values()].map(p=>p.requiredProtocol).filter(Boolean))]}};
   }
 
   // Scoped persistence accessor: materialize only the entities affected by a
@@ -542,7 +673,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       }
     }
 
-    return { primaryRoomId };
+    return { primaryRoomId, requiredProtocol:snapshot.requiredProtocol || snapshot.room?.requiredProtocol || null };
   }
 
   function createProject(input = {}, mutationCtx = undefined) {
@@ -569,8 +700,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
         const reusable = findReusableProjectForCreateRequest({ clientRequestKey: normalizedKey });
         if (reusable) return Promise.resolve(reusable);
       }
-      return validateRoomFirstCreate(input, mutationCtx).then(({ primaryRoomId: resolvedRoomId }) =>
-        createProjectValidated(input, mutationCtx, resolvedRoomId));
+      return validateRoomFirstCreate(input, mutationCtx).then(({ primaryRoomId: resolvedRoomId,requiredProtocol }) =>
+        createProjectValidated({...input,requiredProtocol,autoAssignPo:requiredProtocol ? false : input.autoAssignPo}, mutationCtx, resolvedRoomId));
     }
     return createProjectValidated(input, mutationCtx, null);
   }
@@ -628,6 +759,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       projectRevision: 1,
       teamPlan: null,
       primaryRoomId: resolvedRoomId,
+      ...(input.requiredProtocol === 'room_workspace_v1' ? {requiredProtocol:'room_workspace_v1',workspaceMapping:{state:'mapping_required',roomId:resolvedRoomId,projectId:id}} : {}),
       // Gate 收敛设计 v8（design §3.3, §8.2）：
       // dependencyPolicies 按 taskId 索引 DependencyPolicy（'completed' | 'completed_for_remediation' | 'verified_pass'）。
       // gateEvaluations 按 taskId 索引 GateEvaluationV1[]（service-owned，只能从磁盘证据派生，不接受 mutation API 写入）。
@@ -1365,6 +1497,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   function handleRequestDispatch(projectId, fromAgent, options = {}) {
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
+    if (project.requiredProtocol === 'room_workspace_v1' && !verifiedWorkspaceCalls.has(options)) return {ok:false,error:'workspace_claim_required'};
     if (project.status !== 'active') return { ok: false, error: 'project_not_active' };
     if (project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
 
@@ -1480,7 +1613,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
         continue;
       }
       let assignedRuntimeInstance = task.assignedRuntimeInstance || null;
-      if (typeof runtimeInstanceAllocator?.reserveWorkerInstance === 'function') {
+      if (!options.workspaceContext && typeof runtimeInstanceAllocator?.reserveWorkerInstance === 'function') {
         const reservation = runtimeInstanceAllocator.reserveWorkerInstance({ project, task });
         if (reservation?.ok) {
           assignedRuntimeInstance = reservation.instanceId || null;
@@ -1498,10 +1631,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
         assignedExecutor: null,
         assignedRuntimeInstance,
         selectedRoute: task.selectedRoute || null,
+        ...(options.workspaceContext ? {runId:options.workspaceContext.runId} : {}),
       });
       if (!result.ok) continue;
       const storedTask = board.getTask(task.id);
       if (storedTask) {
+        if (options.workspaceContext) storedTask.workspaceContext=structuredClone(options.workspaceContext);
         storedTask.execution = buildTaskExecutionMetadata(executionSelection, {
           workflowRunId: null,
           selectedAt: Date.now(),
@@ -1511,9 +1646,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
       if (bridge) {
         const targetParticipantId = assignedRuntimeInstance || task.assignedAgent;
         const handoff = createTaskHandoffPackage({
-          projectRoot: project.workFolder || project.workspacePath || (dataDir ? join(dirname(dataDir), 'handoffs', projectId) : join(tmpdir(), 'kswarm-handoffs', projectId)),
+          projectRoot: join(managedProjectRoot, projectId),
           project,
-          task,
+          task: storedTask || task,
           runId: result.runId,
           targetParticipantId,
         });
@@ -1529,6 +1664,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
           attempt: task.attempt || 1,
           projectName: project.name, targetParticipantId,
           handoffPath: handoff.handoffPath,
+          ...(options.workspaceContext?{requiredProtocol:'room_workspace_v1',workspaceContext:structuredClone(options.workspaceContext)}:{}),
         });
       }
 
@@ -1676,6 +1812,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   }
 
   function handleRework(projectId, taskId, reason, fromAgent) {
+    if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_claim_required'};
     const project = projects.get(projectId);
     if (!project || project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
 
@@ -2422,6 +2559,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   }
 
   function handleSubmitResult(projectId, taskId, result, workerAgent, runId) {
+    if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1' && !verifiedWorkspaceCalls.has(result)) return {ok:false,error:'workspace_claim_required'};
     result = stripReservedTaskResultFields(result, { projectId, taskId, source: 'handleSubmitResult' });
     const board = boards.get(projectId);
     if (!board) return { ok: false, error: 'project_not_found' };
@@ -2706,6 +2844,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   }
 
   function handleRecoverSubmission(projectId, taskId, result, fromAgent, meta = {}) {
+    if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_claim_required'};
     result = stripReservedTaskResultFields(result, { projectId, taskId, source: 'handleRecoverSubmission' });
     const board = boards.get(projectId);
     if (!board) return { ok: false, error: 'project_not_found' };
@@ -2749,6 +2888,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   }
 
   function handleResumeTaskForRecovery(projectId, taskId, { leaseTimeoutMs = 600_000 } = {}) {
+    if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_claim_required'};
     const board = boards.get(projectId);
     if (!board) return { ok: false, error: 'project_not_found' };
     const task = board.getTask(taskId);
@@ -2781,7 +2921,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
 
   function handleResumeSuspendedRuns({ sleptMs = 0, leaseTimeoutMs = 600_000 } = {}) {
     let resumed = 0;
-    for (const board of boards.values()) {
+    for (const [projectId,board] of boards.entries()) {
+      if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') continue;
       for (const task of board.getAllTasks()) {
         if (!task.suspendedAt) continue;
         const result = board.refreshLeaseForResume(task.id, { leaseTimeoutMs });
@@ -3539,6 +3680,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
     const project = projects.get(proposal.projectId);
     const board = boards.get(proposal.projectId);
     if (!project || !board) return { ok: false, error: 'project_not_found' };
+    if (project.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_workflow_protocol_required'};
     const sourceTask = resolveWorkflowSourceTask(board, proposal.scope?.taskId || taskId || null);
     if (!sourceTask.ok) return sourceTask;
 
@@ -3849,6 +3991,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    if (projects.get(workflowRun.projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_workflow_protocol_required'};
     if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
     if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
     if (!readWorkflowString(phaseTitle)) return { ok: false, error: 'workflow_script_phase_required' };
@@ -5981,6 +6124,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, persis
   return {
     ...persisted,
     getProject,
+    getWorkspaceProtocolBaseline,
+    applyWorkspaceMapping,
+    getWorkspaceMapping,
+    dispatchWorkspaceTask,
+    submitWorkspaceTaskResult,
+    authorizeWorkspaceDelivery,
     getBoard,
     getEventLog,
     listProjects,

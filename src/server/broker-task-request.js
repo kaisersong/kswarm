@@ -12,6 +12,7 @@ export function createBrokerTaskRequest({
   if (!project?.id) return { ok: false, error: 'project_required' };
   if (!task?.id) return { ok: false, error: 'task_required' };
   if (!task.activeRunId) return { ok: false, error: 'run_id_required' };
+  if (project.requiredProtocol === 'room_workspace_v1' && (!task.workspaceContext || task.workspaceContext.runId !== task.activeRunId)) return {ok:false,error:'workspace_claim_required'};
 
   const handoff = createTaskHandoffPackage({
     projectRoot: handoffRoot,
@@ -44,6 +45,7 @@ export function createBrokerTaskRequest({
         workFolder: workspace?.path || project.workFolder || '',
         handoffPath: handoff.handoffPath,
         handoffKind: 'kswarm_task_handoff_v1',
+        ...(task.workspaceContext ? {workspaceContext:structuredClone(task.workspaceContext),requiredProtocol:'room_workspace_v1'} : {}),
         ...(targetParticipantId && targetParticipantId !== targetAgent ? { targetAgentId: targetAgent } : {}),
       },
     },

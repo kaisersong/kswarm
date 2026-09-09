@@ -19,6 +19,8 @@
     "dev": "node src/server/index.js & cd web && npx vite --port 5188",
     "verify": "node src/cli/index.js verify",
     "test": "node test/scenarios-v2.test.js",
+    "test:workspace": "node --test test/room-workspace-mapping.test.js test/room-workspace-broker-client.test.js test/broker-task-request.test.js test/project-recovery-isolation.test.js && node test/handoff-package.test.js",
+    "test:workspace-integration": "node --test test/room-workspace-cross-repo.test.js",
     "test:persistence": "node test/runtime-guard.test.js && node test/persistence.test.js && node test/persistence-hub.test.js",
     "test:persistence-perf": "node test/persistence-performance.test.js",
     "test:matcher": "node test/task-matcher.test.js",

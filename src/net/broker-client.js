@@ -180,6 +180,10 @@ export function createBrokerClient({
     });
   }
 
+  function workspaceRequest(action, input) {
+    return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/workspace/${action}`, {method:'POST',body:input});
+  }
+
   return {
     register,
     connect,
@@ -190,6 +194,11 @@ export function createBrokerClient({
     getRoomSnapshot,
     acquireRoomMembershipLease,
     publishRoomProjectEvent,
+    verifyWorkspaceMappingTicket: input => workspaceRequest('verify-mapping-ticket',input),
+    verifyWorkspaceClaim: input => workspaceRequest('verify-claim',input),
+    verifyWorkspaceCommitTicket: input => workspaceRequest('verify-commit-ticket',input),
+    workspaceMappingApplied: input => workspaceRequest('mapping-applied',input),
+    workspaceMappingRejected: input => workspaceRequest('mapping-rejected',input),
     httpPost,
     httpGet,
     isConnected: () => connected,

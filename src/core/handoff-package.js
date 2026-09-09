@@ -13,6 +13,7 @@ export function createTaskHandoffPackage({
   if (!project?.id) return { ok: false, error: 'project_required' };
   if (!task?.id) return { ok: false, error: 'task_required' };
   if (!runId) return { ok: false, error: 'run_id_required' };
+  if (!/^[a-zA-Z0-9_.-]+$/.test(runId) || runId === '.' || runId === '..') return {ok:false,error:'run_id_invalid'};
 
   const handoffDir = join(projectRoot, 'handoffs', runId);
   mkdirSync(handoffDir, { recursive: true });
@@ -44,8 +45,9 @@ export function createTaskHandoffPackage({
     },
     contextPolicy: {
       largeContent: 'file_reference_only',
-      resultManifest: 'result.json',
+      resultManifest: join(handoffDir, 'result.json'),
     },
+    ...(task.workspaceContext ? {workspaceContext:structuredClone(task.workspaceContext)} : {}),
   };
   writeFileSync(handoffPath, JSON.stringify(handoff, null, 2), 'utf-8');
   return { ok: true, handoffPath, handoff };
