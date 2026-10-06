@@ -7,6 +7,7 @@ export function planStalledRunActions({
   heartbeatTimeoutMs = 300_000,
   noOutputWarningMs = 180_000,
   maxRunMs = 1_200_000,
+  maxQueueMs = 3_600_000,
   systemSuspended = false,
 } = {}) {
   const actions = [];
@@ -22,7 +23,9 @@ export function planStalledRunActions({
 
     const lease = task.runLease || {};
     const telemetry = task.runTelemetry || {};
-    const startedAt = telemetry.startedAt || lease.createdAt || task.updatedAt || task.createdAt || now;
+    const queued = task.status === 'accepted' && telemetry.executionState === 'queued';
+    const queuedAt = lease.createdAt || task.createdAt || now;
+    const startedAt = task.startedAt || lease.startedAt || telemetry.startedAt || queuedAt;
     const lastHeartbeatAt = telemetry.lastHeartbeatAt || lease.lastHeartbeatAt || startedAt;
     const lastOutputAt = latestTimestamp(
       telemetry.lastStdoutAt,
@@ -42,14 +45,16 @@ export function planStalledRunActions({
     };
 
     const missingHeartbeat = now - lastHeartbeatAt >= heartbeatTimeoutMs;
-    const exceededMaxRun = now - startedAt >= maxRunMs;
-    if (missingHeartbeat || exceededMaxRun) {
-      const reason = exceededMaxRun ? 'max_run_time' : 'heartbeat_timeout';
+    const exceededQueue = queued && now - queuedAt >= maxQueueMs;
+    const exceededMaxRun = !queued && now - startedAt >= maxRunMs;
+    if (missingHeartbeat || exceededMaxRun || exceededQueue) {
+      const reason = exceededQueue ? 'queue_timeout' : exceededMaxRun ? 'max_run_time' : 'heartbeat_timeout';
       actions.push({ ...base, type: 'mark_runtime_stalled', reason });
       actions.push({ ...base, type: 'request_cancel_run', reason });
       continue;
     }
 
+    if (queued) continue;
     const reference = lastOutputAt || startedAt;
     if (now - reference >= noOutputWarningMs) {
       actions.push({ ...base, type: 'stalled_warning', reason: 'no_output' });

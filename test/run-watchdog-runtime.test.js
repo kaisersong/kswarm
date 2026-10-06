@@ -12,6 +12,23 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 const now = 1779050000000;
 
+test('accepted queued work keeps heartbeat protection but excludes execution time', () => {
+  const task = { id: 'q', status: 'accepted', activeRunId: 'r',
+    runLease: { createdAt: now - 1_800_000, lastHeartbeatAt: now },
+    runTelemetry: { executionState: 'queued', lastHeartbeatAt: now } };
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.type === 'mark_runtime_stalled'), false);
+  assert.equal(planStalledRunActions({ tasks: [task], now: now + 3_600_000 }).some(a => a.reason === 'queue_timeout'), true);
+  assert.equal(planStalledRunActions({ tasks: [task], now: now + 300_001 }).some(a => a.reason === 'heartbeat_timeout'), true);
+});
+test('actual server start excludes queue time and cannot be reset by queued telemetry', () => {
+  const task = { id: 'q', status: 'in_progress', activeRunId: 'r', startedAt: now - 60_000,
+    runLease: { createdAt: now - 1_800_000, lastHeartbeatAt: now },
+    runTelemetry: { executionState: 'queued', startedAt: now + 99_000_000, lastHeartbeatAt: now } };
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.type === 'mark_runtime_stalled'), false);
+  task.startedAt = now - 1_200_001;
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.reason === 'max_run_time'), true);
+});
+
 test('missing heartbeat past threshold marks runtime stalled and requests cancel', () => {
   const actions = planStalledRunActions({
     projectId: 'proj',
