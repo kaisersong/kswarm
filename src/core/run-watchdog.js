@@ -7,6 +7,7 @@ export function planStalledRunActions({
   heartbeatTimeoutMs = 300_000,
   noOutputWarningMs = 180_000,
   maxRunMs = 1_200_000,
+  maxResearchRunMs = 3_600_000,
   maxQueueMs = 3_600_000,
   systemSuspended = false,
 } = {}) {
@@ -46,7 +47,11 @@ export function planStalledRunActions({
 
     const missingHeartbeat = now - lastHeartbeatAt >= heartbeatTimeoutMs;
     const exceededQueue = queued && now - queuedAt >= maxQueueMs;
-    const exceededMaxRun = !queued && now - startedAt >= maxRunMs;
+    const externalResearch = task.evidenceContract?.version === 1
+      && task.evidenceContract.kind === 'external_source_v1'
+      && task.evidenceContract.required === true;
+    const runBudget = externalResearch ? maxResearchRunMs : maxRunMs;
+    const exceededMaxRun = !queued && now - startedAt >= runBudget;
     if (missingHeartbeat || exceededMaxRun || exceededQueue) {
       const reason = exceededQueue ? 'queue_timeout' : exceededMaxRun ? 'max_run_time' : 'heartbeat_timeout';
       actions.push({ ...base, type: 'mark_runtime_stalled', reason });

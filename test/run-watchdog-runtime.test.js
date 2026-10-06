@@ -12,6 +12,17 @@ function test(name, fn) { tests.push({ name, fn }); }
 
 const now = 1779050000000;
 
+test('canonical external research has a bounded hour without trusting telemetry', () => {
+  const task = { id: 'research', status: 'in_progress', activeRunId: 'r', startedAt: now - 1_800_000,
+    runLease: { createdAt: now - 1_800_000, lastHeartbeatAt: now },
+    runTelemetry: { executionState: 'running', lastHeartbeatAt: now, research: true } };
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.reason === 'max_run_time'), true);
+  task.evidenceContract = { version: 1, kind: 'external_source_v1', required: true };
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.type === 'mark_runtime_stalled'), false);
+  task.startedAt = now - 3_600_001;
+  assert.equal(planStalledRunActions({ tasks: [task], now }).some(a => a.reason === 'max_run_time'), true);
+});
+
 test('accepted queued work keeps heartbeat protection but excludes execution time', () => {
   const task = { id: 'q', status: 'accepted', activeRunId: 'r',
     runLease: { createdAt: now - 1_800_000, lastHeartbeatAt: now },
