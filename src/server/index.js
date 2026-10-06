@@ -26,7 +26,7 @@ import { homedir } from 'node:os';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
 import { createHeartbeatManager } from '../core/heartbeat-manager.js';
-import { aggregateDelivery, buildUserFacingDeliveryFiles, selectUserFacingDeliveryTask } from '../core/delivery.js';
+import { aggregateDelivery, buildUserFacingDeliveryFiles, selectUserFacingDeliveryTask, selectUserFacingDeliveryArtifact } from '../core/delivery.js';
 import { ensureProjectSummarySection, extractSummaryScore, extractSummarySection, extractTaskScores } from '../core/summary-parser.js';
 import { createWatchdog } from '../core/watchdog.js';
 import { parseTaskId } from '../core/task-identity.js';
@@ -277,6 +277,7 @@ function enrichProjectTaskArtifacts(projectId, tasks) {
         artifacts: artifacts.map(artifact => enrichArtifactRecordFromFile({
           artifact,
           artifactsDir: ws.artifacts,
+          projectId,
           getPreviewable,
           mimeTypes: MIME_TYPES,
         })),
@@ -2915,7 +2916,14 @@ async function handleRequest(req, res) {
       // evaluatePreApprovalPrerequisites 安全检查会因为 candidate 缺少
       // taskId/workflowRunId 关联而以 final_deliverable_review_required 拒绝批准。
       const finalTaskForDeliverable = selectUserFacingDeliveryTask(tasksBeforeDelivery);
-      const result = hub.handleDeliver(projectId, { synthesis: true }, fromAgent, {
+      const finalArtifact = selectUserFacingDeliveryArtifact(finalTaskForDeliverable || {});
+      const artifactRef = finalArtifact ? enrichArtifactRecordFromFile({
+        artifact: finalArtifact, artifactsDir: ws.artifacts, projectId, getPreviewable, mimeTypes: MIME_TYPES,
+      }) : null;
+      if (finalTaskForDeliverable?.requiredOutputs?.length > 0 && !artifactRef?.path) {
+        return json(res, { ok: false, error: 'final_task_artifact_unavailable' }, 409);
+      }
+      const result = hub.handleDeliver(projectId, { synthesis: true, ...(artifactRef ? { artifactRef } : {}) }, fromAgent, {
         ...(finalTaskForDeliverable?.id ? { taskId: finalTaskForDeliverable.id } : {}),
       });
       // design §8.2（handleDeliver 项 / cli/verify.js + server route caller）：
@@ -3446,16 +3454,9 @@ async function handleRequest(req, res) {
     const deliveryFileMatch = path.match(/^\/projects\/([^/]+)\/delivery\/(.+)$/);
     if (deliveryFileMatch && req.method === 'GET') {
       const ws = getProjectWorkspace(deliveryFileMatch[1]);
-      let filename;
-      try {
-        filename = decodeURIComponent(deliveryFileMatch[2]);
-      } catch {
-        return json(res, { error: 'invalid_filename' }, 400);
-      }
-      if (!filename || filename.includes('\0') || filename.includes('/') || filename.includes('\\')) {
-        return json(res, { error: 'invalid_filename' }, 400);
-      }
-      const filePath = join(ws.path, 'delivery', filename);
+      const resolved = resolveArtifactPath(join(ws.path, 'delivery'), deliveryFileMatch[2], { allowNested: true });
+      if (resolved.error) return json(res, { error: resolved.error }, 400);
+      const { filePath, artifactPath: filename } = resolved;
       if (!existsSync(filePath)) return json(res, { error: 'not_found' }, 404);
 
       const ext = extname(filename);

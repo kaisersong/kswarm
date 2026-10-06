@@ -1,5 +1,7 @@
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { basename, extname, join, sep } from 'node:path';
+import { listArtifactFilesRecursive } from '../core/artifact-files.js';
+import { resolveArtifactPath } from './artifact-path-resolver.js';
+import { existsSync, statSync } from 'node:fs';
+import { extname, join, sep, relative, isAbsolute, win32 } from 'node:path';
 
 export function createArtifactRecord({
   filename,
@@ -53,45 +55,48 @@ export function listArtifactRecords({ artifactsDir, projectId, getPreviewable, m
  * 不做 containment 校验——输入是已经受信的本地 artifactsDir 根，遍历只读，
  * 不涉及用户可控路径拼接；写入路径的 containment 由 resolveArtifactPath 负责。
  */
-function listArtifactFilesRecursive(rootDir, relativeDir = '') {
-  const currentDir = relativeDir ? join(rootDir, relativeDir) : rootDir;
-  const entries = readdirSync(currentDir, { withFileTypes: true });
-  const results = [];
-  for (const entry of entries) {
-    const entryRelativePath = relativeDir ? join(relativeDir, entry.name) : entry.name;
-    if (entry.isDirectory()) {
-      results.push(...listArtifactFilesRecursive(rootDir, entryRelativePath));
-    } else if (entry.isFile()) {
-      results.push(entryRelativePath.split(sep).join('/'));
-    }
-  }
-  return results;
-}
 
 function encodeArtifactRelativePath(relativePath) {
   return relativePath.split('/').map(part => encodeURIComponent(part)).join('/');
 }
 
-export function enrichArtifactRecordFromFile({ artifact, artifactsDir, getPreviewable, mimeTypes }) {
+export function enrichArtifactRecordFromFile({ artifact, artifactsDir, projectId, getPreviewable, mimeTypes }) {
   if (!artifact || typeof artifact !== 'object') return artifact;
-  const filename = artifactFilename(artifact);
-  if (!filename) return artifact;
-  const filePath = join(artifactsDir, filename);
-  if (!existsSync(filePath)) return artifact;
-
+  let candidate;
+  let encoded = false;
+  if (artifact.path || artifact.relativePath) {
+    const value = String(artifact.path || artifact.relativePath);
+    if (isAbsolute(value)) candidate = relative(artifactsDir, value).split(sep).join('/');
+    else if (win32.isAbsolute(value)) return artifact;
+    else candidate = value.replace(/\\/g, '/').replace(/^artifacts\//, '');
+  } else if (artifact.filename || artifact.name) candidate = String(artifact.filename || artifact.name);
+  else if (artifact.url) {
+    if (!projectId || !String(artifact.url).startsWith(`/projects/${projectId}/artifacts/`)) return artifact;
+    candidate = String(artifact.url).split(/[?#]/, 1)[0].split('/artifacts/')[1];
+    encoded = true;
+  }
+  if (!candidate) return artifact;
+  const rawPath = encoded ? candidate : candidate.split('/').map(encodeURIComponent).join('/');
+  const resolved = resolveArtifactPath(artifactsDir, rawPath, { allowNested: true });
+  if (resolved.error || !existsSync(resolved.filePath)) return artifact;
+  const filePath = resolved.filePath;
+  const filename = resolved.artifactPath;
   const stat = statSync(filePath);
+  if (!stat.isFile()) return artifact;
+
   const ext = extname(filename);
   const generatedAt = stat.mtimeMs;
   return {
     ...artifact,
-    filename: artifact.filename || filename,
-    path: artifact.path || filePath,
+    filename,
+    path: filePath,
     previewable: artifact.previewable ?? getPreviewable(ext),
     mimeType: artifact.mimeType || mimeTypes[ext] || 'application/octet-stream',
-    createdAt: artifact.createdAt ?? generatedAt,
-    updatedAt: artifact.updatedAt ?? generatedAt,
-    generatedAt: artifact.generatedAt ?? generatedAt,
-    size: artifact.size ?? stat.size,
+    ...(projectId ? { url: `/projects/${projectId}/artifacts/${encodeArtifactRelativePath(filename)}` } : {}),
+    createdAt: generatedAt,
+    updatedAt: generatedAt,
+    generatedAt,
+    size: stat.size,
   };
 }
 
@@ -104,12 +109,4 @@ function normalizeTime(value) {
     if (Number.isFinite(parsed)) return parsed;
   }
   return null;
-}
-
-function artifactFilename(artifact) {
-  const value = artifact.filename || artifact.name || artifact.relativePath || artifact.path || artifact.url || '';
-  if (!value) return '';
-  const withoutQuery = String(value).split(/[?#]/, 1)[0] || '';
-  const name = basename(withoutQuery);
-  return name === '.' || name === '..' ? '' : name;
 }

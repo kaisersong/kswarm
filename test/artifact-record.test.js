@@ -3,6 +3,23 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+
+test('enrichment keeps explicit nested identity and never falls back to an unrelated basename', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kswarm-nested-identity-'));
+  try {
+    mkdirSync(join(dir, 'run-a'));
+    writeFileSync(join(dir, 'evidence.json'), 'old');
+    const path = join(dir, 'run-a', 'evidence.json');
+    writeFileSync(path, '{"new":"actual nested bytes"}');
+    const options = { artifactsDir: dir, getPreviewable: () => true, mimeTypes: { '.json': 'application/json' } };
+    const record = enrichArtifactRecordFromFile({ ...options, artifact: { path, filename: 'evidence.json', size: 3, updatedAt: 0 } });
+    assert.equal(record.filename, 'run-a/evidence.json');
+    assert.equal(record.size, statSync(path).size);
+    assert.equal(record.updatedAt, statSync(path).mtimeMs);
+    const outside = { path: join(dir, '..', 'evidence.json'), filename: 'evidence.json' };
+    assert.deepEqual(enrichArtifactRecordFromFile({ ...options, artifact: outside }), outside);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 import {
   createArtifactRecord,
   enrichArtifactRecordFromFile,

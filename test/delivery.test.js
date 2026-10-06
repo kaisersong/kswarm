@@ -4,7 +4,7 @@
  * Run: node test/delivery.test.js
  */
 
-import { aggregateDelivery, buildUserFacingDeliveryFiles, selectUserFacingDeliveryTask } from '../src/core/delivery.js';
+import { aggregateDelivery, buildUserFacingDeliveryFiles, selectUserFacingDeliveryTask, selectUserFacingDeliveryArtifact } from '../src/core/delivery.js';
 import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -325,6 +325,27 @@ scenario('最终产物选择 — 下游 HTML artifact 优先于上游报告 IR',
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+
+scenario('nested same-name artifacts keep their paths and bytes in delivery', () => {
+  const ws = createTestWorkspace({ 'top.md': '# top' });
+  for (const name of ['run-a', 'run-b']) {
+    mkdirSync(join(ws, 'artifacts', name), { recursive: true });
+    writeFileSync(join(ws, 'artifacts', name, 'report.md'), '# ' + name);
+  }
+  const result = aggregateDelivery(ws);
+  const manifest = JSON.parse(readFileSync(result.manifestPath, 'utf8'));
+  assert(manifest.artifacts.some(a => a.filename === 'run-a/report.md'), 'nested identity retained');
+  assert(readFileSync(join(ws, 'delivery', 'run-a', 'report.md'), 'utf8') === '# run-a', 'first bytes retained');
+  assert(readFileSync(join(ws, 'delivery', 'run-b', 'report.md'), 'utf8') === '# run-b', 'second bytes retained');
+});
+
+scenario('final candidate binds the real requested report rather than source evidence', () => {
+  const report = { path: '/project/artifacts/run-a/report.md', kind: 'markdown', label: 'report.md' };
+  const evidence = { path: '/project/artifacts/run-a/search-evidence.json', kind: 'other', label: 'search-evidence.json' };
+  const chosen = selectUserFacingDeliveryArtifact({ requiredOutputs: [{ type: 'markdown' }], result: { artifacts: [evidence, report] } });
+  assert(chosen === report, 'reviewed primary file is selected unchanged');
+  assert(selectUserFacingDeliveryArtifact({ result: { artifacts: [] } }) === null, 'no-file legacy task stays compatible');
+});
 
 // Cleanup
 try { rmSync(TEST_DIR, { recursive: true, force: true }); } catch {}

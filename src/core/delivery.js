@@ -1,10 +1,11 @@
+import { listArtifactFilesRecursive } from './artifact-files.js';
 /**
  * KSwarm — Delivery Aggregation
  *
  * When PO delivers a project, aggregate all task artifacts into a structured delivery package.
  */
 
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, statSync } from 'node:fs';
 import { basename, join, extname } from 'node:path';
 
 /**
@@ -19,10 +20,7 @@ export function aggregateDelivery(projectWorkspace, projectMeta = {}) {
 
   if (!existsSync(artifactsDir)) return null;
 
-  const files = readdirSync(artifactsDir).filter(f => {
-    const fp = join(artifactsDir, f);
-    return statSync(fp).isFile();
-  });
+  const files = listArtifactFilesRecursive(artifactsDir);
 
   if (files.length === 0) return null;
 
@@ -49,13 +47,15 @@ export function aggregateDelivery(projectWorkspace, projectMeta = {}) {
       filename,
       size: stat.size,
       modifiedAt: stat.mtimeMs,
-      taskId: extractTaskId(filename),
+      taskId: extractTaskId(basename(filename)),
       type: getArtifactType(ext),
     };
     manifest.artifacts.push(entry);
 
     // Copy to delivery dir
-    copyFileSync(srcPath, join(deliveryDir, filename));
+    const destination = join(deliveryDir, filename);
+    mkdirSync(join(destination, '..'), { recursive: true });
+    copyFileSync(srcPath, destination);
 
     // Collect text content for report
     if (['.md', '.txt', '.json'].includes(ext)) {
@@ -130,6 +130,19 @@ export function selectUserFacingDeliveryTask(tasks = []) {
 
   if (leafTasks.length > 0) return latestCompleted(leafTasks);
   return latestCompleted(candidates);
+}
+
+export function selectUserFacingDeliveryArtifact(task = {}) {
+  const artifacts = getTaskArtifacts(task).filter(artifact => artifact.path || artifact.filename || artifact.relativePath || artifact.url);
+  const requested = (Array.isArray(task.requiredOutputs) ? task.requiredOutputs : []).map(output => String(output?.type || '').toLowerCase());
+  const score = artifact => {
+    const name = String(artifact.path || artifact.filename || artifact.label || '').toLowerCase();
+    const ext = extname(name);
+    const type = ext === '.md' ? 'markdown' : ext.slice(1);
+    const evidence = basename(name) === 'search-evidence.json';
+    return (requested.includes(type) ? 1000 : 0) + finalArtifactScore(artifact) + (ext === '.md' ? 50 : 1) - (evidence ? 100 : 0);
+  };
+  return [...artifacts].sort((a, b) => score(b) - score(a))[0] || null;
 }
 
 export function buildUserFacingDeliveryFiles({
