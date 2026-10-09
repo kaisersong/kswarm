@@ -1,3 +1,4 @@
+import { activityServiceIdentity } from './activity-service-identity.js';
 /**
  * KSwarm API Server
  *
@@ -221,13 +222,11 @@ function getProjectWorkspace(projectId) {
 
 function setProjectWorkspace(projectId, newPath) {
   if (hub.getProject(projectId)?.requiredProtocol === 'room_workspace_v1') throw new Error('workspace_mapping_ticket_required');
-  const ws = setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
-  const project = hub.getProject(projectId);
-  if (project) {
-    project.workFolder = ws.path;
-    hub.persistState();
-  }
-  return ws;
+  return hub.mutateProjectState(projectId, () => {
+    const ws = setProjectWorkspaceRecord(projectWorkspaces, projectId, newPath);
+    const project = hub.getProject(projectId); if (project) project.workFolder = ws.path;
+    return ws;
+  });
 }
 
 function normalizePersistedProjectPoAgents() {
@@ -308,6 +307,8 @@ function broadcast(msg) {
     if (ws.readyState === 1) ws.send(data);
   }
 }
+
+hub.subscribeProjectActivity(notice => broadcast(notice));
 
 normalizePersistedProjectPoAgents();
 const interruptedTaskWorkflows = hub.recoverInterruptedTaskWorkflows({
@@ -1752,7 +1753,38 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, ...hub.getWorkspaceProtocolBaseline() });
+      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, service: activityServiceIdentity(), roomEventOutbox: hub.getRoomEventOutboxHealth(), ...hub.getWorkspaceProtocolBaseline() });
+    }
+
+    const outboxRetryRoute = path.match(/^\/projects\/([^/]+)\/room-event-outbox\/retry$/);
+    if (outboxRetryRoute) {
+      if (req.method !== 'POST') return json(res, { ok: false, error: 'method_not_allowed' }, 405);
+      const context = resolveDesktopMutationContext(req);
+      if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
+      const result = await hub.retryRoomEventOutbox(decodeURIComponent(outboxRetryRoute[1]), await parseBody(req), context.requestContext);
+      return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 409);
+    }
+    const activityIdentityRoute = path.match(/^\/projects\/([^/]+)\/activity-identity$/);
+    if (activityIdentityRoute) {
+      if (!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token'] !== DESKTOP_MUTATION_TOKEN) return json(res, { ok: false, error: 'mutation_credential_required' }, 401);
+      if (req.method !== 'GET') return json(res, { ok: false, error: 'method_not_allowed' }, 405);
+      if (hub.getPersistenceHealth().status === 'failed') return json(res, { ok: false, error: 'activity_source_unavailable' }, 503);
+      const result = hub.getProjectActivityIdentity(decodeURIComponent(activityIdentityRoute[1]));
+      return json(res, result, result.ok ? 200 : 404);
+    }
+    const activityRoute = path.match(/^\/projects\/([^/]+)\/activity$/);
+    if (activityRoute) {
+      if (!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token'] !== DESKTOP_MUTATION_TOKEN) return json(res, { ok: false, error: 'mutation_credential_required' }, 401);
+      if (req.method !== 'GET') return json(res, { ok: false, error: 'method_not_allowed' }, 405);
+      if (hub.getPersistenceHealth().status === 'failed') return json(res, { ok: false, error: 'activity_source_unavailable' }, 503);
+      const projectId = decodeURIComponent(activityRoute[1]);
+      if (!hub.getProject(projectId)) return json(res, { ok: false, error: 'project_not_found' }, 404);
+      try {
+        const result = hub.getProjectActivity(projectId, {
+          after: Number(url.searchParams.get('after') ?? 0), limit: Number(url.searchParams.get('limit') ?? 100),
+        });
+        return json(res, result, result.ok ? 200 : 409);
+      } catch (error) { return json(res, { ok: false, error: error.message }, 400); }
     }
 
     const workspaceRoute=path.match(/^\/projects\/([^/]+)\/workspace-(mapping|dispatch|result)$/);
@@ -1851,9 +1883,10 @@ async function handleRequest(req, res) {
 
         const workspaceBound=project.requiredProtocol === 'room_workspace_v1' || body.requiredProtocol === 'room_workspace_v1';
         if (workspaceBound) {
-          project.requiredProtocol='room_workspace_v1';
-          project.workspaceMapping={state:'mapping_required',roomId:project.primaryRoomId,projectId:project.id};
-          hub.persistState();
+          hub.mutateProjectState(project.id, () => {
+            project.requiredProtocol='room_workspace_v1';
+            project.workspaceMapping={state:'mapping_required',roomId:project.primaryRoomId,projectId:project.id};
+          });
           return json(res,{ok:true,project,preparation:{state:'mapping_required'},planningStart:{sent:false,reason:'workspace_mapping_required'}},201);
         }
         const ws = initProjectWorkspace(project.id, workFolder);
@@ -2953,10 +2986,11 @@ async function handleRequest(req, res) {
         const project = hub.getProject(projectId);
         if (project && project.enableSummary !== false) {
           try {
-            project.summary = extractSummarySection(synthesis);
-            project.summaryScore = extractSummaryScore(synthesis);
-            project.taskScores = extractTaskScores(synthesis);
-            hub.persistState();
+            hub.mutateProjectState(projectId, () => {
+              project.summary = extractSummarySection(synthesis);
+              project.summaryScore = extractSummaryScore(synthesis);
+              project.taskScores = extractTaskScores(synthesis);
+            });
           } catch (e) {
             log('warn', 'Failed to parse project summary', { projectId, error: String(e) });
           }

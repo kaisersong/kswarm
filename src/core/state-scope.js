@@ -133,6 +133,7 @@ function firstArgProjectId(args) {
 }
 
 const PROJECT_FIRST_ARG = new Set([
+  'submitTaskResult',
   'createProject',
   'setProjectTeamPlan',
   'attachTeamOperationMembers',

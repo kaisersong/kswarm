@@ -13,7 +13,9 @@
  */
 
 import { createTaskBoard, restoreTaskBoard } from './task-board.js';
+import { projectActivitySnapshot, createProjectActivityCandidate, ProjectActivityReservations, activityMutationCriticalBudget, PROJECT_ACTIVITY_FIELDS, readProjectActivity } from './project-activity.js';
 import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -21,6 +23,7 @@ import { createEventLog } from './event-log.js';
 import { createPersistence, PersistenceCommitError } from './persistence.js';
 import { resolveMutationScope, FULL_SCOPE } from './state-scope.js';
 import { randomUUID } from 'node:crypto';
+import { createProjectInstanceId } from './project-id.js';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
 import { validateNodePermissions } from './workflow-node-permissions.js';
@@ -112,6 +115,19 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   const reviewGateDecisions = new Map();
   const reviewConditions = new Map();
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
+  const activityContext = new AsyncLocalStorage();
+  const activityReservations = new ProjectActivityReservations();
+  const emitDiagnostic = eventLog.emit;
+  eventLog.emit = (type, payload = {}) => {
+    // Capture business emission arguments, never replayed diagnostic log lines.
+    const context = activityContext.getStore();
+    if (context?.active && typeof payload.projectId === 'string') context.events.push({ type, payload });
+    return emitDiagnostic(type, payload);
+  };
+  const committedActivities = new Map();
+  const committedRoomOutboxes = new Map();
+  const activitySubscribers = new Set();
+
   const persistence = injectedPersistence || (dataDir ? createPersistence(dataDir) : null);
   const storageFile = typeof dataDir === 'string' ? dataDir : dataDir?.filePath;
   const managedProjectRoot = projectStorageRoot || (storageFile ? join(dirname(storageFile), 'projects') : join(tmpdir(), 'kswarm-managed-projects'));
@@ -281,9 +297,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
   }
 
-  function buildFullState() {
+  function buildFullState(activityCandidates = new Map()) {
     return {
-      projects: [...projects.values()],
+      projects: [...projects.values()].map(project => activityCandidates.get(project.id) ?? project),
       boards: [...boards.entries()].map(([projectId, board]) => ({
         projectId,
         tasks: board.getAllTasks(),
@@ -304,11 +320,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   // Scoped persistence accessor: materialize only the entities affected by a
   // mutation's scope. Never builds the full ~9MB state for a single-project
   // mutation. The `full` closure is used only by the legacy JSON backend.
-  function buildScopedPersistencePayload(scope = FULL_SCOPE) {
+  function buildScopedPersistencePayload(scope = FULL_SCOPE, activityCandidates = new Map()) {
     const inScope = (projectId) => scope.type === 'full' || projectId === scope.projectId;
     const entities = [];
     for (const p of projects.values()) {
-      if (inScope(p.id)) entities.push({ collection: 'project', key: p.id, projectId: p.id, value: p });
+      if (inScope(p.id)) entities.push({ collection: 'project', key: p.id, projectId: p.id, value: activityCandidates.get(p.id) ?? p });
     }
     for (const [projectId, board] of boards.entries()) {
       if (inScope(projectId)) entities.push({ collection: 'board', key: projectId, projectId, value: { projectId, tasks: board.getAllTasks() } });
@@ -331,17 +347,85 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     const newHumanActions = humanActions.slice(persistedHumanActionCount).map(a => ({
       collection: 'humanAction', key: a.id, projectId: a.projectId ?? null, value: a,
     }));
-    return { entities, humanActions: newHumanActions, scope, full: buildFullState };
+    return { entities, humanActions: newHumanActions, scope, full: () => buildFullState(activityCandidates) };
   }
 
+  function withActivityBudget(name, scope, action) {
+    assertPersistenceHealthy();
+    const current = activityContext.getStore();
+    if (current?.active && current.reservations.has(scope.projectId)) return action();
+    const budget = activityMutationCriticalBudget(name);
+    const context = { events: [], consumed: new Map(), active: true, reservations: new Map() };
+    try {
+      if (persistence) context.reservations.set(scope.projectId, activityReservations.reserve(scope.projectId, projects.get(scope.projectId), budget));
+    } catch (error) { for (const reservation of context.reservations.values()) reservation.release(); throw error; }
+    const release = () => { context.active = false; for (const reservation of context.reservations.values()) reservation.release(); };
+    return activityContext.run(context, () => {
+      try { const result = action(); if (result && typeof result.then === 'function') return result.finally(release); release(); return result; }
+      catch (error) { release(); throw error; }
+    });
+  }
+
+  let activityCommitError = null;
   function persistState(scope = FULL_SCOPE) {
     if (!persistence) return;
-    persistence.save(buildScopedPersistencePayload, scope);
-    // Advance the append pointer only after a successful durable commit.
+    assertPersistenceHealthy();
+    const affected = [...projects.values()].filter(project => scope.type === 'full' || project.id === scope.projectId);
+    const candidates = new Map();
+    const previousActivityHeads = new Map(affected.map(project => [project.id, committedActivities.get(project.id)?.committedActivitySeq ?? 0]));
+    const context = activityContext.getStore();
+    const eventWatermark = context?.events.length ?? 0;
+    try {
+      for (const project of affected) {
+        const consumed = context?.consumed.get(project.id) ?? 0;
+        const observations = (context?.events ?? []).slice(consumed, eventWatermark).filter(item => item.payload.projectId === project.id);
+        const previousActivity = committedActivities.get(project.id);
+        const candidate = context?.active ? createProjectActivityCandidate(project, projectActivitySnapshot(project, boards.get(project.id)?.getAllTasks() ?? []), observations) : previousActivity ? { ...project, ...previousActivity, activityEventSeq: previousActivity.committedActivitySeq } : project;
+        const critical = (candidate.activityEventOutbox ?? []).filter(event => event.sourceSequence > (project.activityEventSeq ?? 0) && event.kind !== 'progress').length;
+        context?.reservations?.get(project.id)?.assertFits(critical);
+        candidates.set(project.id, candidate);
+      }
+      persistence.save(committedScope => buildScopedPersistencePayload(committedScope ?? scope, candidates), scope);
+    } catch (error) { activityCommitError = error; throw error; }
+    for (const project of affected) {
+      const candidate = candidates.get(project.id);
+      const critical = (candidate.activityEventOutbox ?? []).filter(event => event.sourceSequence > (project.activityEventSeq ?? 0) && event.kind !== 'progress').length;
+      context?.reservations?.get(project.id)?.consume(critical);
+      for (const field of PROJECT_ACTIVITY_FIELDS) if (field in candidate) project[field] = candidate[field];
+      context?.consumed.set(project.id, eventWatermark);
+    }
+    for (const project of affected) committedRoomOutboxes.set(project.id, structuredClone(project.roomEventOutbox ?? []));
+    for (const id of committedRoomOutboxes.keys()) if (!projects.has(id)) committedRoomOutboxes.delete(id);
+    // Never serve mutable/failed staged state through the activity replay API.
+    for (const project of affected) if (project.activityDataEpoch) committedActivities.set(project.id, structuredClone({
+      activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
+      activitySnapshot: project.activitySnapshot, activityEventOutbox: project.activityEventOutbox, activityGapRanges: project.activityGapRanges,
+    }));
+    for (const id of committedActivities.keys()) if (!projects.has(id)) committedActivities.delete(id);
+    for (const project of affected) if (context?.active && project.activityDataEpoch && project.committedActivitySeq > previousActivityHeads.get(project.id)) {
+      const notice = { type: 'project_activity', projectId: project.id,
+        sourceDataEpoch: project.activityDataEpoch, headSeq: project.committedActivitySeq };
+      for (const listener of activitySubscribers) { try { listener(notice); } catch { /* committed truth cannot be rolled back by a UI consumer */ } }
+    }
     persistedHumanActionCount = humanActions.length;
   }
 
+  function subscribeProjectActivity(listener) {
+    activitySubscribers.add(listener);
+    return () => activitySubscribers.delete(listener);
+  }
+
+  function getProjectActivity(projectId, options) {
+    return readProjectActivity(committedActivities.get(projectId), options);
+  }
+  function getProjectActivityIdentity(projectId) {
+    const committed = committedActivities.get(projectId);
+    if (!committed) return { ok: false, code: 'project_activity_unavailable' };
+    return { ok: true, projectId, roomId: committed.activitySnapshot?.primaryRoomId ?? null, sourceDataEpoch: committed.activityDataEpoch };
+  }
+
   function getPersistenceHealth() {
+    if (activityCommitError) return { ...persistence?.getHealth?.(), status: 'failed', errorCode: 'project_activity_commit_failed' };
     if (!persistence || typeof persistence.getHealth !== 'function') {
       return { status: 'disabled', backend: 'none', revision: 0 };
     }
@@ -352,10 +436,25 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     if (persistence && typeof persistence.close === 'function') persistence.close();
   }
 
+  for (const project of projects.values()) committedRoomOutboxes.set(project.id, structuredClone(project.roomEventOutbox ?? []));
+
+  for (const project of projects.values()) if (project.activityDataEpoch) committedActivities.set(project.id, structuredClone({
+    activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
+    activitySnapshot: project.activitySnapshot, activityEventOutbox: project.activityEventOutbox, activityGapRanges: project.activityGapRanges,
+  }));
+
   if (persistence) {
-    const reconciliation = reconcileRecoveredScriptWorkflowProjectDeliveries();
-    if (reconciliation.delivered.length > 0 || reconciliation.blocked.length > 0) {
-      persistState();
+    for (const project of projects.values()) {
+      try {
+        withActivityBudget('recoverProjectDelivery', { type: 'project', projectId: project.id }, () => {
+          const reconciliation = reconcileRecoveredScriptWorkflowProjectDeliveries({ projectId: project.id });
+          if (reconciliation.delivered.length > 0 || reconciliation.blocked.length > 0) persistState({ type: 'project', projectId: project.id });
+        });
+      } catch (error) {
+        // Known pressure rejects before recovery mutates business state. Other
+        // projects remain recoverable; a real commit failure still fails closed.
+        if (error?.message !== 'project_activity_capacity_exceeded') throw error;
+      }
     }
   }
 
@@ -837,41 +936,106 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return { items: Array.isArray(project.roomEventOutbox) ? [...project.roomEventOutbox] : [] };
   }
 
-  async function flushRoomEventOutbox() {
-    if (!brokerClient || typeof brokerClient.publishRoomProjectEvent !== 'function') {
-      return { ok: false, code: 'kswarm_unavailable' };
-    }
-    let published = 0;
-    let suppressed = 0;
+  let roomOutboxTail = Promise.resolve();
+  let roomFlush;
+  function serializeRoomOutbox(action) {
+    const next = roomOutboxTail.then(action, action);
+    roomOutboxTail = next.then(() => undefined, () => undefined);
+    return next;
+  }
+  function flushRoomEventOutbox() {
+    if (roomFlush) return roomFlush;
+    const pending = serializeRoomOutbox(flushRoomEventOutboxLocked).finally(() => { if (roomFlush === pending) roomFlush = undefined; });
+    roomFlush = pending; return pending;
+  }
+  async function flushRoomEventOutboxLocked() {
+    assertPersistenceHealthy();
+    if (!brokerClient || typeof brokerClient.publishRoomProjectEvent !== 'function') return { ok: false, code: 'kswarm_unavailable' };
+    let published = 0, suppressed = 0;
     for (const project of projects.values()) {
       if (!Array.isArray(project.roomEventOutbox) || !project.primaryRoomId) continue;
       for (const item of project.roomEventOutbox) {
-        if (item.status !== 'pending') continue;
-        const snapshot = await brokerClient.getRoomSnapshot(project.primaryRoomId);
-        if (!snapshot || snapshot.ok === false || snapshot.room?.status !== 'active') {
-          // terminal suppression: no retry loop, no project rollback (§7.4)
-          item.status = 'suppressed_room_archived';
-          item.suppressedAt = Date.now();
-          suppressed += 1;
-          continue;
+        if (item.status !== 'pending' || (item.nextAttemptAt ?? 0) > Date.now()) continue;
+        const committed = committedRoomOutboxes.get(project.id)?.find(saved => saved.projectionEventId === item.projectionEventId);
+        if (persistence && (!committed || !['roomId','projectId','eventType','summary','sourceRefs'].every(key => JSON.stringify(committed[key]) === JSON.stringify(item[key])))) continue;
+
+        assertPersistenceHealthy();
+        item.attempts = (item.attempts ?? 0) + 1;
+        item.totalAttempts = (item.totalAttempts ?? 0) + 1;
+        try {
+          const snapshot = await brokerClient.getRoomSnapshot(project.primaryRoomId);
+          assertPersistenceHealthy();
+          if (persistence && !committedRoomOutboxes.has(project.id)) continue;
+          if (!snapshot || snapshot.ok === false) throw new Error(snapshot?.code ?? 'room_lookup_unavailable');
+          if (['archiving', 'archived'].includes(snapshot.room?.status)) {
+            item.status = 'suppressed_room_archived'; item.suppressedAt = Date.now(); suppressed++;
+          } else if (snapshot.room?.status !== 'active') throw new Error('room_status_unknown');
+          else {
+            const result = await brokerClient.publishRoomProjectEvent({
+              projectionEventId: item.projectionEventId, roomId: item.roomId,
+              projectId: item.projectId, eventType: item.eventType,
+              summary: item.summary, sourceRefs: item.sourceRefs,
+            });
+            assertPersistenceHealthy();
+            const message = result?.message ?? result?.details?.message;
+            const refs = message?.sourceRef;
+            const matchingDuplicate = result?.code === 'room_message_duplicate'
+              && message?.roomId === item.roomId && message?.kind === 'project_event'
+              && message?.sender?.kind === 'system' && message?.sender?.service === 'kswarm'
+              && message?.text === (item.summary ?? '')
+              && refs?.projectId === item.projectId && refs?.projectionEventId === item.projectionEventId
+              && refs?.eventType === item.eventType
+              && Object.entries(item.sourceRefs ?? {}).every(([key, value]) => JSON.stringify(refs?.[key]) === JSON.stringify(value));
+            if (!result || result.ok === false && !matchingDuplicate) throw new Error(result?.code ?? 'room_publish_unavailable');
+            item.status = 'published'; item.publishedAt = Date.now(); published++;
+          }
+          delete item.nextAttemptAt; delete item.lastError;
+        } catch (error) {
+          assertPersistenceHealthy();
+          item.lastError = String(error?.message ?? error).slice(0, 256);
+          item.nextAttemptAt = Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(item.attempts, 6));
+          if (item.attempts >= 10) item.status = 'parked';
         }
-        const result = await brokerClient.publishRoomProjectEvent({
-          projectionEventId: item.projectionEventId,
-          roomId: item.roomId,
-          projectId: item.projectId,
-          eventType: item.eventType,
-          summary: item.summary,
-          sourceRefs: item.sourceRefs,
-        });
-        if (result && result.ok !== false) {
-          item.status = 'published';
-          item.publishedAt = Date.now();
-          published += 1;
-        }
-        // publish failure keeps the item pending for the next flush
+        persistState({ type: 'project', projectId: project.id });
       }
     }
     return { ok: true, published, suppressed };
+  }
+
+  function retryRoomEventOutbox(projectId, input = {}, requestContext = {}) {
+    return serializeRoomOutbox(() => {
+      if (requestContext.requestSource !== 'user' || typeof requestContext.actorId !== 'string' || !requestContext.actorId) throw new Error('room_outbox_user_required');
+      assertPersistenceHealthy();
+      const project = projects.get(projectId);
+      if (!project) return { ok: false, error: 'project_not_found' };
+      if (typeof input.operationId !== 'string' || !input.operationId || input.operationId.length > 256 || typeof input.projectionEventId !== 'string'
+        || !Number.isSafeInteger(input.expectedAttempts) || input.expectedAttempts < 0) throw new Error('invalid_room_outbox_retry');
+      const fingerprint = JSON.stringify([input.projectionEventId,input.expectedAttempts,requestContext.actorId]);
+      const existing = project.roomOutboxRetryOperations?.[input.operationId];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) throw new Error('room_outbox_operation_conflict');
+        return { ...existing.result, reused: true };
+      }
+      if (Object.keys(project.roomOutboxRetryOperations ?? {}).length >= 256) throw new Error('room_outbox_retry_capacity');
+      const item = project.roomEventOutbox?.find(event => event.projectionEventId === input.projectionEventId);
+      if (!item || item.status !== 'parked' || item.attempts !== input.expectedAttempts) return { ok: false, error: 'room_outbox_state_changed' };
+      const result = { ok: true, projectionEventId: item.projectionEventId };
+      item.status = 'pending'; item.attempts = 0; item.nextAttemptAt = Date.now();
+      project.roomOutboxRetryOperations = { ...project.roomOutboxRetryOperations, [input.operationId]: { fingerprint, result } };
+      persistState({ type: 'project', projectId });
+      return result;
+    });
+  }
+
+  function getRoomEventOutboxHealth() {
+    let pending = 0, parked = 0, oldestPendingAt = null;
+    const retryCapacityProjects = [...projects.values()].filter(project => Object.keys(project.roomOutboxRetryOperations ?? {}).length >= 256).map(project => project.id);
+    const outboxes = persistence ? committedRoomOutboxes.values() : [...projects.values()].map(project => project.roomEventOutbox ?? []);
+    for (const items of outboxes) for (const item of items) {
+      if (item.status === 'pending') { pending++; const at = typeof item.createdAt === 'number' ? item.createdAt : Date.parse(item.createdAt ?? ''); if (Number.isFinite(at)) oldestPendingAt = oldestPendingAt === null ? at : Math.min(oldestPendingAt, at); }
+      if (item.status === 'parked') parked++;
+    }
+    return { pending, parked, retryCapacityProjects, retryOperationLimit: 256, oldestPendingAt };
   }
 
   function submitTaskResult({ projectId, taskId, agentId, summary = null } = {}) {
@@ -5348,10 +5512,11 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     };
   }
 
-  function reconcileRecoveredScriptWorkflowProjectDeliveries({ now = Date.now() } = {}) {
+  function reconcileRecoveredScriptWorkflowProjectDeliveries({ now = Date.now(), projectId } = {}) {
     const delivered = [];
     const blocked = [];
     for (const workflowRun of workflowRuns.values()) {
+      if (projectId && workflowRun.projectId !== projectId) continue;
       const result = maybeDeliverScriptWorkflowProjectResult(workflowRun, { now });
       if (result.workflowRun !== workflowRun) {
         workflowRuns.set(result.workflowRun.id, result.workflowRun);
@@ -6023,6 +6188,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   // Wrap mutation methods to auto-persist state
   const mutations = {
     createProject,
+    submitTaskResult,
     setProjectTeamPlan,
     attachTeamOperationMembers,
     invalidateTeamPlansForAgent,
@@ -6085,7 +6251,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
 
   function assertPersistenceHealthy() {
     if (!persistence || typeof persistence.getHealth !== 'function') return;
-    const health = persistence.getHealth();
+    const health = getPersistenceHealth();
     if (health && health.status === 'failed') {
       throw new PersistenceCommitError('[hub] persistence is in a failed state; mutation rejected');
     }
@@ -6103,40 +6269,72 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   ]);
   for (const [name, fn] of Object.entries(mutations)) {
     persisted[name] = (...args) => {
-      // Gate: after a durable-commit failure, reject subsequent mutations before
-      // they run business logic (their in-memory/broker effects would be uncertain).
       assertPersistenceHealthy();
-      const result = fn(...args);
-      if (teamInputMutations.has(name)) {
-        const projectId = typeof args[0] === 'string' ? args[0] : args[0]?.id;
-        const project = projects.get(projectId);
-        if (project) {
-          if (project.teamPlan && project.teamPlan.status !== 'applied') project.teamPlan = { ...project.teamPlan, status: 'stale' };
-          bumpProjectRevision(project, name);
-        }
+      if (name === 'createProject' && args[0] && !args[0].id) args[0] = { ...args[0], id: createProjectInstanceId() };
+      const admittedScope = resolveMutationScope(name, args, persistenceLookups);
+      const context = { events: [], consumed: new Map(), active: true, reservations: new Map() };
+      const release = () => { context.active = false; for (const reservation of context.reservations.values()) reservation.release(); };
+      if (persistence) {
+        const budget = activityMutationCriticalBudget(name);
+        const targets = admittedScope.type === 'project' ? [{ id: admittedScope.projectId, project: projects.get(admittedScope.projectId), budget }]
+          : [...projects.values()].map(project => ({ id: project.id, project, budget: project.activitySnapshot ? 0 : 1 }));
+        try { for (const target of targets) context.reservations.set(target.id, activityReservations.reserve(target.id, target.project, target.budget)); }
+        catch (error) { release(); throw error; }
       }
-      const scope = resolveMutationScope(name, args, persistenceLookups);
-      persistState(scope);
-      return result;
+      return activityContext.run(context, () => {
+        const commit = result => {
+          try {
+            assertPersistenceHealthy();
+            if (teamInputMutations.has(name)) {
+              const projectId = typeof args[0] === 'string' ? args[0] : args[0]?.id;
+              const project = projects.get(projectId);
+              if (project) {
+                if (project.teamPlan && project.teamPlan.status !== 'applied') project.teamPlan = { ...project.teamPlan, status: 'stale' };
+                bumpProjectRevision(project, name);
+              }
+            }
+            persistState(resolveMutationScope(name, args, persistenceLookups));
+            return result;
+          } finally { context.active = false; }
+        };
+        try {
+          const result = fn(...args);
+          // Room-first creation validates asynchronously; persist after it settles.
+          if (result && typeof result.then === 'function') return result.then(commit).finally(release);
+          try { return commit(result); } finally { release(); }
+        } catch (error) { release(); throw error; }
+      });
     };
   }
 
   return {
     ...persisted,
     getProject,
+    mutateProjectState(projectId, action) {
+      if (!projects.has(projectId)) throw new Error('project_not_found');
+      if (typeof action !== 'function') throw new Error('project_mutation_callback_required');
+      return withActivityBudget('serverProjectState', { type: 'project', projectId }, () => {
+        const commit = result => { persistState({ type: 'project', projectId }); return result; };
+        const result = action(); return result && typeof result.then === 'function' ? result.then(commit) : commit(result);
+      });
+    },
+    getProjectActivityIdentity,
     getWorkspaceProtocolBaseline,
-    applyWorkspaceMapping,
+    applyWorkspaceMapping: (...args) => withActivityBudget('applyWorkspaceMapping', { type: 'project', projectId: args[0] }, () => applyWorkspaceMapping(...args)),
     getWorkspaceMapping,
-    dispatchWorkspaceTask,
-    submitWorkspaceTaskResult,
+    dispatchWorkspaceTask: (...args) => withActivityBudget('dispatchWorkspaceTask', { type: 'project', projectId: args[0] }, () => dispatchWorkspaceTask(...args)),
+    submitWorkspaceTaskResult: (...args) => withActivityBudget('submitWorkspaceTaskResult', { type: 'project', projectId: args[0] }, () => submitWorkspaceTaskResult(...args)),
     authorizeWorkspaceDelivery,
     getBoard,
     getEventLog,
     listProjects,
     findReusableProjectForCreateRequest,
+    getProjectActivity,
+    subscribeProjectActivity,
     getRoomEventOutbox,
     flushRoomEventOutbox,
-    submitTaskResult,
+    retryRoomEventOutbox,
+    getRoomEventOutboxHealth,
     listRoomMemberBlockers,
     getDispatchPlan,
     getExecutionGraph,
