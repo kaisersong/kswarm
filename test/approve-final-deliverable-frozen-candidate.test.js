@@ -32,7 +32,7 @@ test('schema v2 项目批准真实文件 deliverable 后，artifactRef 指向 fr
     const originalContent = '# Final Report\n\nApproved content.';
     writeFileSync(workingFilePath, originalContent);
 
-    const hub = createHub({ silent: true });
+    const hub = createHub({ silent: true, dataDir: { backend: 'sqlite', filePath: join(workspaceRoot, 'state.sqlite'), legacyJsonPath: join(workspaceRoot, 'state.json') } });
     const projectId = 'proj-frozen-1';
     hub.createProject({
       id: projectId, name: projectId, goal: 'goal', poAgent: 'po', members: ['worker'],
@@ -65,10 +65,14 @@ test('schema v2 项目批准真实文件 deliverable 后，artifactRef 指向 fr
     });
     assert.equal(delivered.ok, true, JSON.stringify(delivered));
 
+    assert.equal(hub.getProjectActivity(projectId).events.some(event => event.kind === 'completed'), false, 'candidate registration is not accepted delivery');
     const approved = hub.approveFinalDeliverable(projectId, delivered.finalDeliverable.deliverableId, {
       approvalIdempotencyKey: 'k-frozen-1',
     }, { requestSource: 'user', actorId: 'user-1' });
     assert.equal(approved.ok, true, JSON.stringify(approved));
+    const activity = hub.getProjectActivity(projectId);
+    assert.equal(activity.events.filter(event => event.kind === 'completed').length, 1);
+    assert.equal(activity.snapshot.status, 'delivered');
     assert.equal(approved.finalDeliverable.artifactRef.frozen, true, 'approved artifactRef 必须标记为 frozen');
     assert.notEqual(approved.finalDeliverable.artifactRef.path, workingFilePath, 'frozen 后 path 必须指向冻结副本而不是原始工作文件');
 
@@ -81,6 +85,7 @@ test('schema v2 项目批准真实文件 deliverable 后，artifactRef 指向 fr
 
     const frozenContentAfterTamper = readFileSync(approved.finalDeliverable.artifactRef.path, 'utf-8');
     assert.equal(frozenContentAfterTamper, originalContent, 'frozen 副本必须不受工作文件后续修改影响');
+    hub.closePersistence();
   } finally {
     rmSync(workspaceRoot, { recursive: true, force: true });
   }

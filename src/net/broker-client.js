@@ -27,40 +27,85 @@ export function createBrokerClient({
   let ws = null;
   let connected = false;
   let reconnectTimer = null;
+  let sealed = false;
+  let reconnectAllowed = true;
+  let closing = null;
+  const lifetime = new AbortController();
+  const closedError = Object.assign(Error('broker_client_closed'), { code: 'broker_client_closed' });
+  const pending = new Set();
+  const sockets = new Map();
+  const closeErrors = new Set();
+  function assertOpen() { if (sealed) throw closedError; lifetime.signal.throwIfAborted(); }
+  function run(fn, args) {
+    if (sealed) return Promise.reject(closedError);
+    // Register before destructuring, toJSON or any other user-code reentry.
+    let resolve, reject;
+    const work = new Promise((done, failed) => { resolve = done; reject = failed; });
+    pending.add(work);
+    void work.then(() => pending.delete(work), () => pending.delete(work));
+    try { resolve(fn(...args)); } catch (error) { reject(error); }
+    return work;
+  }
+  function notify(callback, ...args) {
+    try { const value = callback?.(...args); if (value && typeof value.then === 'function') void Promise.resolve(value).catch(error => log('callback failed', error)); }
+    catch (error) { log('callback failed', error); }
+  }
+  function stopSocket(record) {
+    if (record.stopping) return;
+    record.stopping = true;
+    record.resolveHandshake(false);
+    const socket = record.socket;
+    try {
+      if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
+      else if (socket.readyState === WebSocket.OPEN) socket.close();
+    } catch (error) { closeErrors.add(error); }
+    if (sockets.has(socket)) {
+      record.timer = setTimeout(() => {
+        record.timer = null;
+        if (sockets.has(socket)) { try { socket.terminate(); } catch (error) { closeErrors.add(error); } }
+      }, 1000);
+      record.timer.unref?.();
+    }
+  }
 
   const httpBase = brokerUrl.replace(/\/$/, '');
   const wsUrl = `${httpBase.replace('http', 'ws')}/ws?participantId=${encodeURIComponent(participantId)}`;
 
   function log(...args) {
-    if (!silent) console.log(`[${alias || participantId}]`, ...args);
+    if (!silent) { try { console.log(`[${alias || participantId}]`, ...args); } catch { /* diagnostics cannot interrupt drain */ } }
   }
 
   // ─── HTTP helpers ────────────────────────────────────────────────
 
   async function httpPost(path, body) {
-    const resp = await fetchImpl(`${httpBase}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const url = `${httpBase}${path}`, init = {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body), signal: lifetime.signal,
+    };
+    assertOpen();
+    const resp = await fetchImpl(url, init);
     return resp.json();
   }
 
   async function httpGet(path) {
-    const resp = await fetchImpl(`${httpBase}${path}`);
+    const url = `${httpBase}${path}`; assertOpen();
+    const resp = await fetchImpl(url, { signal: lifetime.signal });
     return resp.json();
   }
 
   async function roomRequest(path, { method = 'GET', body } = {}) {
     if (!roomSystemToken) return { ok: false, code: 'room_authentication_required' };
-    const resp = await fetchImpl(`${httpBase}${path}`, {
+    const url = `${httpBase}${path}`, init = {
       method,
+      signal: lifetime.signal,
       headers: {
         'x-intent-broker-room-token': roomSystemToken,
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    });
+    };
+    assertOpen();
+    const resp = await fetchImpl(url, init);
     return resp.json();
   }
 
@@ -83,49 +128,74 @@ export function createBrokerClient({
   // ─── WebSocket ───────────────────────────────────────────────────
 
   function connect() {
-    return new Promise((resolve) => {
-      ws = new WebSocket(wsUrl);
-
-      ws.on('open', () => {
-        connected = true;
-        log('WebSocket connected');
-        onConnect?.();
-        resolve(true);
-      });
-
-      ws.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === 'connected') {
-            // Initial connection ack
-            return;
-          }
-          if (msg.type === 'new_intent') {
-            onIntent?.(msg.event);
-          }
-        } catch (e) {
-          // ignore malformed
-        }
-      });
-
-      ws.on('close', () => {
-        connected = false;
-        log('WebSocket disconnected');
-        onDisconnect?.();
-        // Auto-reconnect
-        reconnectTimer = setTimeout(connect, 2000);
-      });
-
-      ws.on('error', (err) => {
-        if (!connected) resolve(false);
-      });
+    assertOpen();
+    reconnectAllowed = true;
+    const existing = sockets.get(ws);
+    if (existing && !existing.stopping && ws.readyState <= WebSocket.OPEN) return existing.handshake;
+    let resolveHandshake, resolveClosed;
+    const handshake = new Promise(resolve => { resolveHandshake = resolve; });
+    const closed = new Promise(resolve => { resolveClosed = resolve; });
+    assertOpen();
+    const socket = new WebSocket(wsUrl);
+    const record = { socket, handshake, closed, resolveHandshake, stopping: false, timer: null };
+    sockets.set(socket, record);
+    ws = socket;
+    connected = false;
+    const current = () => ws === socket && !sealed && reconnectAllowed && !record.stopping;
+    socket.on('open', () => {
+      if (!current()) { resolveHandshake(false); stopSocket(record); return; }
+      connected = true;
+      log('WebSocket connected');
+      notify(onConnect);
+      resolveHandshake(current());
     });
+    socket.on('message', data => {
+      if (!current()) return;
+      try { const msg = JSON.parse(data.toString()); if (msg.type === 'new_intent') notify(onIntent, msg.event); }
+      catch { /* ignore malformed */ }
+    });
+    socket.on('error', () => { if (socket.readyState !== WebSocket.OPEN) resolveHandshake(false); });
+    socket.once('close', () => {
+      clearTimeout(record.timer);
+      sockets.delete(socket);
+      resolveHandshake(false);
+      resolveClosed();
+      if (ws !== socket) return;
+      connected = false;
+      log('WebSocket disconnected');
+      if (!current()) return;
+      notify(onDisconnect);
+      // A notification can synchronously close/disconnect the same instance.
+      if (!current()) return;
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!sealed && reconnectAllowed) void run(connect, []).catch(error => log('reconnect failed', error));
+      }, 2000);
+    });
+    return handshake;
   }
 
   function disconnect() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (ws) ws.close();
+    reconnectAllowed = false;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
     connected = false;
+    for (const record of sockets.values()) stopSocket(record);
+  }
+
+  function close() {
+    if (closing) return closing;
+    sealed = true;
+    closing = Promise.resolve().then(async () => {
+      await Promise.allSettled([...pending]);
+      await Promise.all([...sockets.values()].map(record => record.closed));
+      if (closeErrors.size) throw new AggregateError([...closeErrors], 'broker_client_close_unconfirmed');
+    });
+    void closing.catch(() => {});
+    lifetime.abort(closedError);
+    disconnect();
+    return closing;
   }
 
   // ─── Send Intent ─────────────────────────────────────────────────
@@ -184,10 +254,11 @@ export function createBrokerClient({
     return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/workspace/${action}`, {method:'POST',body:input});
   }
 
-  return {
+  const api = {
     register,
     connect,
     disconnect,
+    close,
     sendIntent,
     sendTo,
     readInbox,
@@ -201,7 +272,13 @@ export function createBrokerClient({
     workspaceMappingRejected: input => workspaceRequest('mapping-rejected',input),
     httpPost,
     httpGet,
-    isConnected: () => connected,
+    isConnected: () => !sealed && connected,
     getParticipantId: () => participantId,
   };
+  for (const key of Object.keys(api)) {
+    if (['disconnect', 'close', 'isConnected', 'getParticipantId'].includes(key)) continue;
+    const original = api[key];
+    api[key] = (...args) => run(original, args);
+  }
+  return Object.freeze(api);
 }

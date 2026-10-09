@@ -101,7 +101,7 @@ test('round-trip: emit, close, re-create restores events in chronological order'
     assert.equal(restored[0].type, 'project.created');
     assert.equal(restored[1].type, 'po.assigned');
     assert.equal(restored[2].type, 'task.dispatched');
-    second.close();
+    await second.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -117,8 +117,7 @@ test('day rollover writes separate files for separate local days', async () => {
     log.emit('task.progress', { projectId: 'p1', taskId: 't1', stage: 'before-midnight' });
     clock.setNow(new clock.realDate('2026-05-18T12:00:00').getTime());
     log.emit('task.progress', { projectId: 'p1', taskId: 't1', stage: 'after-midnight' });
-    log.close();
-    await new Promise(r => setTimeout(r, 50));
+    await log.close();
 
     const files = readdirSync(dir).filter(n => n.endsWith('.ndjson')).sort();
     assert.equal(files.length, 2, `expected 2 files, got ${files.join(', ')}`);
@@ -152,7 +151,7 @@ test('replay window includes today + (replayDays - 1) days', async () => {
     const events = log.getEvents();
     assert.equal(events.length, 3);
     assert.deepEqual(events.map(e => e.taskId), ['t-7', 't-8', 't-9']);
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -176,7 +175,7 @@ test('replayDays=1 includes only today', async () => {
     const events = log.getEvents();
     assert.equal(events.length, 1);
     assert.equal(events[0].taskId, 'new');
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -226,7 +225,7 @@ test('per-project truncation keeps tail and inserts events.truncated marker', as
     assert.ok(truncated.some(e => e.projectId === 'A' && e.count === 3000),
       'should mark 3000 events truncated for A');
     assert.equal(truncated.filter(e => e.projectId === 'B').length, 0);
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -254,7 +253,7 @@ test('corrupt lines are skipped without aborting replay', async () => {
     await waitForReady(log);
     const types = log.getEvents().map(e => e.type);
     assert.deepEqual(types, ['project.created', 'task.dispatched', 'task.done']);
-    log.close();
+    await log.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -267,7 +266,7 @@ test('unwritable logDir falls back to in-memory mode without throwing', async ()
   await waitForReady(log);
   log.emit('task.progress', { projectId: 'p', taskId: 't' });
   assert.equal(log.getEvents().length, 1);
-  log.close();
+  await log.close();
 });
 
 // ── 7. Concurrent emit during replay ──────────────────────────────────────
@@ -307,7 +306,7 @@ test('emit during async replay merges historical + live events without seq colli
       assert.ok(!seen.has(s), `duplicate seq ${s}`);
       seen.add(s);
     }
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -336,7 +335,7 @@ test('seq after bucket truncation starts above highest historical seq', async ()
     await waitForReady(log);
     const event = log.emit('task.progress', { projectId: 'A', taskId: 'after-truncation' });
     assert.ok(event.seq >= 9000, `expected seq >= 9000, got ${event.seq}`);
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -361,7 +360,7 @@ test('emit truncates oversized payloads to keep single line under maxLineBytes',
     assert.ok(line.length <= 4000, `expected <= 4000B, got ${line.length}`);
     assert.equal(event.type, 'task.failed');
     assert.equal(event.taskId, 't');
-    log.close();
+    await log.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -385,8 +384,7 @@ test('hub integration: events survive close + re-create cycle', async () => {
       members: [],
     });
     hub1.persistState();
-    hub1.getEventLog().close();
-    await new Promise(r => setTimeout(r, 100));
+    await hub1.getEventLog().close();
 
     const hub2 = createHub({ eventLogDir: eventDir, dataDir: stateFile, silent: true });
     await waitForReady(hub2.getEventLog());
@@ -395,8 +393,7 @@ test('hub integration: events survive close + re-create cycle', async () => {
       restored.some(e => e.type === 'project.created' && e.projectId === 'p-int'),
       'project.created event should survive restart',
     );
-    hub2.getEventLog().close();
-    await new Promise(r => setTimeout(r, 700));
+    await hub2.getEventLog().close();
   } finally {
     rmSync(baseDir, { recursive: true, force: true });
   }
@@ -414,7 +411,7 @@ test('replayDays < 1 is normalized to 1', async () => {
     const log = createEventLog({ logDir: dir, silent: true, replayDays: 0 });
     await waitForReady(log);
     assert.equal(log.getEvents().length, 1);
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -432,7 +429,7 @@ test('logDir is created if missing and replay yields no events', async () => {
     assert.equal(existsSync(dir), true, 'directory should be created');
     assert.equal(log.getEvents().length, 0);
     log.emit('project.created', { projectId: 'p', projectName: 'N' });
-    log.close();
+    await log.close();
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -458,7 +455,7 @@ test('retentionDays prunes old ndjson files at startup', async () => {
     const remaining = readdirSync(dir).filter(n => n.endsWith('.ndjson')).sort();
     assert.equal(remaining.length, 1, `expected 1 file, got ${remaining.join(', ')}`);
     assert.ok(remaining[0].includes(dayKey(recent)), 'recent file kept');
-    log.close();
+    await log.close();
   } finally {
     clock.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -479,7 +476,7 @@ test('events lacking seq or ts still load and get normalized', async () => {
     const events = log.getEvents();
     assert.equal(events.length, 2);
     assert.ok(events.every(e => typeof e.seq === 'number'));
-    log.close();
+    await log.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -494,8 +491,7 @@ test('emit writes exactly one ndjson line per event', async () => {
     log.emit('a.x', { projectId: 'p' });
     log.emit('b.y', { projectId: 'p' });
     log.emit('c.z', { projectId: 'p' });
-    log.close();
-    await new Promise(r => setTimeout(r, 100));
+    await log.close();
 
     const files = readdirSync(dir).filter(n => n.endsWith('.ndjson'));
     assert.equal(files.length, 1);

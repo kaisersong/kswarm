@@ -215,7 +215,10 @@ test('a publish failure keeps the outbox item pending for the next flush', async
   const outboxAfterFailure = hub.getRoomEventOutbox({ projectId: project.id });
   assert.ok(outboxAfterFailure.items.some((item) => item.status === 'pending'));
 
-  await hub.flushRoomEventOutbox();
+  const realNow = Date.now;
+  const retryAt = Math.max(...outboxAfterFailure.items.map(item => item.nextAttemptAt ?? 0));
+  Date.now = () => retryAt + 1;
+  try { await hub.flushRoomEventOutbox(); } finally { Date.now = realNow; }
   const outboxAfterRetry = hub.getRoomEventOutbox({ projectId: project.id });
   assert.ok(outboxAfterRetry.items.every((item) => item.status !== 'pending'));
 });
@@ -301,6 +304,73 @@ test('a deliverable-contract rejection does not expose the rejected artifact in 
   const artifactItems = hub.getRoomEventOutbox({ projectId: project.id }).items
     .filter((item) => item.eventType === 'artifact.registered');
   assert.equal(artifactItems.length, 0);
+});
+
+test('published and suppressed outcomes are durable, not re-published after reopening', async () => {
+  const dataDir = createDataDir();
+  const broker = createFakeBrokerClient();
+  const hub = createHub({ silent: true, dataDir, brokerClient: broker });
+  await createRoomLinkedProject(hub);
+  await hub.flushRoomEventOutbox();
+  hub.closePersistence();
+  const restartedBroker = createFakeBrokerClient();
+  const restarted = createHub({ silent: true, dataDir, brokerClient: restartedBroker });
+  await restarted.flushRoomEventOutbox();
+  assert.equal(restartedBroker.calls.publishRoomProjectEvent.length, 0);
+  assert.equal(restarted.getRoomEventOutbox({ projectId: 'proj-outbox' }).items[0].status, 'published');
+  restarted.closePersistence();
+});
+
+test('transient room lookup errors do not suppress a committed event', async () => {
+  const broker = createFakeBrokerClient();
+  const hub = createHub({ silent: true, dataDir: createDataDir(), brokerClient: broker });
+  await createRoomLinkedProject(hub);
+  broker.getRoomSnapshot = async () => ({ ok: false, code: 'unavailable' });
+  await hub.flushRoomEventOutbox();
+  const item = hub.getRoomEventOutbox({ projectId: 'proj-outbox' }).items[0];
+  assert.equal(item.status, 'pending');
+  assert.ok(item.nextAttemptAt > Date.now());
+  hub.closePersistence();
+});
+
+test('parked retry is user-scoped, CAS protected and preserves the projection identity', async () => {
+  const dataDir = createDataDir();
+  const client = createFakeBrokerClient();
+  client.publishRoomProjectEvent = async () => ({ ok: false, code: 'temporary' });
+  const hub = createHub({ silent: true, brokerClient: client, dataDir });
+  const project = await createRoomLinkedProject(hub);
+  const clock = Date.now;
+  let now = clock(); Date.now = () => now;
+  try {
+    for (let attempt = 0; attempt < 10; attempt++) { await hub.flushRoomEventOutbox(); now += 60_001; }
+    const item = hub.getRoomEventOutbox({ projectId: project.id }).items[0];
+    assert.equal(item.status, 'parked');
+    const input = { projectionEventId: item.projectionEventId, expectedAttempts: item.attempts, operationId: 'user-retry-1' };
+    await assert.rejects(hub.retryRoomEventOutbox(project.id, input, { requestSource: 'agent' }), /room_outbox_user_required/);
+    const result = await hub.retryRoomEventOutbox(project.id, input, { requestSource: 'user', actorId: 'desktop-user' });
+    assert.equal(result.ok, true);
+    assert.equal(hub.getRoomEventOutbox({ projectId: project.id }).items[0].projectionEventId, item.projectionEventId);
+    assert.equal(hub.getRoomEventOutbox({ projectId: project.id }).items[0].status, 'pending');
+    assert.equal((await hub.retryRoomEventOutbox(project.id, input, { requestSource: 'user', actorId: 'desktop-user' })).reused, true);
+    assert.equal((await hub.retryRoomEventOutbox(project.id, { ...input, operationId: 'stale' }, { requestSource: 'user', actorId: 'desktop-user' })).error, 'room_outbox_state_changed');
+  } finally { Date.now = clock; hub.closePersistence(); }
+});
+
+test('retry receipts have a hard bound before changing a parked event, remain idempotent across restart and single-flight concurrent flushes', async () => {
+  const dataDir = createDataDir(), client = createFakeBrokerClient();
+  const hub = createHub({ silent: true, dataDir, brokerClient: client });
+  const project = await createRoomLinkedProject(hub);
+  const item = project.roomEventOutbox[0]; item.status = 'parked'; item.attempts = 10;
+  project.roomOutboxRetryOperations = Object.fromEntries(Array.from({ length: 256 }, (_, index) => [`op-${index}`, { fingerprint: JSON.stringify([item.projectionEventId,10,'user']), result: { ok: true, projectionEventId: item.projectionEventId } }]));
+  hub.persistState();
+  await assert.rejects(hub.retryRoomEventOutbox(project.id, { operationId: 'overflow', projectionEventId: item.projectionEventId, expectedAttempts: 10 }, { requestSource: 'user', actorId: 'user' }), /room_outbox_retry_capacity/);
+  assert.equal(item.status,'parked'); assert.equal(Object.keys(project.roomOutboxRetryOperations).length,256);
+  assert.equal((await hub.retryRoomEventOutbox(project.id, { operationId:'op-0',projectionEventId:item.projectionEventId,expectedAttempts:10 }, { requestSource:'user',actorId:'user' })).reused,true);
+  hub.closePersistence();
+  const reopened = createHub({ silent:true, dataDir, brokerClient:client });
+  assert.equal((await reopened.retryRoomEventOutbox(project.id,{operationId:'op-0',projectionEventId:item.projectionEventId,expectedAttempts:10},{requestSource:'user',actorId:'user'})).reused,true);
+  await Promise.all([reopened.flushRoomEventOutbox(),reopened.flushRoomEventOutbox()]);
+  assert.equal(client.calls.publishRoomProjectEvent.length,0); reopened.closePersistence();
 });
 
 let passed = 0;
