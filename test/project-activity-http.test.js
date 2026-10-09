@@ -26,6 +26,11 @@ test('real activity HTTP requires the host credential and replays only committed
       if (child.exitCode !== null || Date.now() > deadline) throw new Error('isolated server startup failed');
       await new Promise(resolve => setTimeout(resolve, 25));
     }
+    const health = await (await fetch(`${base}/health`)).json();
+    assert.deepEqual(health.workflowCapabilities, {
+      schemaVersion: 'kswarm_workflow_patterns_v1', compiledContract: false, patternPublicView: false,
+    });
+    assert.ok(health.features.includes('dynamic_workflows'));
     assert.equal((await fetch(`${base}/projects/fixture/activity`)).status, 401);
     const headers = { 'x-kswarm-mutation-token': 'fixture-credential' };
     assert.equal((await fetch(`${base}/projects/fixture/activity-identity`)).status, 401);

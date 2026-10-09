@@ -101,6 +101,11 @@ const SERVICE_FEATURES = [
   'workflow_budget_cache_recovery',
   'workflow_script_generated_runs',
 ];
+// Pattern-v1 compilation/public views are not implemented by this baseline.
+// Advertise their absence; Desktop must retain existing dynamic workflows.
+const WORKFLOW_CAPABILITIES = Object.freeze({
+  schemaVersion: 'kswarm_workflow_patterns_v1', compiledContract: false, patternPublicView: false,
+});
 const runtimeInstancePool = createRuntimeInstancePool({
   maxWorkerInstances: Math.max(1, Math.min(10, Number(process.env.KSWARM_MAX_WORKER_INSTANCES) || DEFAULT_MAX_WORKER_INSTANCES)),
 });
@@ -1753,7 +1758,7 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, service: activityServiceIdentity(), roomEventOutbox: hub.getRoomEventOutboxHealth(), ...hub.getWorkspaceProtocolBaseline() });
+      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, workflowCapabilities: WORKFLOW_CAPABILITIES, service: activityServiceIdentity(), roomEventOutbox: hub.getRoomEventOutboxHealth(), ...hub.getWorkspaceProtocolBaseline() });
     }
 
     const outboxRetryRoute = path.match(/^\/projects\/([^/]+)\/room-event-outbox\/retry$/);
