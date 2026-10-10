@@ -12,6 +12,7 @@ import { activityServiceIdentity } from './activity-service-identity.js';
  */
 
 import http from 'node:http';
+import { StringDecoder } from 'node:string_decoder';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
@@ -1675,8 +1676,10 @@ function renderPlanMarkdown(plan) {
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', c => body += c);
+    const decoder = new StringDecoder('utf8');
+    req.on('data', c => body += decoder.write(c));
     req.on('end', () => {
+      body += decoder.end();
       try { resolve(body ? JSON.parse(body) : {}); }
       catch { reject(new Error('Invalid JSON')); }
     });
