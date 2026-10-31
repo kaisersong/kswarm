@@ -2969,8 +2969,15 @@ async function handleRequest(req, res) {
       if (finalTaskForDeliverable?.requiredOutputs?.length > 0 && !artifactRef?.path) {
         return json(res, { ok: false, error: 'final_task_artifact_unavailable' }, 409);
       }
+      // This is only a hint: handleDeliver still validates the actual file's
+      // existence, containment, contents and hash before candidate registration.
+      const finalFormat = {
+        '.html': 'html', '.htm': 'html', '.md': 'markdown', '.markdown': 'markdown',
+        '.pdf': 'pdf', '.pptx': 'pptx', '.json': 'json', '.csv': 'csv',
+      }[extname(String(artifactRef?.path || '')).toLowerCase()];
       const result = hub.handleDeliver(projectId, { synthesis: true, ...(artifactRef ? { artifactRef } : {}) }, fromAgent, {
         ...(finalTaskForDeliverable?.id ? { taskId: finalTaskForDeliverable.id } : {}),
+        ...(finalFormat ? { expectedFormat: finalFormat } : {}),
       });
       // design §8.2（handleDeliver 项 / cli/verify.js + server route caller）：
       // handleDeliver 现在只注册一个 FinalDeliverable candidate 并返回
