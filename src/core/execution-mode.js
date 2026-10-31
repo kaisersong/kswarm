@@ -1,3 +1,5 @@
+import { canonicalizeOutputType } from './output-types.js';
+
 export const PROJECT_EXECUTION_MODES = new Set(['direct', 'auto', 'workflow_preferred']);
 
 export function normalizeProjectExecutionMode(value) {
@@ -28,6 +30,12 @@ export function selectTaskExecutionStrategy({ project = {}, task = {}, now = Dat
   }
 
   const reasonCode = inferWorkflowReasonCode(task);
+  // The sealed task workflow only has file tools. Initial managed rendering
+  // belongs on the existing capable worker; recovery and explicit quality
+  // requests retain their original workflow and all submission gates.
+  if (reasonCode === 'delivery_review' && !hasExplicitQualityRequest(task) && needsManagedRenderer(task)) {
+    return buildSelection('direct', 'auto_selector', 'managed_renderer_direct', now);
+  }
   if (reasonCode) {
     return buildSelection('workflow', 'auto_selector', reasonCode, now);
   }
@@ -129,6 +137,27 @@ function taskText(task = {}) {
     task.brief,
     task.type,
     task.kind,
-    ...(Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : []),
+    ...(Array.isArray(task.acceptanceCriteria) ? task.acceptanceCriteria : [task.acceptanceCriteria]),
   ].filter(Boolean).join('\n');
+}
+
+function needsManagedRenderer(task = {}) {
+  const outputs = Array.isArray(task.requiredOutputs) ? task.requiredOutputs : [];
+  const types = outputs.map(output => canonicalizeOutputType(
+    typeof output === 'string' ? output : output?.type || output?.format || output?.kind,
+  )).filter(Boolean);
+  if (outputs.some(output => {
+    if (typeof output !== 'string' && output?.source && output.source !== 'task') return false;
+    const type = canonicalizeOutputType(typeof output === 'string' ? output : output?.type || output?.format || output?.kind);
+    return type === 'report_html' || type === 'slide_html';
+  })) return true;
+  if (types.length > 0 && types.every(type => ['markdown', 'md', 'ir', 'report_ir', 'slide_ir'].includes(type))) return false;
+
+  // Briefs commonly describe downstream HTML. Require an unambiguous current
+  // task action in the title rather than inferring it from project context.
+  const title = String(task.title || '');
+  if (/准备|供后续|下一任务|prepar|for (?:a |the )?(?:later|next|subsequent)/i.test(title)) return false;
+  return /(?:report|slide)[-_]renderer|kai-(?:report|slide)-creator/i.test(title)
+    && /\bhtml\b/i.test(title)
+    && /渲染|生成|输出|\brender\b|\bgenerate\b|\boutput\b/i.test(title);
 }
