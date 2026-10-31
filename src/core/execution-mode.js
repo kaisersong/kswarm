@@ -143,15 +143,12 @@ function taskText(task = {}) {
 
 function needsManagedRenderer(task = {}) {
   const outputs = Array.isArray(task.requiredOutputs) ? task.requiredOutputs : [];
-  const types = outputs.map(output => canonicalizeOutputType(
+  const explicitOutputs = outputs.filter(output => typeof output === 'string' || !output?.source || output.source === 'task');
+  const explicitTypes = explicitOutputs.map(output => canonicalizeOutputType(
     typeof output === 'string' ? output : output?.type || output?.format || output?.kind,
   )).filter(Boolean);
-  if (outputs.some(output => {
-    if (typeof output !== 'string' && output?.source && output.source !== 'task') return false;
-    const type = canonicalizeOutputType(typeof output === 'string' ? output : output?.type || output?.format || output?.kind);
-    return type === 'report_html' || type === 'slide_html';
-  })) return true;
-  if (types.length > 0 && types.every(type => ['markdown', 'md', 'ir', 'report_ir', 'slide_ir'].includes(type))) return false;
+  if (explicitTypes.some(type => type === 'report_html' || type === 'slide_html')) return true;
+  if (explicitTypes.length > 0 && explicitTypes.every(type => ['markdown', 'md', 'ir', 'report_ir', 'slide_ir'].includes(type))) return false;
 
   // Briefs commonly describe downstream HTML. Require an unambiguous current
   // task action in the title rather than inferring it from project context.

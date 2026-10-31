@@ -36,6 +36,7 @@ test('preparation, ambiguous HTML and Markdown-only steps retain workflows', () 
     { title: '最终 report-renderer HTML 检查' },
     { ...renderTask, requiredOutputs: ['markdown'] },
     { ...renderTask, requiredOutputs: [{ type: 'ir' }] },
+    { ...renderTask, requiredOutputs: [{ type: 'markdown', source: 'task' }, { type: 'report_html', source: 'inferred' }] },
   ]) assert.equal(select(task).strategy, 'workflow', JSON.stringify(task));
 });
 
