@@ -16,8 +16,8 @@ import { createWatchdog } from '../src/core/watchdog.js';
 import { matchTaskToAgent, assignTasksSmartly } from '../src/core/task-matcher.js';
 import { aggregateDelivery } from '../src/core/delivery.js';
 import { createAgentStore } from '../src/core/agent-store.js';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, mkdtempSync } from 'node:fs';
+import { join, delimiter } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as childProcess from 'node:child_process';
 
@@ -275,13 +275,25 @@ await scenario('4. QoderCLI — agent-store 注册 + detectCLIs 集成', async (
   assert(qoder.bin === 'qodercli', `bin: ${qoder.bin}`);
   assert(qoder.displayName === 'Qoder', `displayName: ${qoder.displayName}`);
 
-  // 验证 detectCLIs 能探测
-  const detected = store.detectCLIs();
-  // qodercli 在当前环境中已安装（从之前的 which 确认）
-  const qoderDetected = detected.find(d => d.type === 'qoder');
-  assert(qoderDetected !== undefined, 'qodercli 被检测到');
-  if (qoderDetected) {
-    assert(qoderDetected.path.includes('qodercli'), `路径包含 qodercli: ${qoderDetected.path}`);
+  // Exercise real path discovery with an owned fixture, independent of any
+  // CLI installed on the developer or CI machine. This does not test inference.
+  const binDir = mkdtempSync(join(tmpdir(), 'kswarm-qoder-discovery-'));
+  const fixture = join(binDir, 'qodercli');
+  const previousPath = process.env.PATH;
+  const previousOverride = process.env.KSWARM_QODER_PATH;
+  try {
+    writeFileSync(fixture, '#!/bin/sh\necho fixture-qoder\n', { mode: 0o755 });
+    process.env.PATH = `${binDir}${delimiter}${previousPath || ''}`;
+    delete process.env.KSWARM_QODER_PATH;
+    const qoderDetected = store.detectCLIs().find(d => d.type === 'qoder');
+    assert(qoderDetected !== undefined, 'qodercli fixture 被检测到');
+    assert(qoderDetected?.path === fixture, '检测路径属于本测试 fixture');
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousOverride === undefined) delete process.env.KSWARM_QODER_PATH;
+    else process.env.KSWARM_QODER_PATH = previousOverride;
+    rmSync(binDir, { recursive: true, force: true });
   }
 
   // 验证 CLI 列表包含关键运行时；允许后续新增 CLI 类型
