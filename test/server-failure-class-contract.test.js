@@ -26,35 +26,48 @@ test('server runtime failure list excludes task and output contract failures', (
 });
 
 test('every server task-failure entry point schedules retry and replacement deliveries', () => {
-  assert.match(source, /import \{ failureRecoveryTaskIds \} from ['"]\.\.\/core\/failure-recovery-dispatch\.js['"]/);
+  assert.match(source, /import \{ deliverDispatchResult, deliverFailureRecoveryResults \} from ['"]\.\/task-dispatch-delivery\.js['"]/);
+  assert.match(source, /deliverDispatchResult\(\{projectId, dispatch, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
+  assert.match(source, /deliverFailureRecoveryResults\(\{projectId, results, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
 
   const brokerFailure = source.slice(
     source.indexOf("case 'task_failed':"),
     source.indexOf("case 'submit_result':"),
   );
-  assert.match(brokerFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(brokerFailure, /sendBrokerRequestTasks\(resolved\.projectId, recoveryTaskIds\)/);
+  assert.match(brokerFailure, /sendFailureRecovery\(resolved\.projectId, \[result\]\)/);
 
   const restFailure = source.slice(
     source.indexOf('const failMatch = path.match'),
     source.indexOf('const finalDeliverablesMatch'),
   );
-  assert.match(restFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(restFailure, /sendBrokerRequestTasks\(projectId, recoveryTaskIds\)/);
+  assert.match(restFailure, /sendFailureRecovery\(projectId, \[result\]\)/);
 
   const watchdogFailure = source.slice(
     source.indexOf("if (action.type === 'mark_runtime_stalled')"),
     source.indexOf("if (action.type === 'request_cancel_run')"),
   );
-  assert.match(watchdogFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(watchdogFailure, /sendBrokerRequestTasks\(action\.projectId, recoveryTaskIds\)/);
+  assert.match(watchdogFailure, /sendFailureRecovery\(action\.projectId, \[result\]\)/);
 
   const deliveryFailureHandler = source.slice(
     source.indexOf('async function sendBrokerRequestTasks'),
     source.indexOf('async function sendWorkflowNodeHandoffs'),
   );
-  assert.equal((deliveryFailureHandler.match(/failureRecoveryTaskIds\(failed\)/g) || []).length, 3);
+  assert.equal((deliveryFailureHandler.match(/recoveryResults\.push\(failed\)/g) || []).length, 3);
+  assert.match(deliveryFailureHandler, /sendFailureRecovery\(projectId, recoveryResults\)/);
   assert.doesNotMatch(deliveryFailureHandler, /failed\?\.retryDispatched/);
+});
+
+test('startup, continue, reassign and backoff dispatch both adaptive result channels',()=>{
+  const startup=source.slice(source.indexOf('if (needsDispatch)'),source.indexOf('function handleBrokerIntent'));
+  assert.match(startup,/workflowNodeDispatches\?\.length/);
+  assert.match(startup,/sendDispatchResult\(project\.id, dispatchResult\)/);
+  const continueRoute=source.slice(source.indexOf('const continueMatch ='),source.indexOf('const resolveInterventionMatch'));
+  assert.match(continueRoute,/sendDispatchResult\(projectId, result\)/);
+  const reassign=source.slice(source.indexOf('const reassignMatch ='),source.indexOf('const humanTasksMatch ='));
+  assert.match(reassign,/sendDispatchResult\(projectId, result\.dispatch\)/);
+  const backoff=source.slice(source.indexOf('const dueRetry ='),source.indexOf('const AGENT_RUNTIME_FAILURE_CLASSES'));
+  assert.match(backoff,/workflowNodeDispatches\?\.length/);
+  assert.match(backoff,/sendDispatchResult\(project\.id, sweep\)/);
 });
 
 test('agent list refreshes broker presence and shares the routing profile overlay', () => {

@@ -45,7 +45,7 @@ import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from
 import { isSupportedCliRuntimeType, resolveAgentRuntimeSelection } from '../core/agent-runtime-selection.js';
 import { runtimeCatalogEntry } from '../core/runtime-capabilities.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
-import { failureRecoveryTaskIds } from '../core/failure-recovery-dispatch.js';
+import { deliverDispatchResult, deliverFailureRecoveryResults } from './task-dispatch-delivery.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
 import {
   deriveProjectPreparation,
@@ -344,13 +344,21 @@ const RECOVERY_DEBOUNCE_MS = 15_000;
 const DEFER_RECOVERY_GRACE_MS = 20_000;
 const STARTUP_RECOVERY_DELAY_MS = 8_000;
 
+function sendDispatchResult(projectId, dispatch) {
+  return deliverDispatchResult({projectId, dispatch, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs});
+}
+
+function sendFailureRecovery(projectId, results) {
+  return deliverFailureRecoveryResults({projectId, results, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs});
+}
+
 async function sendBrokerRequestTasks(projectId, taskIds = []) {
   if (!brokerClient || !brokerClient.isConnected() || taskIds.length === 0) return;
 
   const project = hub.getProject(projectId);
   const board = hub.getBoard(projectId);
   const ws = getProjectWorkspace(projectId);
-  const retryTaskIds = [];
+  const recoveryResults = [];
 
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
@@ -394,7 +402,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
           'handoff_create_failed',
           taskRequest.error || 'handoff_create_failed',
         );
-        retryTaskIds.push(...failureRecoveryTaskIds(failed));
+        recoveryResults.push(failed);
         continue;
       }
       const delivery = await sendTaskToBrokerParticipant({
@@ -466,7 +474,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
           'runtime_offline',
           delivery.error || 'delivery_failed',
         );
-        retryTaskIds.push(...failureRecoveryTaskIds(failed));
+        recoveryResults.push(failed);
       }
     } catch (err) {
       log('warn', `Failed to send request_task to ${targetAgent}`, { projectId, taskId: task.id, agent: task.assignedAgent, targetParticipantId, runtimeInstance: task.assignedRuntimeInstance || null, error: err.message });
@@ -481,12 +489,12 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
         'runtime_offline',
         err.message,
       );
-      retryTaskIds.push(...failureRecoveryTaskIds(failed));
+      recoveryResults.push(failed);
     }
   }
 
-  if (retryTaskIds.length > 0) {
-    await sendBrokerRequestTasks(projectId, retryTaskIds);
+  if (recoveryResults.length > 0) {
+    await sendFailureRecovery(projectId, recoveryResults);
   }
 }
 
@@ -1136,10 +1144,10 @@ async function runStartupRecovery({ force = false } = {}) {
 
       if (needsDispatch) {
         const dispatchResult = hub.handleRequestDispatch(project.id, project.poAgent);
-        if (dispatchResult.ok && dispatchResult.dispatched.length > 0) {
+        if (dispatchResult.ok && (dispatchResult.dispatched.length > 0 || dispatchResult.workflowNodeDispatches?.length > 0)) {
           log('info', `Startup recovery redispatched tasks`, { projectId: project.id, dispatched: dispatchResult.dispatched });
           broadcast({ type: 'tasks_dispatched', projectId: project.id, dispatched: dispatchResult.dispatched });
-          await sendBrokerRequestTasks(project.id, dispatchResult.dispatched);
+          await sendDispatchResult(project.id, dispatchResult);
         }
       }
 
@@ -1211,16 +1219,13 @@ function handleBrokerIntent(intent) {
         retried: result.retried,
       });
       broadcast({ type: 'task_failed', projectId: resolved.projectId, taskId: resolved.taskId, agent: logicalParticipantId, ...result });
-      const recoveryTaskIds = failureRecoveryTaskIds(result);
-      if (recoveryTaskIds.length > 0) {
-        sendBrokerRequestTasks(resolved.projectId, recoveryTaskIds).catch(err => {
-          log('warn', 'Failed to deliver retry request_task to broker', {
-            projectId: resolved.projectId,
-            recoveryTaskIds,
-            error: String(err?.message || err),
-          });
+      sendFailureRecovery(resolved.projectId, [result]).catch(err => {
+        log('warn', 'Failed to deliver task recovery to broker', {
+          projectId: resolved.projectId,
+          taskId: resolved.taskId,
+          error: String(err?.message || err),
         });
-      }
+      });
       break;
     }
     case 'submit_result': {
@@ -2442,8 +2447,7 @@ async function handleRequest(req, res) {
           workflowDispatched: result.dispatch?.workflowDispatched || [],
         });
         if (result.dispatch?.ok) {
-          await sendBrokerRequestTasks(projectId, result.dispatch.dispatched || []);
-          await sendWorkflowNodeHandoffs(projectId, result.dispatch.workflowNodeDispatches || []);
+          await sendDispatchResult(projectId, result.dispatch);
         }
       }
       return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 400);
@@ -2500,9 +2504,7 @@ async function handleRequest(req, res) {
             result.reviewNotification = 'not_available';
           }
         }
-        if ((result.dispatched || []).length > 0) {
-          await sendBrokerRequestTasks(projectId, result.dispatched || []);
-        }
+        await sendDispatchResult(projectId, result);
       }
       return json(res, result, result.status || (result.ok ? 200 : 400));
     }
@@ -2826,16 +2828,14 @@ async function handleRequest(req, res) {
           if (dispatchResult.ok && (dispatchResult.dispatched.length > 0 || dispatchResult.workflowNodeDispatches?.length > 0)) {
             log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
             broadcast({ type: 'tasks_dispatched', projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
-            await sendBrokerRequestTasks(projectId, dispatchResult.dispatched);
-            await sendWorkflowNodeHandoffs(projectId, dispatchResult.workflowNodeDispatches || []);
+            await sendDispatchResult(projectId, dispatchResult);
           }
         }
 
         // If rework created a fresh run, notify through the normal request_task path.
-        if (result.rework && result.dispatch?.ok && (result.dispatched || []).length > 0) {
+        if (result.rework && result.dispatch?.ok && ((result.dispatched || []).length > 0 || result.dispatch.workflowNodeDispatches?.length > 0)) {
           broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
-          await sendBrokerRequestTasks(projectId, result.dispatched || []);
-          await sendWorkflowNodeHandoffs(projectId, result.dispatch.workflowNodeDispatches || []);
+          await sendDispatchResult(projectId, result.dispatch);
         } else if (result.rework && brokerClient && brokerClient.isConnected()) {
           const board = hub.getBoard(projectId);
           const task = board?.getTask(taskId);
@@ -3088,7 +3088,7 @@ async function handleRequest(req, res) {
 
       if (result.dispatch?.ok) {
         broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
-        await sendBrokerRequestTasks(projectId, result.dispatched || []);
+        await sendDispatchResult(projectId, result.dispatch);
       }
 
       return json(res, result);
@@ -3146,8 +3146,7 @@ async function handleRequest(req, res) {
         log('info', `Dispatched tasks for project ${projectId}`, { dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
         broadcast({ type: 'tasks_dispatched', projectId, dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
 
-        await sendBrokerRequestTasks(projectId, result.dispatched || []);
-        await sendWorkflowNodeHandoffs(projectId, result.workflowNodeDispatches || []);
+        await sendDispatchResult(projectId, result);
       }
       return json(res, result);
     }
@@ -3200,10 +3199,7 @@ async function handleRequest(req, res) {
       if (result.ok) {
         log('info', `Task failed: ${taskId}`, { projectId, failureReason: result.failureReason, retried: result.retried });
         broadcast({ type: 'task_failed', projectId, taskId, ...result });
-        const recoveryTaskIds = failureRecoveryTaskIds(result);
-        if (recoveryTaskIds.length > 0) {
-          await sendBrokerRequestTasks(projectId, recoveryTaskIds);
-        }
+        await sendFailureRecovery(projectId, [result]);
       }
       return json(res, result);
     }
@@ -3998,16 +3994,13 @@ function runStalledRunWatchdog() {
         );
         log(result.ok ? 'warn' : 'error', `Marked run stalled: ${action.taskId}`, { ...action, result });
         broadcast({ type: 'run_stalled', ...action, result });
-        const recoveryTaskIds = failureRecoveryTaskIds(result);
-        if (recoveryTaskIds.length > 0) {
-          sendBrokerRequestTasks(action.projectId, recoveryTaskIds).catch(err => {
-            log('warn', 'Failed to deliver stalled-run recovery task', {
-              projectId: action.projectId,
-              recoveryTaskIds,
-              error: String(err?.message || err),
-            });
+        sendFailureRecovery(action.projectId, [result]).catch(err => {
+          log('warn', 'Failed to deliver stalled-run recovery task', {
+            projectId: action.projectId,
+            taskId: action.taskId,
+            error: String(err?.message || err),
           });
-        }
+        });
         continue;
       }
       if (action.type === 'request_cancel_run') {
@@ -4033,8 +4026,9 @@ function runStalledRunWatchdog() {
     );
     if (dueRetry && project.status === 'active') {
       const sweep = hub.handleRequestDispatch(project.id, project.poAgent);
-      if (sweep?.ok && sweep.dispatched?.length > 0) {
+      if (sweep?.ok && (sweep.dispatched?.length > 0 || sweep.workflowNodeDispatches?.length > 0)) {
         log('info', 'Backoff redispatch swept due retries', { projectId: project.id, dispatched: sweep.dispatched });
+        sendDispatchResult(project.id, sweep).catch(err => log('warn', 'Backoff recovery delivery failed', {projectId:project.id,error:String(err?.message || err)}));
       }
     }
   }
