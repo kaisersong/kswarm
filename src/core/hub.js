@@ -4890,6 +4890,28 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
   }
 
+  function workflowDependencyOutputs(workflowRun) {
+    const taskScope = workflowRun.workflowId === PO_GENERATED_TASK_WORKFLOW_ID;
+    if (!taskScope && workflowRun.workflowId !== PO_GENERATED_PROJECT_WORKFLOW_ID) return null;
+    const board = boards.get(workflowRun.projectId);
+    const source = taskScope ? board?.getTask(workflowRun.scope?.taskId) : null;
+    if (!board || taskScope && !source) return null;
+    const dependencies = taskScope ? new Set(source.dependencies || []) : null;
+    const outputs = {};
+    for (const task of board.getAllTasks()) {
+      if (task.status !== 'done' || dependencies && !dependencies.has(task.id)) continue;
+      const compact = compactNodeOutput({ id: task.id, title: task.title, output: task.result });
+      const artifactPaths = compact?.artifactPaths?.filter(path => typeof path === 'string' && path.length > 0);
+      if (!artifactPaths?.length) continue;
+      const workFolder = readWorkflowString(task.result?.workFolder) || readWorkflowString(task.result?.workspacePath);
+      outputs[task.id] = { taskId: task.id, title: task.title, artifactPaths,
+        ...(compact.summary ? { summary: compact.summary.slice(0, INLINE_MAX_CHARS) } : {}),
+        ...(workFolder ? { workFolder } : {}),
+      };
+    }
+    return outputs;
+  }
+
   function enrichWorkflowNodeInput(workflowRun, input = null, { nodeId = null } = {}) {
     const base = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : { value: input };
 
@@ -4934,6 +4956,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       upstreamOutputs = null;
     }
 
+    const dependencyOutputs = workflowDependencyOutputs(workflowRun);
     return {
       ...base,
       workflowRunId: workflowRun.id,
@@ -4944,6 +4967,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         taskId: workflowRun.scope?.taskId || null,
       },
       sourceTask: base.sourceTask || workflowRun.sourceTask || null,
+      ...(dependencyOutputs ? { dependencyOutputs } : {}),
       ...(upstreamOutputs ? { upstreamOutputs } : {}),
     };
   }

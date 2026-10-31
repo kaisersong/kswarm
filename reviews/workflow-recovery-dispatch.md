@@ -53,3 +53,11 @@ RED/GREEN：真实 Hub 的自动改派转工作流、continue 重试、普通 re
 设计与实施前对抗性自审：对成功完成且 taskSubmission.status=submitted 的生产 workflow receipt，从当前 Hub board 读取同一 scope task 的真实 result，交给既有 deliverReviewSubmission 持久队列；不把 workflow reviewer 的通过当作 PO 验收，不改 done/依赖或审批规则。失败、blocked、already_submitted、task/run identity 不符均不得发送。此源任务工作流仅从 broker review 入口完成；script HTTP result 不产生该 receipt，不增加路由权限。测试真实 Hub 完成及真实产物证据，确认正确项目/任务/run 提交被送入既有 queue；源码 contract 仅辅助确认生产入口接线。
 
 第三/四轮验证：真实 Hub watchdog 场景先 RED（错误 reset→pending），修复后 source status/run identity 原样保留；工作流到 PO queue 的生产入口 contract 先 RED，真实 Hub 完成+artifact 的 transport 回归通过（按真实 provenance.workflowRunId 绑定）。最终行为用例 12/12，server contract 5/5，legacy watchdog 19/19、runtime watchdog 12/12；npm test 与 npm run test:all 均退出 0。两个新增场景接入 test:workflow/test:all。真实项目 worker 写入/回读与 workflow review/gate 已完成；PO 验收通知及后续依赖的本地验收继续进行，不把 submitted 当 done。
+
+## 第五轮：上游产物路径交接
+
+现状诊断已由 PO 正式验收，依赖任务自动启动。但真实节点反复猜测文件名：任务工作流 input.taskSnapshot 只有 ID/标题/状态，没有任何上游 result/artifact，artifact-only 执行器也没有目录检索工具。已生成文件存在于不同真实文件名和嵌套 run 目录中，缺少指针使依赖消费者无法复用证据。
+
+设计与实施前对抗性自审：在真正构建 node handoff 的 enrichWorkflowNodeInput 中，从同项目 board 最新 done 任务收集指针；任务工作流只收集其声明的直接依赖，项目工作流收集已完成任务。复用既有 compactNodeOutput 提取 artifactPaths，仅传任务 ID/标题、有界 summary、workFolder 与路径，不内联正文/任意 result 字段；不增加工具、读路径权限或目录访问。review 仍保留自己的 upstreamOutputs，两者不互相覆盖。测试真实 Hub 的自动派发、批准旧 proposal 后更新上游产物的派发、项目工作流消费，确认路径准确、使用最新结果、未完成/非依赖结果不泄露。先 RED 再生产；仅停止缺输入的当前消费者重试，已验收任务/产物不重做。
+
+第五轮验证：自动派发、旧 proposal 后上游更新、project workflow 三项均先 RED（依赖路径缺失），修复后三项通过；结合恢复/所有权/PO 队列最终行为 15/15。npm test 与最终 npm run test:all 退出 0（清理测试依赖 symlink 后曾使 isolated HTTP fixture 无法启动；恢复本工作树依赖后重跑通过，保留失败日志）；hub syntax 与 diff check 通过。新增三项接入 test:workflow/test:all。输入仅携带同项目已完成依赖的指针及有界摘要，空集合也覆盖旧 retry input，防止继承过期结果。
