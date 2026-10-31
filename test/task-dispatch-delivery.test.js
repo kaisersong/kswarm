@@ -75,3 +75,24 @@ test('starts both transports and reports errors after the other settles',async()
 test('failed dispatch results do not send either transport',async()=>{
   await deliverDispatchResult({projectId:'proj-fictional',dispatch:{ok:false,dispatched:['task'],workflowNodeDispatches:[{}]},sendTasks:async()=>assert.fail(),sendWorkflowNodes:async()=>assert.fail()});
 });
+
+test('completed real task workflow hands its submitted artifact to the PO review queue',async()=>{
+  const {deliverWorkflowTaskReview}=await import('../src/server/task-dispatch-delivery.js');
+  const {mkdtempSync,writeFileSync,rmSync}=await import('node:fs'),{join}=await import('node:path'),{tmpdir}=await import('node:os');
+  const root=mkdtempSync(join(tmpdir(),'fictional-workflow-review-'));
+  try{const {hub,project,board,task}=fixture(),failed=hub.handleTaskFail(project.id,task.id,'desktop_runtime_error','fictional protocol failure');
+    const worker=failed.replacementDispatch.workflowNodeDispatches[0],artifact=join(root,'fictional-analysis.md');writeFileSync(artifact,'# Fictional analysis\nEvidence and conclusions.\n');
+    const produced=hub.handleWorkflowNodeResult({workflowRunId:worker.workflowRunId,nodeId:worker.nodeId,attempt:worker.attempt,handoffId:worker.handoffId,fromAgent:worker.targetParticipantId,output:{summary:'Fictional analysis complete',artifacts:[{path:artifact,kind:'markdown'}],workFolder:root,evidenceRefs:['artifact:'+artifact]}});
+    const review=produced.dispatches[0],completed=hub.handleWorkflowNodeReview({workflowRunId:worker.workflowRunId,nodeId:review.nodeId,attempt:review.attempt,handoffId:review.handoffId,fromAgent:review.targetParticipantId,reviewDecision:{status:'passed',reason:'Fictional evidence verified',evidenceRefs:['artifact:'+artifact]},output:{summary:'Review complete'}});
+    assert.equal(completed.workflowRun.status,'completed');assert.equal(board.getTask(task.id).status,'submitted');
+    const calls=[],getTask=(p,t)=>hub.getBoard(p)?.getTask(t);
+    await deliverWorkflowTaskReview({result:completed,getTask,sendReview:async input=>calls.push(input)});
+    assert.equal(calls.length,1);assert.equal(calls[0].projectId,project.id);assert.equal(calls[0].taskId,task.id);
+    assert.equal(calls[0].result.provenance.workflowRunId,worker.workflowRunId);assert.equal(calls[0].fromWorker,board.getTask(task.id).assignedAgent);
+    assert.deepEqual(calls[0].result,board.getTask(task.id).result);assert.equal(calls[0].submittedAt,board.getTask(task.id).updatedAt);
+    assert.equal(board.getTask(task.id).status,'submitted','notification must not approve task');
+    const rejects=[{...completed,ok:false},{...completed,workflowRun:{...completed.workflowRun,status:'blocked'}},{...completed,workflowRun:{...completed.workflowRun,taskSubmission:{...completed.workflowRun.taskSubmission,status:'already_submitted'}}}];
+    for(const result of rejects)await deliverWorkflowTaskReview({result,getTask,sendReview:async()=>assert.fail('rejected receipt notified')});
+    await deliverWorkflowTaskReview({result:completed,getTask:()=>({...board.getTask(task.id),activeRunId:'other-run',result:{...board.getTask(task.id).result,provenance:{workflowRunId:'other-run'}}}),sendReview:async()=>assert.fail('wrong run notified')});
+  }finally{rmSync(root,{recursive:true,force:true});}
+});

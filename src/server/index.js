@@ -45,7 +45,7 @@ import { probeAgentGeneration, probeAgentRuntime, supportsGenerationProbe } from
 import { isSupportedCliRuntimeType, resolveAgentRuntimeSelection } from '../core/agent-runtime-selection.js';
 import { runtimeCatalogEntry } from '../core/runtime-capabilities.js';
 import { planStalledRunActions } from '../core/run-watchdog.js';
-import { deliverDispatchResult, deliverFailureRecoveryResults } from './task-dispatch-delivery.js';
+import { deliverDispatchResult, deliverFailureRecoveryResults, deliverWorkflowTaskReview } from './task-dispatch-delivery.js';
 import { recordRuntimeFailure } from '../core/runtime-health.js';
 import {
   deriveProjectPreparation,
@@ -350,6 +350,10 @@ function sendDispatchResult(projectId, dispatch) {
 
 function sendFailureRecovery(projectId, results) {
   return deliverFailureRecoveryResults({projectId, results, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs});
+}
+
+function sendWorkflowResultReview(result) {
+  return deliverWorkflowTaskReview({result,getTask:(projectId,taskId)=>hub.getBoard(projectId)?.getTask(taskId),sendReview:deliverReviewSubmission});
 }
 
 async function sendBrokerRequestTasks(projectId, taskIds = []) {
@@ -1302,6 +1306,7 @@ function handleBrokerIntent(intent) {
       if (!result.ok) return emitTaskIntentError(kind, taskId, logicalParticipantId, { ...result, projectId });
       log('info', `Workflow node result accepted: ${payload.nodeId}`, { projectId, workflowRunId: payload.workflowRunId, fromParticipantId, agent: logicalParticipantId });
       broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
+      sendWorkflowResultReview(result).catch(err => log('warn', 'Failed to enqueue workflow submission review', {projectId,workflowRunId:payload.workflowRunId,error:String(err?.message || err)}));
       if (result.dispatches?.length > 0) {
         sendWorkflowNodeHandoffs(projectId, result.dispatches).catch(err => {
           log('warn', 'Failed to deliver workflow node handoffs', {

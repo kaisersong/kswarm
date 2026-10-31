@@ -39,3 +39,17 @@ RED/GREEN：真实 Hub 的自动改派转工作流、continue 重试、普通 re
 - `npm test`、`npm run test:all`：退出码 0。新增行为测试已接入 test:workflow 与 test:all，无新增依赖。
 - `node --check src/server/index.js` 通过。
 - 用户项目恢复经已有语义 API，旧 run 保留取消原因，新的 handoff 得到 broker 在线投递回执和 Desktop 的 started 回执。随后的真实执行暴露独立的模型终止边界错误；不能把该次 started 当项目完成。模型修复在单独 xiaok-cli 分支验证，真实项目继续验收另记本机私有日志，不将用户材料提交仓库。
+
+## 第三轮：两个 watchdog 的工作流所有权
+
+真实写文件恢复后，复查发现 run-watchdog 已跳过 workflow-owned source task，但仍并行运行的 legacy watchdog 不检查所有权，10 分钟后可以把合法 worker→review 流程的 source task 重置到 pending，丢失 activeRunId。原项目里出现过这种回退；不能只修其中一个 watchdog。
+
+设计与实施前对抗性自审：复用 run-watchdog 既有 isWorkflowOwnedTask 判定，legacy owner 同样跳过 workflow task；普通 direct task 保持既有超时行为。只消除两个 owner 的竞争，不扩大执行预算、不把 blocked 当成功、不自动审批，不新增重试。用真实 Hub 生成工作流派发，运行真实 legacy watchdog 超过 timeout 并核对 source status/run ID 原样保留；先 RED 再 production。安装须等当前节点安全边界，不能为装补丁中断正在生成的交付物。
+
+## 第四轮：评审通过后的 PO 交接
+
+真实工作流 worker→review→gate 已全部 completed，源任务停在 submitted，且没有执行中的任务。项目只提供手动 notify_po_review 继续入口。核实 broker workflow_node_result 仅广播与发下游 node，不像普通 submit_result 那样调用持久 review queue，导致后续依赖仍等待。
+
+设计与实施前对抗性自审：对成功完成且 taskSubmission.status=submitted 的生产 workflow receipt，从当前 Hub board 读取同一 scope task 的真实 result，交给既有 deliverReviewSubmission 持久队列；不把 workflow reviewer 的通过当作 PO 验收，不改 done/依赖或审批规则。失败、blocked、already_submitted、task/run identity 不符均不得发送。此源任务工作流仅从 broker review 入口完成；script HTTP result 不产生该 receipt，不增加路由权限。测试真实 Hub 完成及真实产物证据，确认正确项目/任务/run 提交被送入既有 queue；源码 contract 仅辅助确认生产入口接线。
+
+第三/四轮验证：真实 Hub watchdog 场景先 RED（错误 reset→pending），修复后 source status/run identity 原样保留；工作流到 PO queue 的生产入口 contract 先 RED，真实 Hub 完成+artifact 的 transport 回归通过（按真实 provenance.workflowRunId 绑定）。最终行为用例 12/12，server contract 5/5，legacy watchdog 19/19、runtime watchdog 12/12；npm test 与 npm run test:all 均退出 0。两个新增场景接入 test:workflow/test:all。真实项目 worker 写入/回读与 workflow review/gate 已完成；PO 验收通知及后续依赖的本地验收继续进行，不把 submitted 当 done。

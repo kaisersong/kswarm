@@ -26,7 +26,7 @@ test('server runtime failure list excludes task and output contract failures', (
 });
 
 test('every server task-failure entry point schedules retry and replacement deliveries', () => {
-  assert.match(source, /import \{ deliverDispatchResult, deliverFailureRecoveryResults \} from ['"]\.\/task-dispatch-delivery\.js['"]/);
+  assert.match(source, /import \{ deliverDispatchResult, deliverFailureRecoveryResults, deliverWorkflowTaskReview \} from ['"]\.\/task-dispatch-delivery\.js['"]/);
   assert.match(source, /deliverDispatchResult\(\{projectId, dispatch, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
   assert.match(source, /deliverFailureRecoveryResults\(\{projectId, results, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
 
@@ -79,6 +79,12 @@ test('agent list refreshes broker presence and shares the routing profile overla
   assert.match(listRoute, /await refreshBrokerOnlineAgentIds\(\)/);
   assert.match(listRoute, /listAgentProfilesForRouting\(\{ includeArchived \}\)/);
   assert.doesNotMatch(listRoute, /agentStore\.list\(/);
+});
+
+test('workflow completion schedules the existing durable PO review delivery',()=>{
+  const brokerCase=source.slice(source.indexOf("case 'workflow_node_result':"),source.indexOf("case 'workflow_node_failed':"));
+  assert.match(brokerCase,/sendWorkflowResultReview\(result\)/);
+  assert.match(source,/sendReview:deliverReviewSubmission/);
 });
 
 let passed = 0;

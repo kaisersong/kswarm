@@ -25,3 +25,14 @@ export async function deliverFailureRecoveryResults({projectId,results,sendTasks
   }
   return deliverDispatchResult({projectId,dispatch:{ok:true,dispatched:[...taskIds],workflowNodeDispatches:[...nodes.values()]},sendTasks,sendWorkflowNodes});
 }
+
+/** A workflow review is evidence for PO review, never an implicit task approval. */
+export async function deliverWorkflowTaskReview({result,getTask,sendReview}) {
+  const run=result?.workflowRun,receipt=run?.taskSubmission;
+  if (result?.ok !== true || run?.status !== 'completed' || run.workflowId !== 'po-generated-task-workflow'
+    || receipt?.status !== 'submitted' || receipt.taskId !== run.scope?.taskId
+    || receipt.runId !== `workflow-${run.id}`) return;
+  const task=getTask(run.projectId,receipt.taskId);
+  if (task?.status !== 'submitted' || !task.assignedAgent || task.id !== receipt.taskId || task.result?.provenance?.workflowRunId !== run.id) return;
+  return sendReview({projectId:run.projectId,taskId:task.id,fromWorker:task.assignedAgent,result:task.result,submittedAt:task.updatedAt});
+}
