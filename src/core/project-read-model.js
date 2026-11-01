@@ -47,6 +47,7 @@ export function deriveExecutionGraph({
   bindings = [],
   artifacts = [],
   finalDeliverables = [],
+  now = Date.now(),
 } = {}) {
   const normalizedTasks = Array.isArray(tasks) ? tasks : [];
   const normalizedWorkflowRuns = Array.isArray(workflowRuns) ? workflowRuns : [];
@@ -79,6 +80,7 @@ export function deriveExecutionGraph({
   }
 
   for (const workflowRun of normalizedWorkflowRuns) {
+    const historical = isHistoricalTaskWorkflowRun({ project, tasks: normalizedTasks, workflowRun, now });
     for (const workflowNode of Array.isArray(workflowRun?.nodes) ? workflowRun.nodes : []) {
       const binding = resolveWorkflowNodeBinding({
         project,
@@ -94,12 +96,12 @@ export function deriveExecutionGraph({
         displayId: binding.userFacingId || binding.stableNodeId,
         title: workflowNode.title || workflowNode.label || workflowNode.id,
         source: workflowRun.scope?.taskId ? 'script_workflow' : 'project_workflow',
-        ownership: binding.taskId ? 'delegated_to_workflow' : 'unbound',
+        ownership: historical ? 'historical_task_attempt' : binding.taskId ? 'delegated_to_workflow' : 'unbound',
         ...(binding.taskId ? { taskId: binding.taskId } : {}),
         workflowRunId: workflowRun.id,
         workflowNodeId: workflowNode.id,
         status,
-        required: workflowNode.required !== false,
+        required: workflowNode.required !== false && !historical,
         expectedDeliverableKind: inferWorkflowExpectedDeliverableKind(workflowNode),
         expectedFormat: inferExpectedFormat(workflowNode),
         assignedAgent: workflowNode.assignedAgent || null,
@@ -112,11 +114,12 @@ export function deriveExecutionGraph({
     }
   }
 
-  const counts = countExecutionNodes(nodes);
+  const counts = countExecutionNodes(nodes.filter(node => node.ownership !== 'historical_task_attempt'));
   return {
     projectId: project?.id || null,
     nodes,
     counts,
+    historyCounts: countExecutionNodes(nodes.filter(node => node.ownership === 'historical_task_attempt')),
     derivedAt: new Date().toISOString(),
   };
 }
@@ -132,7 +135,7 @@ export function deriveProjectLifecycle({
   reviewConditions = [],
   now = Date.now(),
 } = {}) {
-  const executionGraph = deriveExecutionGraph({ project, tasks, workflowRuns, bindings, artifacts, finalDeliverables });
+  const executionGraph = deriveExecutionGraph({ project, tasks, workflowRuns, bindings, artifacts, finalDeliverables, now });
   const issues = [];
   const legacyStatus = project?.status || 'created';
   const approvedFinal = selectApprovedFinalDeliverable(finalDeliverables);
@@ -229,7 +232,8 @@ export function deriveProjectLifecycle({
     projectId: project?.id || null,
     state,
     canDispatch: ['active', 'running', 'ready_to_start'].includes(state),
-    canResume: state === 'blocked' || workflowRuns.some(run => run?.recovery?.nextAction === 'resume_workflow'),
+    canResume: state === 'blocked' || workflowRuns.some(run => run?.recovery?.nextAction === 'resume_workflow'
+      && !isHistoricalTaskWorkflowRun({ project, tasks, workflowRun: run, now })),
     canRegisterFinalDeliverable: ['active', 'running', 'ready_to_deliver', 'legacy_needs_reconciliation'].includes(state),
     canAutoClose,
     ...(primaryAction ? { primaryAction } : {}),
@@ -278,6 +282,28 @@ export function evaluateFinalDeliverableApprovalFacts({
   if (hasOpenBlockingCondition) return { ok: false, error: 'open_review_conditions' };
 
   return { ok: true };
+}
+
+// A later independent source-task review supersedes attempt progress, never
+// the attempt's original verdict. Missing/ambiguous chronology stays current.
+export function isHistoricalTaskWorkflowRun({ project, tasks = [], workflowRun: run, now = Date.now() } = {}) {
+  if (!project?.id || run?.projectId !== project.id || run?.scope?.projectId !== project.id
+    || run?.source !== 'po_generated' || run?.workflowId !== 'po-generated-task-workflow'
+    || !['completed', 'blocked', 'failed', 'cancelled'].includes(run?.status)) return false;
+  const id = run.scope.taskId;
+  if (typeof id !== 'string' || !id.startsWith(`${project.id}__`)) return false;
+  const matches = tasks.filter(task => task?.id === id);
+  if (matches.length !== 1) return false;
+  const task = matches[0];
+  if (task.projectId !== project.id || task.status !== 'done' || task.reviewResult?.passed !== true) return false;
+  const validTime = value => typeof value === 'number' && Number.isFinite(value) && value > 0;
+  const reviewedAt = task.reviewResult.reviewedAt;
+  if (!validTime(now) || !validTime(reviewedAt) || reviewedAt > now
+    || !validTime(run.createdAt) || !validTime(run.updatedAt)) return false;
+  const times = [run.createdAt, run.updatedAt, run.startedAt, run.completedAt, run.cancelledAt,
+    ...(Array.isArray(run.nodes) ? run.nodes.flatMap(node => [node.startedAt, node.completedAt, node.updatedAt]) : [])]
+    .filter(value => value !== undefined && value !== null);
+  return times.every(value => validTime(value) && value < reviewedAt);
 }
 
 /**
