@@ -20,7 +20,7 @@ function createActiveProject(hub, id = 'proj-boundary') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '输出诊断材料', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   const approved = hub.handleApprove(id);
   assert.equal(approved.ok, true);

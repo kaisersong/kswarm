@@ -1,3 +1,6 @@
+import {createOwnedDefaultDispatchBusiness} from './owned-default-dispatch-business.js';
+import{createServerTaskDeliveryOwner}from'./task-delivery-owner.js';
+import {installOwnedDesktopControl} from './owned-desktop-control.js';
 import { activityServiceIdentity } from './activity-service-identity.js';
 /**
  * KSwarm API Server
@@ -15,12 +18,14 @@ import http from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
-import { createHub } from '../core/hub.js';
+import { createHub,bindHubServerScheduler } from '../core/hub.js';
 import { recoverProjectsIndependently } from '../core/project-recovery-isolation.js';
 import { createAgentStore } from '../core/agent-store.js';
 import { getCapabilityCatalog } from '../core/capability-catalog.js';
 import { createTeamOperationStore } from '../core/team-operation-store.js';
 import { createMutationAuthority, createTeamProvisioningHub } from '../core/persistence-hub.js';
+import {createProjectInputAuthority} from '../core/project-input-authority.js';
+import {readTaskInitialClaimInput} from '../core/initial-plan-semantic-schema.js';
 import { createBrokerClient } from '../net/broker-client.js';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join, extname, resolve, relative, isAbsolute } from 'node:path';
@@ -63,10 +68,10 @@ import { createQualityOverlayStore } from '../core/quality-overlays.js';
 import { handleQualityApiRequest } from './quality-api.js';
 import {
   getProjectWorkspace as getProjectWorkspaceRecord,
+  lookupProjectWorkspace as lookupProjectWorkspaceRecord,
   initProjectWorkspace as initProjectWorkspaceRecord,
   setProjectWorkspace as setProjectWorkspaceRecord,
 } from './project-workspace.js';
-import { sendTaskToBrokerParticipant } from './broker-task-delivery.js';
 import {
   createAutoWorkerSpawnConfig,
   spawnAutoWorkerProcess,
@@ -75,7 +80,6 @@ import { buildAgentChildEnv } from './agent-child-env.js';
 import { createArtifactRecord, enrichArtifactRecordFromFile, listArtifactRecords } from './artifact-record.js';
 import { resolveArtifactPath } from './artifact-path-resolver.js';
 import { canSpawnAutoWorkerForTask } from '../core/runtime-execution-boundary.js';
-import { createBrokerTaskRequest } from './broker-task-request.js';
 import { normalizeProjectAgentSelection, reconcileProjectAgentSelectionWithEffectiveAgents } from '../core/agent-selection.js';
 import { getEffectiveAgentConcurrency } from '../core/effective-agent-concurrency.js';
 import { applyBrokerPresenceToAgentProfiles } from '../core/broker-presence.js';
@@ -91,6 +95,9 @@ const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
 const RUNTIME_TOKEN = process.env.KSWARM_RUNTIME_TOKEN || '';
 const DESKTOP_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
+const desktopProjectAuthority = /^[a-f0-9]{64}$/.test(process.env.KSWARM_DESKTOP_PROFILE_ID || '')
+  && /^[a-f0-9]{64}$/.test(process.env.KSWARM_DESKTOP_WORKSPACE_ID || '')
+  ? createProjectInputAuthority({profileId:process.env.KSWARM_DESKTOP_PROFILE_ID,workspaceId:process.env.KSWARM_DESKTOP_WORKSPACE_ID}) : null;
 const XIAOK_DESKTOP_HOST_PARTICIPANT_ID = 'xiaok-desktop';
 const MAX_SUSPEND_MS = 300_000;
 const SERVICE_FEATURES = [
@@ -140,11 +147,20 @@ function listAgentProfilesForRouting({ includeArchived = false } = {}) {
   return agents.map(agent => activeProfileById.get(agent.id) || agent);
 }
 
+const dispatchBusiness=desktopProjectAuthority?createOwnedDefaultDispatchBusiness({scope:{profileId:process.env.KSWARM_DESKTOP_PROFILE_ID,workspaceId:process.env.KSWARM_DESKTOP_WORKSPACE_ID}}):null;
 const hub = createHubOrExit();
+const ownedDispatchBusiness=dispatchBusiness?.install(hub,{onPersistenceCommitFailure:failStopOnPersistenceCommit});
+const serverScheduler=bindHubServerScheduler(hub);
+const schedulerContext=Object.freeze({requestSource:'scheduler'});
+const ownedDesktopControl=installOwnedDesktopControl({hub,dispatchBusiness:ownedDispatchBusiness,onPersistenceCommitFailure:failStopOnPersistenceCommit,scope:desktopProjectAuthority?{profileId:process.env.KSWARM_DESKTOP_PROFILE_ID,workspaceId:process.env.KSWARM_DESKTOP_WORKSPACE_ID}:null});
 
 function createHubOrExit() {
   try {
     return createHub({
+      defaultDispatchActionSource:dispatchBusiness?.source??null,
+      defaultDispatchPreparationSource:dispatchBusiness?.preparationSource??null,
+      dshBusinessSource:dispatchBusiness?.dshSource??null,
+      dshBudgetSource:dispatchBusiness?.dshBudgetSource??null,
       eventLogDir: join(KSWARM_HOME, 'events'),
       silent: false,
       projectStorageRoot: PROJECTS_DIR,
@@ -192,7 +208,7 @@ function createHubOrExit() {
 
 // ─── Agent Store ──────────────────────────────────────────────────
 agentStore = createAgentStore({
-  onTeamRelevantChange: ({ agentId }) => hub.invalidateTeamPlansForAgent(agentId),
+  onTeamRelevantChange: ({ agentId }) => serverScheduler.invalidateAgentTeamPlans(agentId,schedulerContext),
 });
 const teamOperationStore = createTeamOperationStore({ filePath: join(KSWARM_HOME, 'team-operations.json') });
 const teamProvisioningHub = createTeamProvisioningHub({
@@ -236,29 +252,20 @@ function setProjectWorkspace(projectId, newPath) {
 }
 
 function normalizePersistedProjectPoAgents() {
-  const agents = agentStore?.list({ includeArchived: false }) || [];
-  let changed = 0;
-  for (const project of hub.listProjects()) {
-    if (!project || ['closed', 'delivered'].includes(project.status)) continue;
-    const resolution = resolvePlanRetryPoAgent(project, agents);
-    if (resolution.changed && resolution.poAgent) {
-      const previousPoAgent = project.poAgent;
-      project.poAgent = resolution.poAgent;
-      changed++;
-      log('info', 'Project PO normalized to executable runtime', {
-        projectId: project.id,
-        previousPoAgent,
-        poAgent: project.poAgent,
-        reason: resolution.reason,
-      });
-    }
-    if (reconcileProjectAgentSelectionWithEffectiveAgents(project)) changed++;
-  }
-  if (changed > 0) hub.persistState();
+  const result=serverScheduler.normalizePoAgents(agentStore?.list({includeArchived:false})??[],schedulerContext);
+  for(const change of result.changes)log('info','Project PO normalized to executable runtime',change);
 }
 
-function listProjectArtifacts(projectId) {
-  const ws = getProjectWorkspace(projectId);
+function lookupProjectWorkspaceSnapshot(project){
+  if(project.requiredProtocol==='room_workspace_v1'){
+    const mapping=project.workspaceMapping;if(!mapping||mapping.state!=='active')throw Error('workspace_mapping_required');
+    return Object.freeze({path:mapping.workFolder,artifacts:mapping.artifactsDir,custom:true});
+  }
+  return lookupProjectWorkspaceRecord(projectWorkspaces,PROJECTS_DIR,project.id,project.workFolder);
+}
+
+function listProjectArtifacts(projectId,workspace) {
+  const ws = workspace??getProjectWorkspace(projectId);
   return listArtifactRecords({
     artifactsDir: ws.artifacts,
     projectId,
@@ -267,8 +274,8 @@ function listProjectArtifacts(projectId) {
   });
 }
 
-function enrichProjectTaskArtifacts(projectId, tasks) {
-  const ws = getProjectWorkspace(projectId);
+function enrichProjectTaskArtifacts(projectId, tasks,workspace) {
+  const ws = workspace??getProjectWorkspace(projectId);
   return tasks.map(task => {
     const result = task?.result;
     const artifacts = result && typeof result === 'object' && Array.isArray(result.artifacts)
@@ -314,12 +321,10 @@ function broadcast(msg) {
   }
 }
 
-hub.subscribeProjectActivity(notice => broadcast(notice));
+hub.serverObservation.subscribe(notice => broadcast(notice));
 
 normalizePersistedProjectPoAgents();
-const interruptedTaskWorkflows = hub.recoverInterruptedTaskWorkflows({
-  reason: 'kswarm_service_started',
-});
+const interruptedTaskWorkflows = serverScheduler.recoverStartup(schedulerContext);
 if (interruptedTaskWorkflows.recovered?.length > 0) {
   log('warn', 'Recovered interrupted task workflow runs on startup', {
     recovered: interruptedTaskWorkflows.recovered.length,
@@ -344,151 +349,18 @@ const RECOVERY_DEBOUNCE_MS = 15_000;
 const DEFER_RECOVERY_GRACE_MS = 20_000;
 const STARTUP_RECOVERY_DELAY_MS = 8_000;
 
-async function sendBrokerRequestTasks(projectId, taskIds = []) {
-  if (!brokerClient || !brokerClient.isConnected() || taskIds.length === 0) return;
-
-  const project = hub.getProject(projectId);
-  const board = hub.getBoard(projectId);
-  const ws = getProjectWorkspace(projectId);
-  const retryTaskIds = [];
-
-  for (const taskId of taskIds) {
-    const task = board?.getTask(taskId);
-    if (!task?.assignedAgent) continue;
-    const workspaceAdmission=await hub.authorizeWorkspaceDelivery(projectId,taskId);
-    if (!workspaceAdmission.ok) {
-      log('warn','Workspace delivery rejected',{projectId,taskId,error:workspaceAdmission.error});
-      continue;
-    }
-    const route = task.assignedRuntimeInstance
-      ? {
-          targetParticipantId: task.assignedRuntimeInstance,
-          targetAgentId: task.assignedRuntimeInstance,
-          executionMode: 'self_running',
-        }
-      : resolveAgentIntentRoute(task.assignedAgent);
-    const targetAgent = task.assignedAgent;
-    const targetParticipantId = route.targetParticipantId;
-    try {
-      const taskRequest = createBrokerTaskRequest({
-        handoffRoot: join(PROJECTS_DIR, projectId),
-        project,
-        workspace: ws,
-        task,
-        targetAgent,
-        targetParticipantId,
-      });
-      if (!taskRequest.ok) {
-        log('warn', `Failed to create task handoff for ${targetAgent}`, {
-          projectId,
-          taskId: task.id,
-          agent: task.assignedAgent,
-          runtimeInstance: task.assignedRuntimeInstance || null,
-          error: taskRequest.error,
-        });
-        const failed = hub.handleWorkerFailure(
-          projectId,
-          task.id,
-          targetAgent,
-          task.activeRunId,
-          'handoff_create_failed',
-          taskRequest.error || 'handoff_create_failed',
-        );
-        retryTaskIds.push(...failureRecoveryTaskIds(failed));
-        continue;
-      }
-      const delivery = await sendTaskToBrokerParticipant({
-        brokerClient,
-        targetId: targetParticipantId,
-        kind: 'request_task',
-        isOnline: isAgentOnBroker,
-        waitTimeoutMs: 8_000,
-        waitIntervalMs: 200,
-        request: taskRequest.request,
-      });
-      if (!delivery.ok) {
-        log('warn', `Failed to deliver request_task to ${targetAgent}`, {
-          projectId,
-          taskId: task.id,
-          agent: task.assignedAgent,
-          targetParticipantId,
-          runtimeInstance: task.assignedRuntimeInstance || null,
-          error: delivery.error,
-          delivery: delivery.delivery || null,
-        });
-        const fallbackAgent = !task.assignedRuntimeInstance ? agentStore?.get(task.assignedAgent) : null;
-        if (fallbackAgent?.fallbackToDesktopModel === true && targetParticipantId !== XIAOK_DESKTOP_HOST_PARTICIPANT_ID) {
-          recordAgentRuntimeFailure(task.assignedAgent, 'runtime_offline', delivery.error || 'delivery_failed');
-          const fallbackRequest = createBrokerTaskRequest({
-            handoffRoot: join(PROJECTS_DIR, projectId),
-            project,
-            workspace: ws,
-            task,
-            targetAgent,
-            targetParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
-          });
-          const fallbackDelivery = fallbackRequest.ok
-            ? await sendTaskToBrokerParticipant({
-                brokerClient,
-                targetId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
-                kind: 'request_task',
-                isOnline: isAgentOnBroker,
-                waitTimeoutMs: 8_000,
-                waitIntervalMs: 200,
-                request: fallbackRequest.request,
-              })
-            : { ok: false, error: fallbackRequest.error || 'fallback_handoff_failed' };
-          if (fallbackDelivery.ok) {
-            log('warn', `Agent runtime unavailable; task routed to Desktop current model`, {
-              projectId,
-              taskId: task.id,
-              agent: task.assignedAgent,
-              fallbackRuntime: 'desktop_current_model',
-            });
-            broadcast({
-              type: 'agent_runtime_fallback',
-              projectId,
-              taskId: task.id,
-              agent: task.assignedAgent,
-              fallbackRuntime: 'desktop_current_model',
-            });
-            continue;
-          }
-        }
-        if (!task.assignedRuntimeInstance && task.assignedAgent) {
-          agentStore?.setOffline(task.assignedAgent);
-        }
-        const failed = hub.handleWorkerFailure(
-          projectId,
-          task.id,
-          targetAgent,
-          task.activeRunId,
-          'runtime_offline',
-          delivery.error || 'delivery_failed',
-        );
-        retryTaskIds.push(...failureRecoveryTaskIds(failed));
-      }
-    } catch (err) {
-      log('warn', `Failed to send request_task to ${targetAgent}`, { projectId, taskId: task.id, agent: task.assignedAgent, targetParticipantId, runtimeInstance: task.assignedRuntimeInstance || null, error: err.message });
-      if (!task.assignedRuntimeInstance && task.assignedAgent) {
-        agentStore?.setOffline(task.assignedAgent);
-      }
-      const failed = hub.handleWorkerFailure(
-        projectId,
-        task.id,
-        targetAgent,
-        task.activeRunId,
-        'runtime_offline',
-        err.message,
-      );
-      retryTaskIds.push(...failureRecoveryTaskIds(failed));
-    }
-  }
-
-  if (retryTaskIds.length > 0) {
-    await sendBrokerRequestTasks(projectId, retryTaskIds);
-  }
+const taskDeliveryConstructionBinding=serverScheduler.takeTaskDeliveryOwnerConstructionBinding(schedulerContext);
+const taskDeliveryOwner=createServerTaskDeliveryOwner({hub,scheduler:serverScheduler,context:schedulerContext,originalConstructionBinding:taskDeliveryConstructionBinding,getBrokerClient:()=>brokerClient,
+  getProjectWorkspace,resolveAgentIntentRoute,projectsDir:PROJECTS_DIR,agentStore,isAgentOnBroker,recordAgentRuntimeFailure,broadcast,log,desktopParticipantId:XIAOK_DESKTOP_HOST_PARTICIPANT_ID});
+serverScheduler.bindTaskDeliveryOwner(taskDeliveryOwner,schedulerContext);
+const preparationTransportSource=ownedDispatchBusiness?.available?serverScheduler.takeDefaultDispatchPreparationTransportSource(taskDeliveryOwner,schedulerContext):null;
+let preparationClientInstalled=false,preparationClientUnavailable=false;
+function retirePreparationClient(){
+  if(!preparationTransportSource)return;
+  preparationClientUnavailable=true;ownedDispatchBusiness.sealPreparation();
 }
+
+async function sendBrokerRequestTasks(projectId,taskIds=[]){return taskDeliveryOwner.send(projectId,taskIds,schedulerContext);}
 
 async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
   if (!Array.isArray(dispatches) || dispatches.length === 0) return [];
@@ -575,8 +447,12 @@ async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
 
 function connectBroker() {
   try {
+    // A different client is a different SDK owner. Existing preparation tails
+    // retain their original client; ordinary Broker recovery cannot regrant it.
+    if(preparationClientInstalled)retirePreparationClient();
     brokerClient = createBrokerClient({
       brokerUrl: BROKER_URL,
+      preparationSource:preparationClientUnavailable?null:preparationTransportSource,
       participantId: 'kswarm-hub',
       kind: 'hub',
       alias: 'kswarm',
@@ -595,18 +471,26 @@ function connectBroker() {
         scheduleStartupRecovery(STARTUP_RECOVERY_DELAY_MS);
       },
       onDisconnect: () => {
+        retirePreparationClient();
         brokerConnected = false;
         broadcast({ type: 'broker_status', connected: false });
       },
     });
+    if(preparationTransportSource&&!preparationClientInstalled&&!preparationClientUnavailable){
+      serverScheduler.bindDefaultDispatchPreparationClient(taskDeliveryOwner,brokerClient,schedulerContext);
+      preparationClientInstalled=true;
+      ownedDispatchBusiness.installPreparation(hub,taskDeliveryOwner,schedulerContext,brokerClient);
+    }
     // Must register then connect
     brokerClient.register()
       .then(() => brokerClient.connect())
       .catch(err => {
+        retirePreparationClient();
         log('warn', `Broker registration/connect failed: ${err.message}`);
         setTimeout(connectBroker, 5000);
       });
   } catch (err) {
+    retirePreparationClient();
     log('warn', `Broker connection failed: ${err.message}`);
     setTimeout(connectBroker, 5000);
   }
@@ -915,7 +799,12 @@ async function ensureProjectAgentsStarted(project) {
   return { poTarget };
 }
 
+function mainOwnsInitialPlanning(projectId) {
+  return hub.getProjectProtocolBinding(projectId).binding?.initialPlanning?.producer==='desktop_main_v1';
+}
+
 async function sendAssignPoForProject(project, { delayMs = 0 } = {}) {
+  if(project && mainOwnsInitialPlanning(project.id))return {sent:false,reason:'desktop_main_bootstrap'};
   if (!project?.poAgent || !brokerClient || !brokerClient.isConnected()) return { sent: false, reason: 'broker_unavailable' };
   const { poTarget } = await ensureProjectAgentsStarted(project);
   if (!poTarget) return { sent: false, reason: 'po_target_missing' };
@@ -1088,17 +977,16 @@ async function runStartupRecovery({ force = false } = {}) {
   recoveryRunning = true;
   try {
     const onlineAgents = await getOnlineAgentIds();
-    await recoverProjectsIndependently({projects:hub.listProjects(),
+    await recoverProjectsIndependently({projects:hub.serverObservation.projects(),
       onDeferred:(project,reason)=>log('info','Project recovery deferred to workspace owner',{projectId:project.id,reason}),
       onError:(project,error)=>log('warn','Project recovery failed',{projectId:project.id,error:String(error?.message||error)}),
       recoverProject:async(project)=>{
-      const board = hub.getBoard(project.id);
-      if (!board) return;
-      const ws = getProjectWorkspace(project.id);
+      const tasks=hub.serverObservation.tasks(project.id);
+      const ws=lookupProjectWorkspaceSnapshot(project);
       const journals = readRunJournals(ws.path);
       const recoveryPlan = planProjectRecovery({
         project,
-        tasks: board.getAllTasks(),
+        tasks,
         journals,
         onlineAgents,
       });
@@ -1673,12 +1561,19 @@ function renderPlanMarkdown(plan) {
 }
 
 // ─── HTTP API ─────────────────────────────────────────────────────
-function parseBody(req) {
+function parseBody(req, maxBytes=Infinity) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    let body = '', bytes=0, rejected=false;
     const decoder = new StringDecoder('utf8');
-    req.on('data', c => body += decoder.write(c));
+    req.on('data', c => {
+      if (rejected) return;
+      bytes+=c.length;
+      if(bytes>maxBytes){rejected=true;reject(Error('request_body_too_large'));return;}
+      body += decoder.write(c);
+    });
+    req.on('aborted',()=>reject(Error('request_aborted')));
     req.on('end', () => {
+      if(rejected)return;
       body += decoder.end();
       try { resolve(body ? JSON.parse(body) : {}); }
       catch { reject(new Error('Invalid JSON')); }
@@ -1701,6 +1596,7 @@ function resolveDesktopMutationContext(req) {
       actorId: 'desktop-main',
       actorKind: 'desktop_user',
       transport: 'desktop_ipc',
+      ...(desktopProjectAuthority?{projectInputAuthority:desktopProjectAuthority.reader()}:{}),
     },
   };
 }
@@ -1761,7 +1657,115 @@ async function handleRequest(req, res) {
   try {
     // ── Health ──
     if (path === '/health' && req.method === 'GET') {
-      return json(res, { ok: true, brokerConnected, projects: hub.listProjects().length, features: SERVICE_FEATURES, workflowCapabilities: WORKFLOW_CAPABILITIES, service: activityServiceIdentity(), roomEventOutbox: hub.getRoomEventOutboxHealth(), ...hub.getWorkspaceProtocolBaseline() });
+      const observed=hub.serverObservation.health();return json(res,{...observed,brokerConnected,features:SERVICE_FEATURES,workflowCapabilities:WORKFLOW_CAPABILITIES,service:activityServiceIdentity(),background:{watchdog:watchdog?.getDiagnostics()??null,recovery:{running:recoveryRunning,completedAt:recoveryCompletedAt}}},observed.ok?200:503);
+    }
+
+    // Negotiated before creation: an older server cannot silently accept a
+    // Main producer field while also launching its legacy broker producer.
+    if(path==='/desktop/project-protocol' && req.method==='GET'){
+      if(!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      const health=hub.getPersistenceHealth();
+      if(!desktopProjectAuthority || health.backend!=='sqlite' || health.status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+      return json(res,{ok:true,protocol:'ordinary_initial_plan_v1',producer:'desktop_main_v1',scope:{profileId:process.env.KSWARM_DESKTOP_PROFILE_ID,workspaceId:process.env.KSWARM_DESKTOP_WORKSPACE_ID}});
+    }
+
+    const initialPlanProducerRoute=path.match(/^\/projects\/([^/]+)\/initial-plan-producer$/);
+    if(initialPlanProducerRoute && req.method==='GET'){
+      if(!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      if(hub.getPersistenceHealth().status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+      const projectId=decodeURIComponent(initialPlanProducerRoute[1]);
+      if(!hub.serverObservation.project(projectId))return json(res,{ok:false,error:'PROJECT_NOT_FOUND'},404);
+      const binding=hub.getProjectProtocolBinding(projectId);
+      if(binding.classification==='ordinary')return json(res,{ok:true,projectId,producer:binding.binding.initialPlanning?.producer ?? 'broker_legacy_v1'});
+      if(binding.reasonCode==='PROTOCOL_BINDING_UNVERIFIED')return json(res,{ok:true,projectId,producer:'legacy_unverified'});
+      return json(res,{ok:false,error:binding.reasonCode ?? 'PROTOCOL_BINDING_UNVERIFIED'},409);
+    }
+
+    const executionReadRoute=path.match(/^\/projects\/([^/]+)\/execution-start-admission$/);
+    if(executionReadRoute){
+      if(!DESKTOP_MUTATION_TOKEN||req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      if(!desktopProjectAuthority)return json(res,{ok:false,error:'PROJECT_SCOPE_UNAVAILABLE'},503);
+      if(req.method!=='GET')return json(res,{ok:false,error:'method_not_allowed'},405);
+      const result=hub.readProjectExecutionStart(decodeURIComponent(executionReadRoute[1]),desktopProjectAuthority.reader());
+      const status=result.ok?200:result.error==='project_not_found'?404:result.error==='PROJECT_SCOPE_MISMATCH'?403:result.error==='PROTECTED_PROTOCOL_STORAGE_REQUIRED'?503:409;
+      return json(res,result,status);
+    }
+
+    const ordinaryContextRoute=path.match(/^\/projects\/([^/]+)\/followup-context$/);
+    if(ordinaryContextRoute){
+      // Generic GET authorization is deliberately insufficient for this source
+      // snapshot. Only the authenticated Main channel receives scoped metadata.
+      if(!DESKTOP_MUTATION_TOKEN||req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      if(!desktopProjectAuthority)return json(res,{ok:false,error:'PROJECT_SCOPE_UNAVAILABLE'},503);
+      const health=hub.getPersistenceHealth();if(health.backend!=='sqlite'||health.status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+      if(req.method!=='GET')return json(res,{ok:false,error:'method_not_allowed'},405);
+      const result=hub.readOrdinaryProjectFollowupContext(decodeURIComponent(ordinaryContextRoute[1]),desktopProjectAuthority.reader());
+      const status=result.ok?200:result.error==='PROJECT_NOT_FOUND'?404:result.error==='PROJECT_SCOPE_MISMATCH'?403:result.error==='PROTECTED_PROTOCOL_STORAGE_REQUIRED'?503:409;
+      return json(res,result,status);
+    }
+    const taskMetadataRoute=path.match(/^\/projects\/([^/]+)\/task-metadata-inputs$/);
+    if(taskMetadataRoute){
+      // Main transport identity is fixed by launch configuration. Neither this
+      // closed DTO nor a protocol string supplies a Native/model permission.
+      if(!DESKTOP_MUTATION_TOKEN||req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      if(!desktopProjectAuthority)return json(res,{ok:false,error:'PROJECT_SCOPE_UNAVAILABLE'},503);
+      const health=hub.getPersistenceHealth();if(health.backend!=='sqlite'||health.status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+      if(req.method!=='POST')return json(res,{ok:false,error:'method_not_allowed'},405);
+      let body,user,claim;
+      try{
+        body=await parseBody(req,8388608);
+        const fields=['protocol','source','input','initialPlanClaim'];
+        if(!body||typeof body!=='object'||Array.isArray(body)||Object.keys(body).length!==fields.length||Object.keys(body).some(key=>!fields.includes(key))
+          ||body.protocol!=='ordinary_task_metadata_input_v2')return json(res,{ok:false,error:'task_metadata_envelope_invalid'},400);
+        const sourceContract=req.headers['x-kswarm-source-contract'],roomSource=body.source?.schemaVersion===3&&body.source?.sourceFamily==='main_room_conversion_v1';
+        if(sourceContract!==undefined&&sourceContract!=='main_room_conversion_v1'||roomSource!==(sourceContract==='main_room_conversion_v1'))return json(res,{ok:false,error:'project_input_source_invalid'},403);
+        // Exactly null is task-only. Falsy and malformed claims are errors.
+        if(body.initialPlanClaim!==null)claim=readTaskInitialClaimInput(body.initialPlanClaim);
+      }catch(error){return json(res,{ok:false,error:error?.code||error?.message||'task_metadata_envelope_invalid'},400);}
+      try{user=desktopProjectAuthority.user(body.source);}catch{return json(res,{ok:false,error:'project_input_source_invalid'},403);}
+      // Keep the actual original mutation outside input-error handling. Its
+      // durable failure reaches the original 503 uncertain + fail-stop owner.
+      const result=hub.applyOrdinaryTaskMetadataInput(decodeURIComponent(taskMetadataRoute[1]),body.input,{requestSource:'user',projectInputAuthority:user,
+        ...(claim?{initialPlanningAuthority:desktopProjectAuthority.planner(),initialPlanClaim:claim}:{})});
+      return json(res,result,result.ok?200:result.error==='PROJECT_NOT_FOUND'?404:409);
+    }
+
+    const ordinaryInputRoute=path.match(/^\/projects\/([^/]+)\/ordinary-inputs(?:\/([^/]+)(\/void)?)?$/);
+    const initialPlanInputRoute=path.match(/^\/projects\/([^/]+)\/initial-plan-inputs\/(claim|commit)$/)
+      ?? path.match(/^\/projects\/([^/]+)\/initial-plan-inputs$/);
+    if(ordinaryInputRoute || initialPlanInputRoute){
+      // Unlike generic GET authorization, operation/source reads require Main's
+      // credential too. Scope is fixed by launch configuration, never JSON.
+      if(!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token']!==DESKTOP_MUTATION_TOKEN)return json(res,{ok:false,error:'mutation_credential_required'},401);
+      if(!desktopProjectAuthority)return json(res,{ok:false,error:'PROJECT_SCOPE_UNAVAILABLE'},503);
+      if(hub.getPersistenceHealth().status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+      const match=ordinaryInputRoute ?? initialPlanInputRoute,projectId=decodeURIComponent(match[1]);
+      let result;
+      try{
+        if(initialPlanInputRoute){
+          if(initialPlanInputRoute[2]==='claim' && req.method==='POST')result=hub.claimInitialPlanInputs(projectId,await parseBody(req,131072),desktopProjectAuthority.planner());
+          else if(initialPlanInputRoute[2]==='commit' && req.method==='POST')result=hub.commitInitialPlan(projectId,await parseBody(req,2097152),desktopProjectAuthority.planner());
+          else if(!initialPlanInputRoute[2] && req.method==='GET')result=hub.readInitialPlanInputs(projectId,desktopProjectAuthority.reader());
+          else return json(res,{ok:false,error:'method_not_allowed'},405);
+        }else if(ordinaryInputRoute[3] && req.method==='POST'){
+          const input=await parseBody(req,131072);
+          result=hub.voidOrdinaryPlanInput(projectId,{...input,operationId:decodeURIComponent(ordinaryInputRoute[2])},desktopProjectAuthority.reader());
+        }else if(ordinaryInputRoute[2] && !ordinaryInputRoute[3] && req.method==='GET'){
+          result=hub.readOrdinaryProjectOperation(projectId,decodeURIComponent(ordinaryInputRoute[2]),desktopProjectAuthority.reader());
+        }else if(!ordinaryInputRoute[2] && req.method==='POST'){
+          // Explicit new-family transport budget; this header is NOT an
+          // authority. Legacy transport keeps its original 128KiB ceiling.
+          const sourceContract=req.headers['x-kswarm-source-contract'];
+          if(sourceContract!==undefined&&sourceContract!=='main_room_conversion_v1')return json(res,{ok:false,error:'project_input_source_invalid'},403);
+          const body=await parseBody(req,sourceContract==='main_room_conversion_v1'?1048576:131072);let authority;
+          const roomSource=body?.source?.schemaVersion===3&&body?.source?.sourceFamily==='main_room_conversion_v1';
+          if(roomSource!==(sourceContract==='main_room_conversion_v1'))return json(res,{ok:false,error:'project_input_source_invalid'},403);
+          if(roomSource&&(Object.keys(body).length!==2||Object.keys(body).some(key=>!['source','input'].includes(key))))return json(res,{ok:false,error:'project_input_source_invalid'},403);
+          try{authority=desktopProjectAuthority.user(body.source);}catch{return json(res,{ok:false,error:'project_input_source_invalid'},403);}
+          result=hub.applyOrdinaryProjectInput(projectId,body.input,authority);
+        }else return json(res,{ok:false,error:'method_not_allowed'},405);
+      }catch(error){if(isPersistenceCommitError(error))throw error;return json(res,{ok:false,error:error?.code || error?.message || 'project_input_failed'},400);}
+      return json(res,result,result.ok?200:result.error==='OPERATION_NOT_FOUND'||result.error==='PROJECT_NOT_FOUND'?404:409);
     }
 
     const outboxRetryRoute = path.match(/^\/projects\/([^/]+)\/room-event-outbox\/retry$/);
@@ -1787,11 +1791,25 @@ async function handleRequest(req, res) {
       if (hub.getPersistenceHealth().status === 'failed') return json(res, { ok: false, error: 'activity_source_unavailable' }, 503);
       const projectId = decodeURIComponent(activityRoute[1]);
       if (!hub.getProject(projectId)) return json(res, { ok: false, error: 'project_not_found' }, 404);
+      const profile=req.headers['x-kswarm-activity-profile'];
+      const sourceRead=req.headers['x-kswarm-source-read'];
+      if(sourceRead!==undefined&&(sourceRead!=='project_source_v1'||profile!==undefined))return json(res,{ok:false,error:'activity_source_profile_unsupported'},400);
+      if(profile!==undefined&&profile!=='project_delivery_v1')return json(res,{ok:false,error:'activity_profile_unsupported'},400);
+      if(profile&&!desktopProjectAuthority)return json(res,{ok:false,error:'PROJECT_SCOPE_UNAVAILABLE'},503);
       try {
-        const result = hub.getProjectActivity(projectId, {
+        const options={
           after: Number(url.searchParams.get('after') ?? 0), limit: Number(url.searchParams.get('limit') ?? 100),
-        });
-        return json(res, result, result.ok ? 200 : 409);
+        };
+        let result;
+        if(sourceRead){
+          if(desktopProjectAuthority)result=hub.readProjectSourceActivity(projectId,options,desktopProjectAuthority.reader());
+          else{const ordinary=hub.getProjectActivity(projectId,options);result=ordinary.ok?{...ordinary,delivery:{status:'unavailable',reasonCode:'SNAPSHOT_INCOMPLETE'}}:ordinary;}
+        }else result=profile?hub.readScopedProjectActivity(projectId,options,desktopProjectAuthority.reader()):hub.getProjectActivity(projectId,options);
+        // Instance affinity only; project authorization remains a separate gate.
+        if (result.ok) res.setHeader('x-kswarm-source-instance', activityServiceIdentity().instanceId);
+        if(result.ok&&(profile||sourceRead&&result.protocol==='scoped_project_activity_v1'))res.setHeader('x-kswarm-activity-profile','project_delivery_v1');
+        const denied=result.error==='PROJECT_SCOPE_MISMATCH'||result.error==='PROJECT_INPUT_AUTHORITY_REQUIRED'?403:result.error==='PROTECTED_PROTOCOL_STORAGE_REQUIRED'?503:409;
+        return json(res, result, result.ok ? 200 : denied);
       } catch (error) { return json(res, { ok: false, error: error.message }, 400); }
     }
 
@@ -1853,6 +1871,18 @@ async function handleRequest(req, res) {
       if (body.requestSource !== 'user') {
         return json(res, { ok: false, error: 'request_source_denied' }, 403);
       }
+      if(Object.hasOwn(body,'initialPlanProducer')){
+        const producer=body.initialPlanProducer;
+        if(!desktopProjectAuthority || !producer || typeof producer!=='object' || Array.isArray(producer)
+          || Object.keys(producer).some(key=>!['protocol','canonicalCreateOperationId','profileId','workspaceId'].includes(key))
+          || producer.protocol!=='ordinary_initial_plan_v1' || producer.profileId!==process.env.KSWARM_DESKTOP_PROFILE_ID
+          || producer.workspaceId!==process.env.KSWARM_DESKTOP_WORKSPACE_ID || producer.canonicalCreateOperationId!==body.clientRequestKey
+          || typeof body.clientRequestKey!=='string' || !/^conversation-project:[a-f0-9]{64}$/.test(body.clientRequestKey))return json(res,{ok:false,error:'initial_plan_producer_invalid'},403);
+        const health=hub.getPersistenceHealth();
+        if(health.backend!=='sqlite' || health.status==='failed')return json(res,{ok:false,error:'project_owner_unavailable'},503);
+        context.requestContext.projectInputAuthority=desktopProjectAuthority.creator(producer.canonicalCreateOperationId);
+      }
+
       const {
         name, goal, requirements, planningGuidance, poAgent, members, workFolder,
         enableSummary, agentSelection, executionMode, requestedStartPolicy,
@@ -1889,16 +1919,30 @@ async function handleRequest(req, res) {
           linkedBy: { kind: 'user', userId: 'user.local' },
         }, context.requestContext);
 
+        let initialPlanning;
+        if(body.initialPlanProducer){
+          const state=hub.readInitialPlanInputs(project.id,desktopProjectAuthority.reader());
+          if(!state.ok || state.ownerBinding.canonicalCreateOperationId!==body.clientRequestKey)return json(res,{ok:false,error:'initial_plan_producer_conflict',project},409);
+          initialPlanning=state.ownerBinding;
+        }
         const workspaceBound=project.requiredProtocol === 'room_workspace_v1' || body.requiredProtocol === 'room_workspace_v1';
         if (workspaceBound) {
           hub.mutateProjectState(project.id, () => {
             project.requiredProtocol='room_workspace_v1';
             project.workspaceMapping={state:'mapping_required',roomId:project.primaryRoomId,projectId:project.id};
           });
-          return json(res,{ok:true,project,preparation:{state:'mapping_required'},planningStart:{sent:false,reason:'workspace_mapping_required'}},201);
+          return json(res,{ok:true,project,preparation:{state:'mapping_required'},planningStart:{sent:false,reason:'workspace_mapping_required'},...(initialPlanning?{initialPlanning}:{})},201);
         }
         const ws = initProjectWorkspace(project.id, workFolder);
         project.workFolder = ws.path;
+        if(mainOwnsInitialPlanning(project.id)){
+          // The protected create is already committed. No readiness probe,
+          // legacy runtime launch or PO intent is emitted by this producer.
+          hub.persistState();
+          const roomProjection=await hub.flushRoomEventOutbox().catch(error=>({ok:false,code:error.message || 'room_projection_failed'}));
+          broadcast({type:'project_created',project});
+          return json(res,{ok:true,project,preparation:project.preparation,planningStart:{sent:false,reason:'desktop_main_bootstrap'},initialPlanning,roomProjection},201);
+        }
         await ensureProjectAgentsStarted(project);
         const preparation = await prepareProjectForPlanning(project);
         const planningStart = preparation?.state === 'ready'
@@ -1924,22 +1968,7 @@ async function handleRequest(req, res) {
 
     // ── Projects list ──
     if (path === '/projects' && req.method === 'GET') {
-      const projects = hub.listProjects().map(p => {
-        const board = hub.getBoard(p.id);
-        const tasks = board ? board.getAllTasks() : [];
-        const done = tasks.filter(t => t.status === 'done').length;
-        const stopped = tasks.filter(t => ['failed', 'blocked', 'cancelled'].includes(t.status)).length;
-        return {
-          ...p,
-          taskCount: tasks.length,
-          doneCount: done,
-          stoppedCount: stopped,
-          updatedAt: p.updatedAt || p.createdAt || 0,
-          projectLifecycle: hub.getProjectLifecycle(p.id),
-          projectIntervention: hub.getProjectIntervention(p.id),
-          latestWorkflowRun: hub.listProjectWorkflowRuns(p.id)[0] || null,
-        };
-      }).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      const projects=hub.serverObservation.projectListView();
       return json(res, { projects });
     }
 
@@ -2076,40 +2105,11 @@ async function handleRequest(req, res) {
     // ── Project detail ──
     const projectMatch = path.match(/^\/projects\/([^/]+)$/);
     if (projectMatch && req.method === 'GET') {
-      const project = hub.getProject(projectMatch[1]);
-      if (!project) return json(res, { error: 'not_found' }, 404);
-      const board = hub.getBoard(project.id);
-      const tasks = board ? enrichProjectTaskArtifacts(project.id, board.getAllTasks()) : [];
-      const activities = hub.getEventLog().getEvents().filter(e => e.projectId === project.id);
-      const humanActions = hub.getHumanActions(project.id);
-      const ws = getProjectWorkspace(project.id);
-      const artifacts = listProjectArtifacts(project.id);
-      const planProgress = board ? board.getPlanProgress() : null;
-      const dispatchPlan = hub.getDispatchPlan(project.id);
-      const projectHealth = hub.getProjectHealth(project.id);
-      const projectIntervention = hub.getProjectIntervention(project.id);
-      const workflowRuns = hub.listProjectWorkflowRuns(project.id);
-      const projectLifecycle = hub.getProjectLifecycle(project.id);
-      const executionGraph = hub.getExecutionGraph(project.id);
-      const deliverables = hub.listFinalDeliverables(project.id);
-      const reviewGateDecisions = hub.listReviewGateDecisions(project.id);
-      return json(res, {
-        project: { ...project, workFolder: ws.path },
-        projectLifecycle,
-        executionGraph,
-        tasks,
-        activities,
-        humanActions,
-        workspace: { path: ws.path, custom: ws.custom, artifacts },
-        plan: project.plan || null,
-        planProgress,
-        dispatchPlan,
-        projectHealth,
-        projectIntervention,
-        workflowRuns,
-        deliverables,
-        reviewGateDecisions,
-      });
+      const view=hub.serverObservation.projectDetailView(projectMatch[1]);
+      if(!view)return json(res,{error:'not_found'},404);
+      const project=view.project,ws=lookupProjectWorkspaceSnapshot(project);
+      const tasks=enrichProjectTaskArtifacts(project.id,view.tasks,ws),artifacts=listProjectArtifacts(project.id,ws);
+      return json(res,{...view,project:{...project,workFolder:ws.path},tasks,workspace:{path:ws.path,custom:ws.custom,artifacts}});
     }
 
     // ── Project workflow runs ──
@@ -2453,7 +2453,7 @@ async function handleRequest(req, res) {
     if (projectMatch && req.method === 'DELETE') {
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
-      const result = hub.deleteProject(projectMatch[1]);
+      const result = hub.deleteProject(projectMatch[1],context.requestContext);
       if (result.ok) {
         log('info', `Human deleted project: ${projectMatch[1]}`);
         broadcast({ type: 'project_closed', projectId: projectMatch[1] });
@@ -2622,6 +2622,7 @@ async function handleRequest(req, res) {
       const projectId = retryPlanMatch[1];
       const project = hub.getProject(projectId);
       if (!project) return json(res, { error: 'project_not_found' }, 404);
+      if(mainOwnsInitialPlanning(projectId))return json(res,{ok:false,error:'INITIAL_PLAN_MAIN_RECOVERY_REQUIRED'},409);
       const board = hub.getBoard(projectId);
       const normalized = normalizeProjectForPlanRetry(project, board?.getAllTasks() || []);
       if (!normalized.ok) return json(res, { ok: false, error: normalized.error }, 409);
@@ -3285,8 +3286,10 @@ async function handleRequest(req, res) {
     // ── Close project (Human only!) ──
     const closeMatch = path.match(/^\/projects\/([^/]+)\/close$/);
     if (closeMatch && req.method === 'POST') {
+      const context=resolveDesktopMutationContext(req);
+      if(!context.ok)return json(res,{ok:false,error:context.error},context.status||401);
       const body = await parseBody(req);
-      const result = hub.handleCloseProject(closeMatch[1], body.summary || '');
+      const result = hub.handleCloseProject(closeMatch[1], body.summary || '',context.requestContext);
       if (result.ok) {
         log('info', `Human closed project: ${closeMatch[1]}`);
         broadcast({ type: 'project_closed', projectId: closeMatch[1] });
@@ -3899,13 +3902,13 @@ const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws) => {
   wsClients.add(ws);
-  ws.send(JSON.stringify({
+  try{ws.send(JSON.stringify({
     type: 'init',
-    projects: hub.listProjects(),
+    projects: hub.serverObservation.projects(),
     agents: agentStore.list().map(a => agentStore.redact(a)),
     brokerConnected,
     logs: systemLogs.slice(-50),
-  }));
+  }));}catch(error){wsClients.delete(ws);ws.close(1013,'source unavailable');return;}
   ws.on('close', () => wsClients.delete(ws));
 });
 
@@ -3946,9 +3949,12 @@ function startRoomEventOutboxPublisher() {
 function startWatchdog() {
   if (watchdogStarted) return;
   watchdogStarted = true;
+  let watchdogOwner;
   watchdog = createWatchdog({
-    listProjects: () => hub.listProjects(),
-    getBoard: (id) => hub.getBoard(id),
+    listProjects: () => hub.serverObservation.projects(),
+    getTasks:id=>hub.serverObservation.tasks(id),
+    applyTimeout:(_id,_task,decision)=>watchdogOwner.applyTimeout(decision,schedulerContext),
+    onError:error=>{if(isPersistenceCommitError(error)||error?.durableCommitted&&hub.getPersistenceHealth().status==='failed')failStopOnPersistenceCommit();else log('warn','Watchdog observation unavailable',{error:String(error?.message??error)});},
     onTimeout: (projectId, task, action) => {
       log('warn', `Watchdog: task ${task.id} timed out in project ${projectId}`, action);
       broadcast({ type: 'task_timeout', projectId, taskId: task.id, action });
@@ -3957,20 +3963,20 @@ function startWatchdog() {
     timeoutMs: 600_000,
     maxRetries: 2,
   });
+  watchdogOwner=serverScheduler.bindWatchdog(watchdog);
   watchdog.start();
   if (!stalledRunWatchdogTimer) {
-    stalledRunWatchdogTimer = setInterval(runStalledRunWatchdog, 60_000);
+    stalledRunWatchdogTimer = setInterval(()=>{try{runStalledRunWatchdog();}catch(error){if(isPersistenceCommitError(error))failStopOnPersistenceCommit();else log('warn','Stalled-run observation unavailable',{error:String(error?.message??error)});}},60_000);
   }
 }
 
 function runStalledRunWatchdog() {
-  for (const project of hub.listProjects()) {
+  for (const project of hub.serverObservation.projects()) {
     if (project.status === 'closed' || project.status === 'delivered') continue;
-    const board = hub.getBoard(project.id);
-    if (!board) continue;
+    const tasks=hub.serverObservation.tasks(project.id);
     const actions = planStalledRunActions({
       projectId: project.id,
-      tasks: board.getAllTasks(),
+      tasks: tasks,
       systemSuspended,
     });
     for (const action of actions) {
@@ -3980,6 +3986,7 @@ function runStalledRunWatchdog() {
         continue;
       }
       if (action.type === 'mark_runtime_stalled') {
+        serverScheduler.markStalledRunEffect(schedulerContext);
         const healthAgentId = action.logicalAgentId || action.agentId;
         const agent = healthAgentId ? agentStore.get(healthAgentId) : null;
         if (agent) {
@@ -4012,21 +4019,22 @@ function runStalledRunWatchdog() {
       }
       if (action.type === 'request_cancel_run') {
         if (brokerClient && brokerClient.isConnected() && action.agentId) {
+          serverScheduler.markStalledRunEffect(schedulerContext);
           const route = resolveAgentIntentRoute(action.agentId);
-          brokerClient.sendTo(route.targetParticipantId, 'cancel_run', {
+          const sending=brokerClient.sendTo(route.targetParticipantId, 'cancel_run', {
             taskId: action.taskId,
             payload: {
               ...action,
               ...(route.targetAgentId ? { targetAgentId: route.targetAgentId } : {}),
             },
-          }).catch(err => log('warn', `Failed to request cancel_run from ${action.agentId}`, { ...action, error: err.message }));
+          });serverScheduler.retainStalledTail(sending,schedulerContext);sending.catch(err => log('warn', `Failed to request cancel_run from ${action.agentId}`, { ...action, error: err.message }));
         }
       }
     }
 
     // Backoff redispatch sweep: pick up retries whose backoff window elapsed.
     const dispatchNow = Date.now();
-    const dueRetry = board.getAllTasks().some(task =>
+    const dueRetry = tasks.some(task =>
       task.status === 'pending' &&
       Number.isFinite(task.retryNotBefore) &&
       task.retryNotBefore <= dispatchNow,
@@ -4065,6 +4073,8 @@ function recordAgentRuntimeFailure(agentId, failureClass, errorMessage) {
 let shuttingDown = false;
 function gracefulShutdown(signal) {
   if (shuttingDown) return;
+  ownedDesktopControl.seal();
+  ownedDispatchBusiness?.seal();
   shuttingDown = true;
   if (roomEventOutboxTimer) {
     clearInterval(roomEventOutboxTimer);

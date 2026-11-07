@@ -33,7 +33,7 @@ function createActiveProject(hub, id = 'proj-script') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '整理项目现状', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(id).ok, true);
   return project;

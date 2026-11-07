@@ -27,7 +27,7 @@ function createHighQualityProject(hub, id = 'proj-project-workflow') {
     { title: '收集公开资料', description: '整理关键事实', assignedAgent: 'xiaok-worker' },
     { title: '分析趋势', description: '结合公开资料做综合分析', assignedAgent: 'xiaok-worker' },
     { title: '生成最终报告', description: '输出项目最终报告', assignedAgent: 'xiaok-worker', requiredOutputs: ['markdown'] },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   const approved = hub.handleApprove(id);
   assert.equal(approved.ok, true);

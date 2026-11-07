@@ -5,7 +5,7 @@ const hub = createHub({ silent: true });
 const project = hub.createProject({ id: 'project-1', name: 'Alpha', goal: 'goal', poAgent: 'po', members: ['worker'], autoAssignPo: false });
 assert.equal(project.projectRevision, 1);
 
-hub.handleHumanAddTasks(project.id, [{ title: 'Implement', description: 'work' }]);
+hub.handleHumanAddTasks(project.id, [{ title: 'Implement', description: 'work' }], {requestSource: 'user'});
 assert.equal(hub.getProject(project.id).projectRevision, 2);
 
 hub.setProjectTeamPlan(project.id, { planDigest: 'old', projectRevision: 2, status: 'proposed', roles: [] });

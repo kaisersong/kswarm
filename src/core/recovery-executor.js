@@ -6,6 +6,7 @@
  */
 
 import { extname } from 'node:path';
+import {types} from 'node:util';
 
 const PREVIEWABLE_EXTS = new Set(['.html', '.md', '.json', '.txt', '.svg', '.png', '.jpg']);
 const MIME_TYPES = {
@@ -77,11 +78,26 @@ export async function executeRecoveryAction(action, {
   }
 
   if (action.type === 'resume_task') {
-    if (typeof hub?.handleResumeTaskForRecovery === 'function') {
-      hub.handleResumeTaskForRecovery(action.projectId, action.taskId);
+    if(typeof sendRequestTask!=='function')return{ok:false,error:'task_delivery_unavailable'};
+    if(types.isProxy(action))return{ok:false,error:'invalid_recovery_action'};
+    const fields=Object.getOwnPropertyDescriptors(action),frame={};
+    for(const key of ['projectId','taskId','runId']){
+      const field=fields[key];if(field&&!Object.hasOwn(field,'value'))return{ok:false,error:'invalid_recovery_action'};
+      frame[key]=field?.value;
     }
-    if (sendRequestTask) await sendRequestTask(action.projectId, action.taskId);
-    return { ok: true, action: 'resume_task', projectId: action.projectId, taskId: action.taskId };
+    if(!['projectId','taskId'].every(key=>typeof frame[key]==='string'&&frame[key].length>0&&frame[key].length<=1024))return{ok:false,error:'invalid_recovery_action'};
+    const originalHub=hub,resume=originalHub?.handleResumeTaskForRecovery;
+    if(typeof resume!=='function')return{ok:false,error:'recovery_resume_unavailable'};
+    const result=await resume.call(originalHub,frame.projectId,frame.taskId,{expectedRunId:frame.runId});
+    if(!result||typeof result!=='object'||types.isProxy(result))return{ok:false,error:'recovery_resume_unavailable'};
+    const accepted=Object.getOwnPropertyDescriptor(result,'ok');
+    if(!accepted||!Object.hasOwn(accepted,'value'))return{ok:false,error:'recovery_resume_unavailable'};
+    if(accepted.value!==true)return accepted.value===false?result:{ok:false,error:'recovery_resume_unavailable'};
+    const resultTask=Object.getOwnPropertyDescriptor(result,'taskId');
+    if(resultTask&&(!Object.hasOwn(resultTask,'value')||resultTask.value!==frame.taskId))return{ok:false,error:'RECOVERY_RESULT_MISMATCH'};
+    const delivery=await sendRequestTask(frame.projectId,frame.taskId);
+    if(delivery&&typeof delivery==='object'&&!types.isProxy(delivery)&&Object.getOwnPropertyDescriptor(delivery,'ok')?.value===false)return delivery;
+    return { ok: true, action: 'resume_task', projectId: frame.projectId, taskId: frame.taskId };
   }
 
   if (action.type === 'defer_recovery') {

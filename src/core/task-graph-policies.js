@@ -1,3 +1,4 @@
+import {readOrdinaryTaskDependencyPolicies,InitialPlanSemanticSchemaError} from './initial-plan-semantic-schema.js';
 /**
  * KSwarm — normalizeTaskGraphPolicies（design §3.3：动态依赖的唯一 policy owner）
  *
@@ -85,3 +86,39 @@ export function applyTaskGraphPolicyWrites(project, policyWrites = []) {
 }
 
 export { DEPENDENCY_POLICY_VALUES };
+
+/** Additional v2 check over the ORIGINAL expander/identity/policy outputs.
+ * This is data validation only, never a frame, writer or execution grant.
+ * Legacy graph normalization deliberately keeps its existing semantics. */
+export function validateAdditiveTaskGraphPolicies(input){return validateTaskGraphUnion(input);}
+/** Fixed original plan candidates may refer to their own original expanded IDs.
+ * This data check is not a caller capability or a choice of authorization mode. */
+export function validateTaskPlanUnionPolicies(input){
+ if(!Array.isArray(input.expandedTaskInputs))return{ok:false,error:'ADDITIVE_GRAPH_UNVERIFIED'};
+ return validateTaskGraphUnion(input,new Set(input.expandedTaskInputs.map(task=>task.id)));
+}
+function validateTaskGraphUnion({projectId,existingTasks,originalTaskList,identityPreviewTasks,dependencyPolicies,policyWrites},plannedRefs=new Set()) {
+  const deny=error=>({ok:false,error});
+  if(!Array.isArray(existingTasks)||!Array.isArray(originalTaskList)||!Array.isArray(identityPreviewTasks)||!Array.isArray(policyWrites))return deny('ADDITIVE_GRAPH_UNVERIFIED');
+  if(existingTasks.length+identityPreviewTasks.length>200)return deny('ADDITIVE_TASK_LIMIT_EXCEEDED');
+  const oldIds=new Set(existingTasks.map(task=>task.id));
+  const newIds=new Set(identityPreviewTasks.map(task=>task.id));
+  if(oldIds.size!==existingTasks.length||newIds.size!==identityPreviewTasks.length
+    ||existingTasks.some(task=>task.projectId!==projectId)||identityPreviewTasks.some(task=>task.projectId!==projectId||oldIds.has(task.id)))return deny('ADDITIVE_GRAPH_UNVERIFIED');
+  // Only generated composite internals may introduce local dependency refs.
+  // Caller input must name an existing stable ID before alias normalization.
+  if(originalTaskList.some(task=>(task.dependencies??[]).some(ref=>!oldIds.has(ref)&&!plannedRefs.has(ref))))return deny('ADDITIVE_DEPENDENCY_ID_REQUIRED');
+  const allIds=new Set([...oldIds,...newIds]);
+  if(identityPreviewTasks.some(task=>task.unresolvedDependencies?.length||task.dependencies.some(id=>!allIds.has(id))))return deny('ADDITIVE_GRAPH_UNVERIFIED');
+  let oldPolicies;
+  try{oldPolicies=readOrdinaryTaskDependencyPolicies(dependencyPolicies);}catch(error){if(!(error instanceof InitialPlanSemanticSchemaError))throw error;return deny('ADDITIVE_POLICY_BASE_UNVERIFIED');}
+  if(Object.keys(oldPolicies).some(id=>!oldIds.has(id)))return deny('ADDITIVE_POLICY_BASE_UNVERIFIED');
+  const targets=new Set(identityPreviewTasks.flatMap(task=>task.dependencies));
+  const proposed=new Map();
+  for(const [id,value] of policyWrites){
+    if(!targets.has(id)||!DEPENDENCY_POLICY_VALUES.includes(value))return deny('ADDITIVE_GRAPH_UNVERIFIED');
+    if(Object.hasOwn(oldPolicies,id)&&oldPolicies[id]!==value||proposed.has(id)&&proposed.get(id)!==value)return {ok:false,error:'ADDITIVE_DEPENDENCY_POLICY_CONFLICT',taskId:id};
+    proposed.set(id,value);
+  }
+  return {ok:true,policyDelta:[...proposed].filter(([id])=>!Object.hasOwn(oldPolicies,id))};
+}

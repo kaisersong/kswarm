@@ -17,7 +17,7 @@ test('real activity HTTP requires the host credential and replays only committed
   hub.createProject({ id: 'fixture', name: 'Fixture', goal: 'Read-only test', poAgent: 'po', members: [], autoAssignPo: false });
   const expected = hub.getProjectActivity('fixture'); hub.closePersistence();
   const child = spawn(process.execPath, ['src/server/index.js'], { cwd: process.cwd(),
-    env: { ...process.env, HOME: root, USERPROFILE: root, KSWARM_DATA_ROOT: root, KSWARM_PORT: String(port), BROKER_URL: 'http://127.0.0.1:1', KSWARM_DESKTOP_MUTATION_TOKEN: 'fixture-credential' }, stdio: 'ignore' });
+    env: { ...process.env, HOME: root, USERPROFILE: root, KSWARM_DATA_ROOT: root, KSWARM_PORT: String(port), BROKER_URL: 'http://127.0.0.1:1', KSWARM_DESKTOP_MUTATION_TOKEN: 'fixture-credential',KSWARM_DESKTOP_PROFILE_ID:'',KSWARM_DESKTOP_WORKSPACE_ID:'' }, stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   try {
     const deadline = Date.now() + 10000;
@@ -39,7 +39,11 @@ test('real activity HTTP requires the host credential and replays only committed
     assert.deepEqual(Object.keys(await identityResponse.json()).sort(), ['ok','projectId','roomId','sourceDataEpoch']);
     const response = await fetch(`${base}/projects/fixture/activity`, { headers });
     assert.equal(response.status, 200);
+    assert.match(health.service.instanceId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+    assert.equal(response.headers.get('x-kswarm-source-instance'), health.service.instanceId);
     const page = await response.json();
+    assert.equal((await fetch(`${base}/projects/fixture/activity`,{headers:{...headers,'x-kswarm-activity-profile':'project_delivery_v1'}})).status,503);
+    const source=await fetch(`${base}/projects/fixture/activity`,{headers:{...headers,'x-kswarm-source-read':'project_source_v1'}});assert.equal(source.status,200);assert.equal(source.headers.get('x-kswarm-activity-profile'),null);assert.deepEqual((await source.json()).delivery,{status:'unavailable',reasonCode:'SNAPSHOT_INCOMPLETE'});
     assert.equal(page.sourceDataEpoch, expected.sourceDataEpoch);
     assert.deepEqual(page.events, expected.events);
     assert.equal((await fetch(`${base}/projects/fixture/activity?limit=999`, { headers })).status, 400);
