@@ -28,7 +28,7 @@ function createActiveProject(hub, id = 'proj-script') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '整理项目现状', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(id).ok, true);
   return project;
@@ -306,7 +306,7 @@ test('script-generated project workflow blocks delivery when final task requires
         assignedAgent: 'xiaok-worker',
         requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
       },
-    ]);
+    ], {requestSource: 'user'});
     assert.equal(added.ok, true);
     assert.equal(hub.handleApprove(projectId).ok, true);
 
@@ -384,7 +384,7 @@ test('blocked script-generated project workflow can redeliver after runtime supp
         assignedAgent: 'xiaok-worker',
         requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
       },
-    ]);
+    ], {requestSource: 'user'});
     assert.equal(added.ok, true);
     assert.equal(hub.handleApprove(projectId).ok, true);
 

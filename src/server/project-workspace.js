@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join,win32 } from 'node:path';
+import {captureExecutionData} from '../core/task-execution-content.js';
 import { homedir } from 'node:os';
 
 export function resolveWorkspacePath(path, homeDir = homedir()) {
@@ -35,4 +36,11 @@ export function setProjectWorkspace(workspaces, projectId, newPath) {
   const ws = { path: wsPath, artifacts: artifactsPath, custom: true };
   workspaces.set(projectId, ws);
   return ws;
+}
+
+/** Pure metadata lookup. Never creates a directory or repairs the original cache. */
+export function lookupProjectWorkspace(workspaces,projectsDir,projectId,persistedPath){
+ if(workspaces.has(projectId))return captureExecutionData(workspaces.get(projectId));
+ const requested=resolveWorkspacePath(persistedPath),value=requested||projectsDir,paths=/^[a-z]:[\\/]/i.test(value)||/^[\\/]{2}[^\\/]/.test(value)?win32:{join};
+ const path=requested||paths.join(projectsDir,projectId);return captureExecutionData({path,artifacts:paths.join(path,'artifacts'),custom:Boolean(requested)});
 }

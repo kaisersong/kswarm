@@ -1,0 +1,27 @@
+{
+  "purpose": "Exact original production profile2 module bytes captured before enabling a future floor3; not a reimplementation or released installer qualification",
+  "floor3Writable": false,
+  "capturedBeforeFloor3Implementation": true,
+  "files": [
+    {
+      "path": "sqlite-persistence.js",
+      "sha256": "12bcf9a473fe65183cfb7ed157da29533fea7fde15091afa6717373f416bbc16"
+    },
+    {
+      "path": "state-scope.js",
+      "sha256": "cff945a47e32c3011f479512233c623950ffb3f606d5f34b9a57f269552d3a80"
+    },
+    {
+      "path": "sqlite-writer-floor.js",
+      "sha256": "22bf213345eae87e67e6f59645823c09e9be560ce57da9f4844361dab3319773"
+    },
+    {
+      "path": "initial-plan-write-fence.js",
+      "sha256": "609b310d561e2706eab4993e7fa9a94d24d1593d9d2257328d48f4b7fe7bfbd3"
+    },
+    {
+      "path": "initial-plan-acceptance-contract.js",
+      "sha256": "349d255259a9621608e306d6be16ad79ca419d249a3eee42220d112a09de2066"
+    }
+  ]
+}

@@ -22,6 +22,7 @@
 import * as nodeFs from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { types } from 'node:util';
 
 import { createSqlitePersistence } from './sqlite-persistence.js';
 
@@ -37,6 +38,25 @@ export {
 const DEFAULT_PATH = new URL('../../../data/state.json', import.meta.url).pathname;
 
 const IS_WINDOWS = process.platform === 'win32';
+const jsonWriteOwners = new WeakMap();
+
+/** Only an original JSON backend can be bound, once, by its local Hub owner.
+ * No payload property, serialized token or caller hash is a write frame. */
+export function bindJsonPersistenceWriteVerifier(api) {
+  const owner = jsonWriteOwners.get(api);
+  if (!owner) return null;
+  if (owner.bound) throw new Error('json_persistence_owner_already_bound');
+  owner.bound = true;
+  return Object.freeze({
+    authorize(payload, verify) {
+      if (!payload || typeof payload !== 'object' || types.isProxy(payload)
+        || typeof verify !== 'function' || types.isAsyncFunction(verify) || types.isProxy(verify)
+        || owner.frames.has(payload)) throw new Error('json_persistence_write_frame_invalid');
+      owner.frames.set(payload, { verify, used: false });
+      return payload;
+    },
+  });
+}
 
 function defaultFs() {
   return {
@@ -88,8 +108,7 @@ function writeAtomic(filePath, data, fs, uniqueToken) {
   }
 }
 
-function extractFullState(stateFactory, scope) {
-  const out = typeof stateFactory === 'function' ? stateFactory(scope) : stateFactory;
+function extractFullState(out) {
   if (out && typeof out.full === 'function') return out.full();
   return out;
 }
@@ -99,6 +118,9 @@ function createJsonPersistence({ filePath = DEFAULT_PATH, fs: injectedFs, now = 
   fs.mkdirSync(dirname(filePath), { recursive: true });
   let counter = 0;
   let status = 'ok';
+  let saving = false;
+  let poisoned = false;
+  const owner = { bound: false, frames: new WeakMap() };
 
   function load() {
     try {
@@ -111,19 +133,51 @@ function createJsonPersistence({ filePath = DEFAULT_PATH, fs: injectedFs, now = 
   }
 
   function commit(stateFactory, scope) {
-    const state = extractFullState(stateFactory, scope);
-    const data = JSON.stringify(state, null, 2);
-    counter += 1;
-    writeAtomic(filePath, data, fs, `${now()}-${counter}`);
+    // Guard before a factory, full getter or serializer can reenter. Catching
+    // the inner error cannot make the outer operation safe to commit.
+    if (saving) {
+      poisoned = true; status = 'failed';
+      throw new Error('json_persistence_reentrant_save');
+    }
+    if (poisoned || status === 'failed') throw new Error('json_persistence_failed_state');
+    saving = true;
+    try {
+      const payload = typeof stateFactory === 'function' ? stateFactory(scope) : stateFactory;
+      const frame = owner.bound && payload && typeof payload === 'object' ? owner.frames.get(payload) : undefined;
+      if (owner.bound) {
+        if (!frame || frame.used) throw new Error('json_persistence_write_frame_required');
+        frame.used = true; // Failure in full/stringify/verify never permits replay.
+      }
+      if (poisoned) throw new Error('json_persistence_reentrant_save');
+      const state = extractFullState(payload);
+      const data = JSON.stringify(state, null, 2);
+      if (frame) {
+        const result = frame.verify(JSON.parse(data));
+        if (result !== undefined) {
+          if (types.isPromise(result)) void Promise.prototype.then.call(result, () => {}, () => {});
+          throw new Error('json_persistence_verifier_must_be_synchronous_void');
+        }
+      }
+      counter += 1;
+      const uniqueToken = `${now()}-${counter}`;
+      if (poisoned) throw new Error('json_persistence_reentrant_save');
+      writeAtomic(filePath, data, fs, uniqueToken);
+      if (poisoned) throw new Error('json_persistence_reentrant_save');
+    } catch (error) {
+      if (owner.bound || poisoned) status = 'failed';
+      throw error;
+    } finally { saving = false; }
   }
 
-  return {
+  const api = {
     load,
     save: (stateFactory, scope) => commit(stateFactory, scope),
     saveSync: (stateFactory, scope) => commit(stateFactory, scope),
     close: () => {},
     getHealth: () => ({ status, backend: 'json', filePath }),
   };
+  jsonWriteOwners.set(api, owner);
+  return api;
 }
 
 export function createPersistence(optionsOrPath = DEFAULT_PATH) {

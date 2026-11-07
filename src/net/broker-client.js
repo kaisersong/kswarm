@@ -1,3 +1,4 @@
+import {createOriginalPreparationBrokerClient} from '../core/original-preparation-transport.js';
 /**
  * Broker Client — 连接 intent-broker 的通用 WebSocket + HTTP 客户端
  *
@@ -23,7 +24,9 @@ export function createBrokerClient({
   silent = false,
   roomSystemToken = process.env.INTENT_BROKER_KSWARM_TOKEN || null,
   fetchImpl = fetch,
+  preparationSource = null,
 } = {}) {
+  let actualClient;
   let ws = null;
   let connected = false;
   let reconnectTimer = null;
@@ -184,7 +187,7 @@ export function createBrokerClient({
     return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/workspace/${action}`, {method:'POST',body:input});
   }
 
-  return {
+  actualClient=createOriginalPreparationBrokerClient({preparationSource,fetchSdk:fetchImpl,httpBase,participantId,methods:{
     register,
     connect,
     disconnect,
@@ -203,5 +206,6 @@ export function createBrokerClient({
     httpGet,
     isConnected: () => connected,
     getParticipantId: () => participantId,
-  };
+  }});
+  return actualClient;
 }

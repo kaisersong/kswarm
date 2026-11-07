@@ -1,9 +1,10 @@
+import {projectDeliveryReadView} from './project-activity-delivery.js';
 import { randomUUID } from 'node:crypto';
 
 const MAX_EVENTS = 4096;
 const MAX_SUMMARY = 512;
 const MAX_PROGRESS = 256;
-export const PROJECT_ACTIVITY_FIELDS = ['activityDataEpoch','activityEventSeq','activityEventOutbox','activitySnapshot','committedActivitySeq','activityLastProgressAt','activityGapRanges'];
+export const PROJECT_ACTIVITY_FIELDS = ['activityDataEpoch','activityEventSeq','activityEventOutbox','activitySnapshot','committedActivitySeq','activityLastProgressAt','activityGapRanges','activityDeliveryHead','activityDeliveryUnavailable'];
 
 export function assertProjectActivityAdmission(project) {
   if ((project?.activityEventOutbox ?? []).filter(event => event.kind !== 'progress').length >= MAX_EVENTS) {
@@ -14,9 +15,10 @@ export function assertProjectActivityAdmission(project) {
 // Reviewed producer callgraph: task/artifact loops emit ordinary details;
 // scoped calls emit at most one critical/project. FULL operations only alter
 // metadata or pause/recover execution; legacy first observation is separate.
-const FULL_ACTIVITY_MUTATIONS = new Set(['invalidateTeamPlansForAgent', 'handleSuspendActiveRuns', 'handleResumeSuspendedRuns', 'recoverInterruptedTaskWorkflows']);
-const SCOPED_ACTIVITY_MUTATIONS = new Set(`serverProjectState applyWorkspaceMapping dispatchWorkspaceTask submitWorkspaceTaskResult recoverProjectDelivery createProject submitTaskResult setProjectTeamPlan attachTeamOperationMembers updateProjectExecutionMode handleApprove activateAndStartProject handleRetryPlan handleHumanAddTasks handleCloseProject deleteProject handleCreateTasks handleAssignTask handleReassignTask handleRequestDispatch handleMarkDone handleRework handleDeliver registerFinalDeliverable approveFinalDeliverable submitReviewConditionEvidence resolveReviewConditionEntry handleSubmitPlan handleRevisePlan handleQualityReview handleAcceptTask handleProgress handleWorkerFailure handleSubmitResult handleRecoverSubmission handleResetTaskForRecovery handleResumeTaskForRecovery handleTaskFail handleContinueProject handleResolveProjectIntervention createWorkflowProposal cancelWorkflowProposal createScriptWorkflowProposal startWorkflowRunFromProposal startScriptWorkflowRunFromProposal beginWorkflowScriptParallelGroup dispatchWorkflowScriptAgentNode retryWorkflowScriptAgentNode completeScriptWorkflowRun startProjectDiagnoseWorkflow startAgentReviewSmokeWorkflow handleWorkflowNodeResult handleWorkflowNodeReview handleWorkflowRuntimeUnavailable handleWorkflowProgressBatch cancelWorkflowRun`.split(' '));
+const FULL_ACTIVITY_MUTATIONS = new Set(['serverStartupNormalization','invalidateTeamPlansForAgent', 'handleSuspendActiveRuns', 'handleResumeSuspendedRuns', 'recoverInterruptedTaskWorkflows']);
+const SCOPED_ACTIVITY_MUTATIONS = new Set(`serverWatchdogTimeout serverProjectState applyWorkspaceMapping dispatchWorkspaceTask submitWorkspaceTaskResult recoverProjectDelivery createProject submitTaskResult setProjectTeamPlan attachTeamOperationMembers updateProjectExecutionMode handleApprove activateAndStartProject handleRetryPlan handleHumanAddTasks handleCloseProject deleteProject handleCreateTasks handleAssignTask handleReassignTask handleRequestDispatch handleMarkDone handleRework handleDeliver registerFinalDeliverable approveFinalDeliverable submitReviewConditionEvidence resolveReviewConditionEntry handleSubmitPlan handleRevisePlan handleQualityReview handleAcceptTask handleProgress handleWorkerFailure handleSubmitResult handleRecoverSubmission handleResetTaskForRecovery handleResumeTaskForRecovery handleTaskFail handleContinueProject handleResolveProjectIntervention createWorkflowProposal cancelWorkflowProposal createScriptWorkflowProposal startWorkflowRunFromProposal startScriptWorkflowRunFromProposal beginWorkflowScriptParallelGroup dispatchWorkflowScriptAgentNode retryWorkflowScriptAgentNode completeScriptWorkflowRun startProjectDiagnoseWorkflow startAgentReviewSmokeWorkflow handleWorkflowNodeResult handleWorkflowNodeReview handleWorkflowRuntimeUnavailable handleWorkflowProgressBatch cancelWorkflowRun`.split(' '));
 export function activityMutationCriticalBudget(name) {
+  if (name==='ordinaryProjectInput') return 1;
   if (FULL_ACTIVITY_MUTATIONS.has(name)) return 0;
   if (SCOPED_ACTIVITY_MUTATIONS.has(name)) return 1;
   throw new Error('unreviewed_project_activity_mutation');
@@ -195,5 +197,5 @@ export function readProjectActivity(committed, { after = 0, limit = 100 } = {}) 
   const gap = after < retainedFromSeq - 1 || after > head || gapRanges.length > 0;
   return structuredClone({ ok: true, sourceDataEpoch: committed.activityDataEpoch,
     retainedFromSeq, headSeq: head, gap, gapRanges, coveredThrough, nextCursor: coveredThrough,
-    snapshotRevision: String(head), snapshot: committed.activitySnapshot, events });
+    snapshotRevision: String(head), snapshot: committed.activitySnapshot, events, delivery:projectDeliveryReadView(committed) });
 }
