@@ -22,9 +22,10 @@ import { getCapabilityCatalog } from '../core/capability-catalog.js';
 import { createTeamOperationStore } from '../core/team-operation-store.js';
 import { createMutationAuthority, createTeamProvisioningHub } from '../core/persistence-hub.js';
 import { createBrokerClient } from '../net/broker-client.js';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, renameSync, rmSync, readdirSync } from 'node:fs';
 import { basename, dirname, join, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { listProviders } from '../llm/index.js';
 import * as modelCatalog from '../llm/model-catalog.js';
 import { createHeartbeatManager } from '../core/heartbeat-manager.js';
@@ -93,6 +94,7 @@ const RUNTIME_TOKEN = process.env.KSWARM_RUNTIME_TOKEN || '';
 const DESKTOP_MUTATION_TOKEN = process.env.KSWARM_DESKTOP_MUTATION_TOKEN || '';
 const XIAOK_DESKTOP_HOST_PARTICIPANT_ID = 'xiaok-desktop';
 const MAX_SUSPEND_MS = 300_000;
+const SERVICE_ENTRY_PATH = resolve(fileURLToPath(import.meta.url));
 const SERVICE_FEATURES = [
   'dynamic_workflows',
   'workflow_proposals',
@@ -110,6 +112,43 @@ const WORKFLOW_CAPABILITIES = Object.freeze({
 const runtimeInstancePool = createRuntimeInstancePool({
   maxWorkerInstances: Math.max(1, Math.min(10, Number(process.env.KSWARM_MAX_WORKER_INSTANCES) || DEFAULT_MAX_WORKER_INSTANCES)),
 });
+let cachedServiceSourceHash;
+
+function computeServiceSourceHash() {
+  if (cachedServiceSourceHash !== undefined) return cachedServiceSourceHash;
+  const sourceRoot = dirname(dirname(SERVICE_ENTRY_PATH));
+  try {
+    const hash = createHash('sha256');
+    const visit = dir => {
+      const entries = readdirSync(dir, { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          visit(path);
+          continue;
+        }
+        if (!entry.isFile() || !/\.(js|json)$/.test(entry.name)) continue;
+        hash.update(relative(sourceRoot, path));
+        hash.update('\0');
+        hash.update(readFileSync(path));
+        hash.update('\0');
+      }
+    };
+    visit(sourceRoot);
+    cachedServiceSourceHash = hash.digest('hex');
+  } catch {
+    cachedServiceSourceHash = null;
+  }
+  return cachedServiceSourceHash;
+}
+
+function getServiceIdentity() {
+  return {
+    entryPath: SERVICE_ENTRY_PATH,
+    sourceHash: computeServiceSourceHash(),
+  };
+}
 
 // Project workspace base — each project gets its own folder
 const KSWARM_HOME = process.env.KSWARM_DATA_ROOT ? resolve(process.env.KSWARM_DATA_ROOT) : join(homedir(), '.kswarm');
