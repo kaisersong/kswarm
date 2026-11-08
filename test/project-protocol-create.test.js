@@ -61,7 +61,7 @@ test('same project ID cannot replace immutable create identity',t=>{
 });
 test('omitting projects on later saves retains protected creation evidence',t=>{
  const f=fixture(t);f.hub.createProject(input);const before=f.hub.getProjectProtocolBinding('p');
- f.hub.deleteProject('p');assert.deepEqual(f.reopen().getProjectProtocolBinding('p'),before);
+ f.hub.deleteProject('p',{requestSource:'user'});assert.deepEqual(f.reopen().getProjectProtocolBinding('p'),before);
 });
 test('a failed asynchronous Room create cannot roll back another committed create audit',async()=>{
  let release;const wait=new Promise(resolve=>{release=resolve;});
@@ -120,4 +120,16 @@ test('post-commit bookkeeping failure preserves committed project and receipt an
   hub.closePersistence();const reopened=createHub({silent:true,dataDir:{backend:'sqlite',filePath}});
   try{assert.equal(reopened.getProject('p').id,'p');assert.equal(reopened.getProjectProtocolBinding('p').classification,'ordinary');}finally{reopened.closePersistence();}
  }finally{hub.closePersistence();rmSync(root,{recursive:true,force:true});}
+});
+
+test('Main-owned create never invokes the legacy PO bridge and legacy retry cannot mutate it',async t=>{
+ const {createProjectInputAuthority}=await import('../src/core/project-input-authority.js');
+ const root=mkdtempSync(join(tmpdir(),'main-owned-create-'));let sent=0;
+ const hub=createHub({silent:true,dataDir:{backend:'sqlite',filePath:join(root,'state.sqlite')},bridge:{send(){sent++;}}});
+ t.after(()=>{hub.closePersistence();rmSync(root,{recursive:true,force:true});});
+ const authority=createProjectInputAuthority({profileId:'a'.repeat(64),workspaceId:'b'.repeat(64)});
+ const project=hub.createProject(input,{projectInputAuthority:authority.creator('main-create')});
+ assert.equal(sent,0);const before=structuredClone(project);
+ assert.deepEqual(hub.handleRetryPlan(project.id),{ok:false,error:'INITIAL_PLAN_MAIN_RECOVERY_REQUIRED'});
+ assert.deepEqual(project,before);assert.equal(sent,0);
 });

@@ -1,3 +1,4 @@
+import {createOriginalPreparationBrokerClient} from '../core/original-preparation-transport.js';
 /**
  * Broker Client — 连接 intent-broker 的通用 WebSocket + HTTP 客户端
  *
@@ -23,7 +24,9 @@ export function createBrokerClient({
   silent = false,
   roomSystemToken = process.env.INTENT_BROKER_KSWARM_TOKEN || null,
   fetchImpl = fetch,
+  preparationSource = null,
 } = {}) {
+  let actualClient;
   let ws = null;
   let connected = false;
   let reconnectTimer = null;
@@ -254,7 +257,7 @@ export function createBrokerClient({
     return roomRequest(`/rooms/${encodeURIComponent(input.roomId)}/workspace/${action}`, {method:'POST',body:input});
   }
 
-  const api = {
+  const lifetimeMethods = {
     register,
     connect,
     disconnect,
@@ -275,10 +278,11 @@ export function createBrokerClient({
     isConnected: () => !sealed && connected,
     getParticipantId: () => participantId,
   };
-  for (const key of Object.keys(api)) {
+  for (const key of Object.keys(lifetimeMethods)) {
     if (['disconnect', 'close', 'isConnected', 'getParticipantId'].includes(key)) continue;
-    const original = api[key];
-    api[key] = (...args) => run(original, args);
+    const original = lifetimeMethods[key];
+    lifetimeMethods[key] = (...args) => run(original, args);
   }
-  return Object.freeze(api);
+  actualClient=createOriginalPreparationBrokerClient({preparationSource,fetchSdk:fetchImpl,httpBase,participantId,methods:lifetimeMethods});
+  return actualClient;
 }

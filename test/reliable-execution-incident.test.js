@@ -49,7 +49,7 @@ test('closed project active tasks do not reserve workers for new active projects
   const oldRunId = hub.getBoard('proj-old').getTask('old-task').activeRunId;
   assert.equal(hub.handleAcceptTask('proj-old', 'old-task', 'worker', oldRunId).ok, true);
   assert.equal(hub.handleProgress('proj-old', 'old-task', 'started', 'worker', oldRunId).ok, true);
-  assert.equal(hub.handleCloseProject('proj-old').ok, true);
+  assert.equal(hub.handleCloseProject('proj-old','',{requestSource:'user'}).ok, true);
 
   hub.createProject({ id: 'proj-new', name: 'New', goal: 'goal', poAgent: 'po-new', members: ['worker'] });
   hub.handleCreateTasks('proj-new', [{ id: 'new-task', title: 'New task', assignedAgent: 'worker' }], 'po-new');

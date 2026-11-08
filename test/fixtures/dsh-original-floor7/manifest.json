@@ -1,0 +1,43 @@
+{
+  "scope": "Original pre-B8 Native writer-floor module and complete nine local-module dependency closure; not full Hub/Main/installed old binary qualification",
+  "origin": "d20-b8-before captured source for floor/contract/data; unchanged dependencies read from active fork before any change to these dependencies",
+  "entry": "src/core/sqlite-writer-floor.js",
+  "files": [
+    {
+      "path": "src/core/default-dispatch-runtime-data.js",
+      "sha256": "5ef9a8f39bd6097b44a000bd498161426796210f7347df6e9c58a13b68a6033e"
+    },
+    {
+      "path": "src/core/dsh-owner-data.js",
+      "sha256": "2c1cdf4a7cd9b9d5f18ed7bdfc2995d1e9fd348771112cb5cdfbe404336bf59e"
+    },
+    {
+      "path": "src/core/initial-plan-acceptance-contract.js",
+      "sha256": "f58794139b271d23a891271e4d0f14d1f7d932534d430bbb80c19a2bb22c109a"
+    },
+    {
+      "path": "src/core/project-input-authority.js",
+      "sha256": "50587e82600c83601124dc40a437e01fb4b048a0ddfcd1b5a6cc4b8d3bd86cb8"
+    },
+    {
+      "path": "src/core/project-protocol.js",
+      "sha256": "127eafc77a7ba5bafbba104c02dc4ac78d966f4ae9c9679c6f2984880703e69c"
+    },
+    {
+      "path": "src/core/room-user-source-contract.js",
+      "sha256": "56753eb668d1d656d211a31eed8f390ed6458e7762136c78b4b1b7dc6dc4fb3c"
+    },
+    {
+      "path": "src/core/sqlite-writer-floor.js",
+      "sha256": "78e77de9f59380c80296761af03695290d6afe11599c1d6ae1aa5ec2916aa545"
+    },
+    {
+      "path": "src/core/task-execution-content.js",
+      "sha256": "c6ebebbc2a6b16d23ff80c0836952037e9d0a9b50f38eeb5f8368b5115efa119"
+    },
+    {
+      "path": "src/core/writer-transition-contract.js",
+      "sha256": "0bcfeaf4774b4d1cdde1fe684c4d707546dd275cb1b30e60d492e6e324f8230d"
+    }
+  ]
+}

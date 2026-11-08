@@ -1,0 +1,87 @@
+{
+  "meaning": "Exact original controlled Node/SQLite ACK ABI before current runtime6 fresh-ACK closure. Not a Native/Host grant, deployed profile or whole-current-binary compatibility promise. Current-rules cold reader uses these original runtime ABI dependencies; function bodies are never patched.",
+  "packetSha256": "2a8d1f3e0d4c5ead6cf7f027fac174e8a79b78c06d829c7fa21d7308c9c7afbf",
+  "files": [
+    {
+      "source": "src/core/default-dispatch-host-registration-data.js",
+      "fixture": "default-dispatch-host-registration-data.js.original.txt",
+      "sha256": "1c8512787f7cea5d39489aa12d4985df120baac2c509f778b62ff4bd931e4fb6"
+    },
+    {
+      "source": "src/core/default-dispatch-runtime-data.js",
+      "fixture": "default-dispatch-runtime-data.js.original.txt",
+      "sha256": "8ec46f0142cd963a50a8a4a447d67ac853ae3070af78bf2e886ee23b1f00f487"
+    },
+    {
+      "source": "src/core/default-dispatch-preparation-admission-data.js",
+      "fixture": "default-dispatch-preparation-admission-data.js.original.txt",
+      "sha256": "b83a16bfafb141ae8f00b2b4c4e6e044bffc026d40add5478de780307fa78ab6"
+    },
+    {
+      "source": "src/core/default-dispatch-operation-rules.js",
+      "fixture": "default-dispatch-operation-rules.js.original.txt",
+      "sha256": "490747a38872c66f672952ba5bf1635eff6e1cc3701138b01217f306ee33f9c1"
+    },
+    {
+      "source": "src/core/initial-plan-acceptance-owner.js",
+      "fixture": "initial-plan-acceptance-owner.js.original.txt",
+      "sha256": "4ecb20336d7119076e792391207cd29f1a3782ff2a42f752f95d1b4c455fd5b2"
+    },
+    {
+      "source": "src/core/initial-plan-acceptance-contract.js",
+      "fixture": "initial-plan-acceptance-contract.js.original.txt",
+      "sha256": "32b83fc7f45cbc1c7cc45f0a85d5df873a9f00633342a0f9dfc35a1011af9e5f"
+    },
+    {
+      "source": "src/core/hub.js",
+      "fixture": "hub.js.original.txt",
+      "sha256": "a0fed09f594beeefd96a96b3ad02b511e42a2cd125eaf6745f8d467ba2269b75"
+    },
+    {
+      "source": "src/core/initial-plan-write-fence.js",
+      "fixture": "initial-plan-write-fence.js.original.txt",
+      "sha256": "c97ac8c614818731591a9de21c53caa1766155c0c2886420acaf768da5128c67"
+    },
+    {
+      "source": "src/core/sqlite-persistence.js",
+      "fixture": "sqlite-persistence.js.original.txt",
+      "sha256": "f1cd033f2dffac1f06e18b4bce3df0b87c2f23cd1a1a0c064d06e3d74e1748ef"
+    },
+    {
+      "source": "src/core/original-response-sdk-startup.js",
+      "fixture": "original-response-sdk-startup.js.original.txt",
+      "sha256": "39d27ddb342885f6433bece9f61600ef7a6000e84449840783e5a416f89a31ba"
+    },
+    {
+      "source": "src/core/original-preparation-transport.js",
+      "fixture": "original-preparation-transport.js.original.txt",
+      "sha256": "6e0cc68fef9e29e15525dcc40debbebf8ee685255807410a1c50a490c8b372af"
+    },
+    {
+      "source": "src/core/intrinsic-collections.js",
+      "fixture": "intrinsic-collections.js.original.txt",
+      "sha256": "fe0d84ddfd37a824bf8f5c55d1ebf3c4f84e1a8ca916f910622ab0a318b8406f"
+    },
+    {
+      "source": "src/core/dispatch-business-data.js",
+      "fixture": "dispatch-business-data.js.original.txt",
+      "sha256": "a3d14cc7fc53633eecf89cf84c4d32ce9db92f725ab87660df68390589d50786"
+    },
+    {
+      "source": "src/core/task-execution-content.js",
+      "fixture": "task-execution-content.js.original.txt",
+      "sha256": "c6ebebbc2a6b16d23ff80c0836952037e9d0a9b50f38eeb5f8368b5115efa119"
+    },
+    {
+      "source": "src/core/project-protocol.js",
+      "fixture": "project-protocol.js.original.txt",
+      "sha256": "29a44f0d942b0d80adf0f820b3e6392f7d5bf741b8a3d053f0117e710a357fcf"
+    },
+    {
+      "source": "src/core/sqlite-writer-floor.js",
+      "fixture": "sqlite-writer-floor.js.original.txt",
+      "sha256": "c8457202a0f399982a7a9a205b9132547604f3d74fafd1172a97535f7d410342",
+      "provenance": "Unchanged original dependency, byte-identical to retained d19x-pre-admission-runtime6 fixture and exact reverse of the two schema7-only edits. Not an additional file in the historical packetSha256."
+    }
+  ]
+}

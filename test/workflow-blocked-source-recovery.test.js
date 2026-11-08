@@ -5,7 +5,7 @@ function fixture({persistent=false}={}){
  const root=mkdtempSync(join(tmpdir(),'fictional-blocked-workflow-'));mkdirSync(join(root,'artifacts'));
  const options={silent:true,...(persistent?{dataDir:{backend:'sqlite',filePath:join(root,'state.sqlite'),legacyJsonPath:join(root,'state.json'),silent:true}}:{})};
  const hub=createHub(options),project=hub.createProject({id:'fictional-source',name:'Fictional report',goal:'Verify existing evidence',poAgent:'xiaok-po',members:['xiaok-worker'],workFolder:root});
- assert.equal(hub.handleHumanAddTasks(project.id,[{id:'item-1',title:'Fictional document',assignedAgent:'xiaok-worker',requiredOutputs:['markdown']},{id:'item-2',title:'Fictional next step',assignedAgent:'xiaok-worker',dependencies:['item-1']}]).ok,true);
+ assert.equal(hub.handleHumanAddTasks(project.id,[{id:'item-1',title:'Fictional document',assignedAgent:'xiaok-worker',requiredOutputs:['markdown']},{id:'item-2',title:'Fictional next step',assignedAgent:'xiaok-worker',dependencies:['item-1']}],{requestSource:'user'}).ok,true);
  assert.equal(hub.handleApprove(project.id).ok,true);const board=hub.getBoard(project.id),[task,downstream]=board.getAllTasks();task.executionStrategyOverride='workflow';
  const handoff=hub.handleRequestDispatch(project.id,'xiaok-po').workflowNodeDispatches[0];assert.ok(handoff);const run=hub.getWorkflowRun(handoff.workflowRunId),artifact=join(root,'artifacts','fictional-report.md');writeFileSync(artifact,'# Fictional report\nVerified evidence and bounded conclusions.\n');
  return {root,options,hub,project,board,task,downstream,handoff,run,artifact,close(){hub.closePersistence();rmSync(root,{recursive:true,force:true});}};

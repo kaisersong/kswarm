@@ -22,7 +22,7 @@ function makeTempDir(suffix) {
 
 function createActiveProject(hub, id = 'proj-upstream') {
   hub.createProject({ id, name: 'Test', goal: 'test upstream', members: ['worker-1'] });
-  hub.handleHumanAddTasks(id, [{ title: 'placeholder', description: 'x' }]);
+  hub.handleHumanAddTasks(id, [{ title: 'placeholder', description: 'x' }], {requestSource: 'user'});
   hub.handleApprove(id);
 }
 

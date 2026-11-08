@@ -545,7 +545,7 @@ function collectWorkflowNodeArtifacts(node, finalDeliverables, artifacts) {
   return result;
 }
 
-function selectApprovedFinalDeliverable(deliverables) {
+export function selectApprovedFinalDeliverable(deliverables) {
   return [...(Array.isArray(deliverables) ? deliverables : [])]
     .filter(item => item?.status === 'approved')
     .sort((a, b) => String(b.updatedAt || b.createdAt || '').localeCompare(String(a.updatedAt || a.createdAt || '')))[0] || null;

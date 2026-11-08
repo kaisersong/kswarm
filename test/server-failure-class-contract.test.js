@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const source = readFileSync(join(process.cwd(), 'src/server/index.js'), 'utf-8');
+const deliveryOwnerSource=readFileSync(join(process.cwd(),'src/server/task-delivery-owner.js'),'utf-8');
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -49,12 +50,13 @@ test('every server task-failure entry point schedules retry and replacement deli
   assert.match(watchdogFailure, /sendFailureRecovery\(action\.projectId, \[result\]\)/);
 
   const deliveryFailureHandler = source.slice(
-    source.indexOf('async function sendBrokerRequestTasks'),
+    source.indexOf('async function sendBrokerRequestTasksImplementation'),
     source.indexOf('async function sendWorkflowNodeHandoffs'),
   );
-  assert.equal((deliveryFailureHandler.match(/recoveryResults\.push\(failed\)/g) || []).length, 3);
-  assert.match(deliveryFailureHandler, /sendFailureRecovery\(projectId, recoveryResults\)/);
-  assert.doesNotMatch(deliveryFailureHandler, /failed\?\.retryDispatched/);
+  assert.match(source,/createServerTaskDeliveryOwner/);
+  assert.match(deliveryFailureHandler,/taskDeliveryOwner\.send\(projectId,taskIds,schedulerContext\)/);
+  assert.equal((deliveryOwnerSource.match(/failureRecoveryTaskIds\(failed\)/g) || []).length, 3);
+  assert.doesNotMatch(deliveryOwnerSource, /failed\?\.retryDispatched/);
 });
 
 test('startup, continue, reassign and backoff dispatch both adaptive result channels',()=>{

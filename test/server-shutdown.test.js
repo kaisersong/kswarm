@@ -16,16 +16,18 @@ async function start(t, { monitor = false, brokerUrl, preload = null, env = {}, 
   const free = net.createServer(); free.listen(0, '127.0.0.1'); await once(free, 'listening');
   const port = free.address().port; await new Promise(resolve => free.close(resolve));
   initialize?.(root);
-  const args = [];
+  const accountPath=join(root,'account.mjs');
+  writeFileSync(accountPath,`import os from 'node:os';import{mkdirSync}from'node:fs';import{syncBuiltinESMExports}from'node:module';const root=${JSON.stringify(root)},original=os.userInfo;mkdirSync(root+'/config',{mode:0o700});os.homedir=()=>root;os.userInfo=options=>{const info=original(options);return {...info,homedir:Buffer.isBuffer(info.homedir)?Buffer.from(root):root};};syncBuiltinESMExports();`);
+  const args = ['--import',accountPath];
   if (monitor) {
     const path = join(root, 'monitor.mjs');
-    writeFileSync(path, `import http from 'node:http';\nimport { DatabaseSync } from 'node:sqlite';\nimport { appendFileSync } from 'node:fs';\nconst marker=${JSON.stringify(join(root, 'observations'))};\nlet active=0;const emit=http.Server.prototype.emit;http.Server.prototype.emit=function(event,...args){if(event==='request'){active++;args[1].once('close',()=>active--);}return emit.call(this,event,...args);};\nconst close=DatabaseSync.prototype.close;DatabaseSync.prototype.close=function(...args){appendFileSync(marker,'sqlite-close-active='+active+'\\n');return close.apply(this,args);};`);
+    writeFileSync(path, `import http from 'node:http';\nimport { DatabaseSync } from 'node:sqlite';\nimport { appendFileSync,existsSync,realpathSync } from 'node:fs';\nconst stateFile=${JSON.stringify(join(root, 'data/state.sqlite'))};\nconst prepare=DatabaseSync.prototype.prepare;\nconst marker=${JSON.stringify(join(root, 'observations'))};\nlet active=0;const emit=http.Server.prototype.emit;http.Server.prototype.emit=function(event,...args){if(event==='request'){active++;args[1].once('close',()=>active--);}return emit.call(this,event,...args);};\nconst close=DatabaseSync.prototype.close;DatabaseSync.prototype.close=function(...args){const errors=[];let result;try{const file=prepare.call(this,'PRAGMA database_list').all().find(row=>row.name==='main')?.file;if(file&&existsSync(stateFile)&&realpathSync(file)===realpathSync(stateFile))appendFileSync(marker,'sqlite-close-active='+active+'\\n');}catch(raw){errors.push(raw);}try{result=close.apply(this,args);}catch(raw){errors.push(raw);}if(errors.length===1)throw errors[0];if(errors.length)throw new AggregateError(errors,'monitor_close_failed',{cause:errors[0]});return result;};`);
     args.push('--import', path);
   }
   if (preload) { const path = join(root, 'fault.mjs'); writeFileSync(path, preload(root)); args.push('--import', path); }
   const child = spawn(process.execPath, [...args, 'src/server/index.js'], {
     cwd: new URL('..', import.meta.url), stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, HOME: root, KSWARM_DATA_ROOT: join(root, 'data'), KSWARM_PORT: String(port), BROKER_URL: brokerUrl || 'http://127.0.0.1:9', KSWARM_DESKTOP_MUTATION_TOKEN: 'shutdown-test-token', ...env },
+    env: { ...process.env, XIAOK_CONFIG_DIR:join(root,'config'), KSWARM_DATA_ROOT: join(root, 'data'), KSWARM_PORT: String(port), BROKER_URL: brokerUrl || 'http://127.0.0.1:9', KSWARM_DESKTOP_MUTATION_TOKEN: 'shutdown-test-token', ...env },
   });
   let output = ''; child.stdout.on('data', data => output += data); child.stderr.on('data', data => output += data);
   const closed = once(child, 'close');

@@ -6,7 +6,7 @@ import {createWatchdog} from '../src/core/watchdog.js';
 test('legacy watchdog cannot reset a real Hub workflow source behind its execution owner',()=>{
   const hub=createHub({silent:true,getAgentProfiles:()=>[{id:'fictional-worker',status:'idle',brokerOnline:true,roles:['worker'],runtimeHealth:{state:'healthy',outputCapabilities:['markdown']}}]});
   const project=hub.createProject({id:'proj-fictional-watchdog',name:'Fictional report',goal:'Write a report',poAgent:'fictional-po',members:['fictional-worker']});
-  assert.equal(hub.handleHumanAddTasks(project.id,[{title:'Produce a fictional artifact',assignedAgent:'fictional-worker',requiredOutputs:['markdown']}]).ok,true);
+  assert.equal(hub.handleHumanAddTasks(project.id,[{title:'Produce a fictional artifact',assignedAgent:'fictional-worker',requiredOutputs:['markdown']}],{requestSource:'user'}).ok,true);
   assert.equal(hub.handleApprove(project.id).ok,true);
   const board=hub.getBoard(project.id),task=board.getAllTasks()[0];task.executionStrategyOverride='workflow';
   const dispatch=hub.handleRequestDispatch(project.id,'fictional-po');assert.deepEqual(dispatch.workflowDispatched,[task.id]);

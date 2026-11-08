@@ -58,7 +58,7 @@ test('executionGateSchemaVersion !== 2 的项目（legacy）approveFinalDelivera
   assert.equal(approved.reviewGateDecision.projectGateSnapshotRef, undefined, 'legacy 项目不应产生 projectGateSnapshotRef');
 });
 
-test('design §8.2 canAutoClose 项：schema v2 项目批准后又新增任务（lifecycleVersion 漂移），getProjectLifecycle().canAutoClose 必须从 true 变为 false', () => {
+test('design §8.2 canAutoClose 项：终态拒绝新任务，owner lifecycleVersion 漂移后旧批准不能自动关闭', () => {
   const hub = createHub({ silent: true });
   const projectId = 'proj-approve-v2-drift';
   hub.createProject({
@@ -89,12 +89,15 @@ test('design §8.2 canAutoClose 项：schema v2 项目批准后又新增任务�
   const lifecycleRightAfterApproval = hub.getProjectLifecycle(projectId);
   assert.equal(lifecycleRightAfterApproval.canAutoClose, true, 'approval 刚完成时应可自动关闭');
 
-  // 批准之后，项目又发生一次真实 mutation（用户通过 handleHumanAddTasks 增加了新任务），
-  // project.lifecycleVersion 会因此递增，使已存在的 passing decision 产生漂移。
+  // 组合合同 §27.29：已交付项目不能通过人工加任务隐式重新打开。
   const addResult = hub.handleHumanAddTasks(projectId, [
     { id: 'item-2', title: 'Extra task added after approval', assignedAgent: 'worker' },
   ], { requestSource: 'user' });
-  assert.equal(addResult.ok, true, JSON.stringify(addResult));
+  assert.deepEqual(addResult, {ok:false,error:'PROJECT_TERMINAL_REQUIRES_REOPEN'});
+  assert.equal(hub.getProjectLifecycle(projectId).canAutoClose, true);
+  // 保留原快照漂移反例：通过真实 owner 持久入口注入版本漂移，
+  // 而不是借已禁止的终态写入口制造它。read model 必须重核旧批准。
+  hub.mutateProjectState(projectId, () => { hub.getProject(projectId).lifecycleVersion += 1; });
 
   const lifecycleAfterDrift = hub.getProjectLifecycle(projectId);
   assert.equal(lifecycleAfterDrift.canAutoClose, false, '批准后又发生 mutation，旧 passing decision 不应再允许自动关闭');
