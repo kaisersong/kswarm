@@ -20,7 +20,7 @@ import {semanticWriterForFloor} from './initial-plan-acceptance-contract.js';
  *    (pid/token/createdAt) that is only reclaimed when the owning pid is gone.
  */
 
-import { DatabaseSync } from 'node:sqlite';
+import {isOriginalSqliteSourceProtected,bindOriginalSqliteSourceNamespace,createOriginalSqliteSourceLifetime,openOriginalSqliteSource,closeOriginalSqliteSource,isOriginalSqliteSourcePending,assertOriginalSqliteSourceUsable,observeOriginalSqliteSource,retainOriginalSqliteSourceFailure,retainUnknownOriginalSqliteSourceFailure,inventoryOriginalSqliteSourceOutcome,rejectOriginalSqliteSourceBeforeOpen,readOriginalSqliteSourceLifetime,originalSqliteSourceErrorMessage,originalSqliteSourceErrorCode,originalSqliteSourceErrorName,originalSqliteSourceDurableCommitted} from './original-sqlite-source-lifecycle.js';
 import * as nodeFs from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -39,35 +39,32 @@ import {
   PROTECTED_COLLECTIONS,
 } from './state-scope.js';
 
-const readRowDefine=Object.defineProperty;
+const readRowDefine=Object.defineProperty,loadErrors=new WeakSet(),commitErrors=new WeakSet(),preopenRejections=new WeakSet();
 export const EXIT_LOAD_UNRECOVERABLE = 78; // terminal degraded, do not auto-restart
 export const EXIT_SAVE_FAILED = 75; // fail-stop, limited restart from last revision
 
 export class PersistenceLoadError extends Error {
-  constructor(message, { cause } = {}) {
-    super(message);
+  constructor(message, options) {
+    super(message,options);loadErrors.add(this);
     this.name = 'PersistenceLoadError';
     this.exitCode = EXIT_LOAD_UNRECOVERABLE;
     this.recoverable = false;
-    if (cause) this.cause = cause;
   }
 }
 
 export class PersistenceCommitError extends Error {
-  constructor(message, { cause } = {}) {
-    super(message);
+  constructor(message, options) {
+    super(message,options);commitErrors.add(this);
     this.name = 'PersistenceCommitError';
     this.exitCode = EXIT_SAVE_FAILED;
-    if (cause) this.cause = cause;
   }
 }
 
 export function isPersistenceCommitError(err) {
-  return !!err && (err.name === 'PersistenceCommitError' || err instanceof PersistenceCommitError
-    || err.code === 'persistence_post_commit_failure' && err.durableCommitted === true);
+  return commitErrors.has(err)||originalSqliteSourceErrorName(err)==='PersistenceCommitError'||originalSqliteSourceErrorCode(err)==='persistence_post_commit_failure'&&originalSqliteSourceDurableCommitted(err);
 }
 export function isPersistenceLoadError(err) {
-  return !!err && (err.name === 'PersistenceLoadError' || err instanceof PersistenceLoadError);
+  return loadErrors.has(err)||originalSqliteSourceErrorName(err)==='PersistenceLoadError';
 }
 
 const HISTORY_VERSIONS_KEPT = 2;
@@ -93,15 +90,21 @@ function defaultIsProcessAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return err && err.code === 'EPERM'; // exists but not permitted -> alive
+    return originalSqliteSourceErrorCode(err)==='EPERM'; // exists but not permitted -> alive
   }
 }
 
+const originalSqliteSourceMembers=new WeakMap(),sourceGet=WeakMap.prototype.get,sourceSet=WeakMap.prototype.set,sourceApply=Reflect.apply;
+/** Passive original connection lifetime; never a Native family or namespace grant. */
+export function readOriginalKSwarmPersistenceSource(api){
+ const row=sourceApply(sourceGet,originalSqliteSourceMembers,[api]);if(!row)throw Error('KSWARM_ORIGINAL_PERSISTENCE_SOURCE_REQUIRED');return row;
+}
 export function createSqlitePersistence(options = {}) {
+  if(!options||typeof options!=='object'||types.isProxy(options))throw Error('KSWARM_SQLITE_SOURCE_OPTIONS');
   const {
     filePath,
     legacyJsonPath = null,
-    sqliteFactory = (path) => new DatabaseSync(path),
+    sqliteFactory,
     fs: injectedFs,
     now = () => Date.now(),
     isProcessAlive = defaultIsProcessAlive,
@@ -109,11 +112,14 @@ export function createSqlitePersistence(options = {}) {
   } = options;
 
   if (!filePath) throw new Error('[sqlite-persistence] filePath is required');
+  const sourceLifetime=createOriginalSqliteSourceLifetime(filePath,sqliteFactory);
   const fs = injectedFs || defaultFs();
   const lockPath = `${filePath}.lock`;
-  const lockToken = randomUUID();
-
-  fs.mkdirSync(dirname(filePath), { recursive: true });
+  let lockToken;
+  try{
+    lockToken=randomUUID();inventoryOriginalSqliteSourceOutcome(sourceLifetime,lockToken);
+    const mkdirResult=fs.mkdirSync(dirname(filePath), { recursive: true });inventoryOriginalSqliteSourceOutcome(sourceLifetime,mkdirResult);
+  }catch(raw){retainUnknownOriginalSqliteSourceFailure(sourceLifetime,raw);throw raw;}
 
   let db = null;
   let writerFloor = null;
@@ -149,7 +155,7 @@ export function createSqlitePersistence(options = {}) {
     try {
       handle = fs.openSync(lockPath, 'wx', 0o600);
     } catch (err) {
-      if (err && err.code === 'EEXIST') return false;
+      inventoryOriginalSqliteSourceOutcome(sourceLifetime,err);if (originalSqliteSourceErrorCode(err)==='EEXIST') return false;
       throw err;
     }
     try {
@@ -173,7 +179,7 @@ export function createSqlitePersistence(options = {}) {
       holder = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
     } catch (err) {
       throw new PersistenceLoadError(
-        `[sqlite-persistence] state lock is unreadable; refusing unsafe reclamation: ${err.message}`,
+        `[sqlite-persistence] state lock is unreadable; refusing unsafe reclamation: ${originalSqliteSourceErrorMessage(err)}`,
         { cause: err },
       );
     }
@@ -183,13 +189,13 @@ export function createSqlitePersistence(options = {}) {
 
     const age = now() - (holder.createdAt || 0);
     if (isProcessAlive(holder.pid)) {
-      throw new PersistenceLoadError(
+      const rejected=new PersistenceLoadError(
         `[sqlite-persistence] state locked by live writer pid=${holder.pid} (age=${age}ms)`,
-      );
+      );preopenRejections.add(rejected);throw rejected;
     }
 
     try { fs.rmSync(lockPath, { force: true }); } catch (err) {
-      throw new PersistenceLoadError(`[sqlite-persistence] failed to reclaim dead writer lock: ${err.message}`, { cause: err });
+      throw new PersistenceLoadError(`[sqlite-persistence] failed to reclaim dead writer lock: ${originalSqliteSourceErrorMessage(err)}`, { cause: err });
     }
     if (!claimLock()) {
       throw new PersistenceLoadError('[sqlite-persistence] another writer claimed the state lock during recovery');
@@ -203,7 +209,7 @@ export function createSqlitePersistence(options = {}) {
         const holder = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
         if (holder && holder.token === lockToken) fs.rmSync(lockPath, { force: true });
       }
-    } catch { /* best-effort */ }
+    } catch(raw) {retainUnknownOriginalSqliteSourceFailure(sourceLifetime,raw);throw raw;}
     lockHeld = false;
   }
 
@@ -319,7 +325,7 @@ export function createSqlitePersistence(options = {}) {
       }else{
         let legacyState;
         try{legacyState=JSON.parse(fs.readFileSync(legacyJsonPath,'utf-8'));}
-        catch(err){throw new PersistenceLoadError(`[sqlite-persistence] legacy state.json is corrupt; refusing to start empty: ${err.message}`,{cause:err});}
+        catch(err){throw new PersistenceLoadError(`[sqlite-persistence] legacy state.json is corrupt; refusing to start empty: ${originalSqliteSourceErrorMessage(err)}`,{cause:err});}
         const entities=decomposeState(legacyState);
         if(entities.some(row=>PROTECTED_COLLECTIONS.includes(row.collection)&&isAcceptanceRecord(row.value)))throw new PersistenceLoadError('initial_plan_legacy_birth_forbidden');
         for(const e of entities){
@@ -335,7 +341,7 @@ export function createSqlitePersistence(options = {}) {
       try { db.exec('ROLLBACK'); } catch { /* ignore */ }
       // Rebuild index cleanly (partial upserts touched it).
       for (const m of index.values()) m.clear();
-      throw new PersistenceLoadError(`[sqlite-persistence] legacy migration failed; original JSON preserved: ${err.message}`, { cause: err });
+      throw new PersistenceLoadError(`[sqlite-persistence] legacy migration failed; original JSON preserved: ${originalSqliteSourceErrorMessage(err)}`, { cause: err });
     }
     if(!migratedLegacy)return;
     // Migration committed & durable. Back up the legacy file (best-effort: data
@@ -344,7 +350,7 @@ export function createSqlitePersistence(options = {}) {
     try {
       fs.renameSync(legacyJsonPath, backupPath);
     } catch (err) {
-      warn(`legacy backup rename failed (migration already durable): ${err.message}`);
+      warn(`legacy backup rename failed (migration already durable): ${originalSqliteSourceErrorMessage(err)}`);
     }
   }
 
@@ -353,7 +359,7 @@ export function createSqlitePersistence(options = {}) {
     const sidecarPath = `${filePath}.corrupt-${new Date(now()).toISOString().replace(/[:.]/g, '-')}.json`;
     try {
       fs.writeFileSync(sidecarPath, JSON.stringify({ kind, detail, at: new Date(now()).toISOString() }, null, 2));
-    } catch { /* best-effort */ }
+    } catch(raw) {retainUnknownOriginalSqliteSourceFailure(sourceLifetime,raw);}
     return sidecarPath;
   }
 
@@ -394,17 +400,27 @@ export function createSqlitePersistence(options = {}) {
     return rows.map(r => ({ collection: r.collection, key: r.entity_key, projectId: r.project_id ?? null, value: JSON.parse(r.state_json) }));
   }
 
+  function closeInitializationFailure() {
+    if(!db)return;
+    try{closeOriginalSqliteSource(sourceLifetime);db=null;writerFloor=null;releaseLock();}
+    catch(secondary){if(isOriginalSqliteSourcePending(secondary))retainOriginalSqliteSourceFailure(sourceLifetime,secondary);else retainUnknownOriginalSqliteSourceFailure(sourceLifetime,secondary);}
+  }
   function load() {
     return withOperation('load',loadOwned);
   }
   function loadOwned() {
-    acquireLock();
+    assertOriginalSqliteSourceUsable(sourceLifetime);
+    try{acquireLock();}catch(raw){status='failed';if(preopenRejections.has(raw))rejectOriginalSqliteSourceBeforeOpen(sourceLifetime,raw);else retainUnknownOriginalSqliteSourceFailure(sourceLifetime,raw);throw raw;}
     try {
-      db = sqliteFactory(filePath);
+      db = openOriginalSqliteSource(sourceLifetime,filePath,sqliteFactory);
+      assertOriginalSqliteSourceUsable(sourceLifetime);
+      observeOriginalSqliteSource(sourceLifetime);
     } catch (err) {
-      const sidecar = writeSidecar('db_open_failed', { message: err.message });
+      retainOriginalSqliteSourceFailure(sourceLifetime,err);
+      closeInitializationFailure();
+      const sidecar = writeSidecar('db_open_failed', { message: originalSqliteSourceErrorMessage(err) });
       status = 'failed';
-      throw new PersistenceLoadError(`[sqlite-persistence] cannot open database: ${err.message}; diagnostic: ${sidecar}`, { cause: err });
+      throw new PersistenceLoadError(`[sqlite-persistence] cannot open database: ${originalSqliteSourceErrorMessage(err)}; diagnostic: ${sidecar}`, { cause: err });
     }
     try {
       assertHealthy();
@@ -412,7 +428,9 @@ export function createSqlitePersistence(options = {}) {
       // Inspect before journal/schema/recovery writes. An incomplete or future
       // floor is never interpreted as a legacy store or automatically repaired.
       writerFloor.assertWritable();
-      db.exec('PRAGMA journal_mode = WAL');
+      if(isOriginalSqliteSourceProtected(sourceLifetime)){
+        db.exec('PRAGMA journal_mode = DELETE');db.exec('PRAGMA temp_store = MEMORY');db.exec('PRAGMA mmap_size = 0');
+      }else db.exec('PRAGMA journal_mode = WAL');
       db.exec('PRAGMA synchronous = FULL');
       db.exec('PRAGMA busy_timeout = 5000');
       db.exec('PRAGMA foreign_keys = ON');
@@ -445,19 +463,22 @@ export function createSqlitePersistence(options = {}) {
           warn(`recovered ${recovered.length} entity(ies) from history; diagnostic: ${sidecar}`);
         }
         assertHealthy();
+        bindOriginalSqliteSourceNamespace(sourceLifetime);
         return state;
       }catch(err){try{db.exec('ROLLBACK');}catch{/* already committed or unavailable */}throw err;}
     } catch (err) {
       status = 'failed';
-      if (err instanceof PersistenceLoadError) throw err;
-      const sidecar = writeSidecar('load_failed', { message: err.message });
-      throw new PersistenceLoadError(`[sqlite-persistence] load failed: ${err.message}; diagnostic: ${sidecar}`, { cause: err });
+      retainOriginalSqliteSourceFailure(sourceLifetime,err);
+      closeInitializationFailure();
+      if (loadErrors.has(err)) throw err;
+      const sidecar = writeSidecar('load_failed', { message: originalSqliteSourceErrorMessage(err) });
+      throw new PersistenceLoadError(`[sqlite-persistence] load failed: ${originalSqliteSourceErrorMessage(err)}; diagnostic: ${sidecar}`, { cause: err });
     }
   }
 
   // ── save ────────────────────────────────────────────────────────────────
   function assertHealthy() {
-    if (status === 'failed') {
+    if (status !== 'ok') {
       throw new PersistenceCommitError('[sqlite-persistence] persistence is in failed state; mutations rejected');
     }
   }
@@ -468,7 +489,7 @@ export function createSqlitePersistence(options = {}) {
       return action();
     }catch(error){
       status='failed';
-      throw new PersistenceCommitError(`[sqlite-persistence] policy read failed: ${error.message}`,{cause:error});
+      throw new PersistenceCommitError(`[sqlite-persistence] policy read failed: ${originalSqliteSourceErrorMessage(error)}`,{cause:error});
     }
   }
 
@@ -496,6 +517,7 @@ export function createSqlitePersistence(options = {}) {
     assertTransitionHealthy();
   }
   function saveOwned(stateFactory,scope) {
+    assertOriginalSqliteSourceUsable(sourceLifetime);
     const expectedRevision=globalRevision;saveExpectedRevision=expectedRevision;let begun=false,committed=false;
     try {
       assertHealthy();
@@ -541,7 +563,7 @@ export function createSqlitePersistence(options = {}) {
       if(epochBirth&&status==='ok'&&!operationReentryFailure&&db===saveConnection){emptyPlanningEpoch=Object.freeze(Object.create(null));emptyPlanningEpochData={connection:db,scope:Object.freeze({...installedFloor.scope}),storeId:installedFloor.storeId,revision:nextRevision};planningEpochUnknown=null;}
     } catch(err) {
       let cause=err;if(begun)try{db?.exec('ROLLBACK');}catch(rollbackError){cause=new AggregateError([err,rollbackError],'persistence rollback unknown',{cause:err});}
-      status='failed';const failure=new PersistenceCommitError(`[sqlite-persistence] durable commit failed: ${err.message}`,{cause});if(committed)failure.durableCommitted=true;throw failure;
+      retainOriginalSqliteSourceFailure(sourceLifetime,cause);status='failed';const failure=new PersistenceCommitError(`[sqlite-persistence] durable commit failed: ${originalSqliteSourceErrorMessage(err)}`,{cause});if(committed)failure.durableCommitted=true;throw failure;
     }
   }
 
@@ -549,7 +571,7 @@ export function createSqlitePersistence(options = {}) {
   function transitionFailure(error,begun,committed){
     let cause=error;
     if(begun)try{db.exec('ROLLBACK');}catch(rollbackError){cause=new AggregateError([error,rollbackError],'writer transition rollback unknown',{cause:error});}
-    status='failed';const failure=new PersistenceCommitError('[sqlite-persistence] writer transition failed: '+error.message,{cause});
+    retainOriginalSqliteSourceFailure(sourceLifetime,cause);status='failed';const failure=new PersistenceCommitError('[sqlite-persistence] writer transition failed: '+originalSqliteSourceErrorMessage(error),{cause});
     if(committed)failure.durableCommitted=true;throw failure;
   }
   function captureDefaultDispatchTransitionObservation(){
@@ -578,11 +600,12 @@ export function createSqlitePersistence(options = {}) {
 
   function close() {
     rejectReentrantOperation();
+    status='closed';
     if (db) {
-      try { db.close(); } catch { /* ignore */ }
+      closeOriginalSqliteSource(sourceLifetime);
       db = null;
       writerFloor = null;
-    }
+    }else closeOriginalSqliteSource(sourceLifetime);
     releaseLock();
   }
 
@@ -595,6 +618,8 @@ export function createSqlitePersistence(options = {}) {
     getHealth: () => ({ status, backend: 'sqlite', revision: globalRevision, filePath }),
     get revision() { return globalRevision; },
   };
+  const source=readOriginalSqliteSourceLifetime(sourceLifetime);
+  sourceApply(sourceSet,originalSqliteSourceMembers,[api,Object.freeze({path:source.path,assertCurrent(){assertHealthy();assertOriginalSqliteSourceUsable(sourceLifetime);if(!db||!writerFloor)throw Error('KSWARM_SQLITE_SOURCE_NOT_OPEN');},async waitKnown(){await source.waitKnown();close();},assertTerminated(){source.assertTerminated();if(lockHeld)throw Error('KSWARM_SQLITE_SOURCE_LOCK_HELD');}})]);
   writeFence=registerInitialPlanWriteBackend(api,{
     captureDefaultDispatchTransitionObservation,transitionDefaultDispatch,connectionIdentity:()=>db,
     inspectFreshPreparation:()=>withOperation('freshPreparationObservation',()=>{
