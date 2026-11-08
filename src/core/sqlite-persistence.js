@@ -27,6 +27,8 @@ import {
   decomposeState,
   composeEntities,
   DELETABLE_COLLECTIONS,
+  ALL_COLLECTIONS,
+  PROTECTED_COLLECTIONS,
 } from './state-scope.js';
 
 export const EXIT_LOAD_UNRECOVERABLE = 78; // terminal degraded, do not auto-restart
@@ -109,7 +111,7 @@ export function createSqlitePersistence(options = {}) {
   let lockHeld = false;
   // in-memory index: collection -> Map(key -> { checksum, projectId, revision })
   const index = new Map();
-  for (const c of ['project', 'board', 'workflowRun', 'workflowProposal', 'finalDeliverable', 'reviewGateDecision', 'reviewCondition', 'humanAction']) {
+  for (const c of ALL_COLLECTIONS) {
     index.set(c, new Map());
   }
 
@@ -325,6 +327,10 @@ export function createSqlitePersistence(options = {}) {
         index.get(row.collection)?.set(row.entity_key, { checksum: row.checksum, projectId: row.project_id ?? null, revision: row.revision });
         continue;
       }
+      // A historical epoch/head cannot replace a corrupt current security fact.
+      if (PROTECTED_COLLECTIONS.includes(row.collection)) {
+        throw new PersistenceLoadError('[sqlite-persistence] protected record integrity failure');
+      }
       // Checksum mismatch -> try recover from history (latest valid version).
       const history = db.prepare('SELECT project_id, state_json, checksum, revision, updated_at FROM state_entity_history WHERE collection = ? AND entity_key = ? ORDER BY revision DESC, rowid DESC')
         .all(row.collection, row.entity_key);
@@ -444,9 +450,25 @@ export function createSqlitePersistence(options = {}) {
         const stateJson = serializeValue(e.value);
         const checksum = sha256Hex(stateJson);
         seenByCollection.get(e.collection)?.add(e.key);
+        const protectedRecord = PROTECTED_COLLECTIONS.includes(e.collection);
+        const protectedValue = protectedRecord ? JSON.parse(stateJson) : null;
+        if (protectedRecord && (!protectedValue || protectedValue.id !== e.key
+          || typeof protectedValue.kind !== 'string' || !protectedValue.kind
+          || (protectedValue.projectId ?? null) !== (e.projectId ?? null))) throw new Error('protected_record_identity_invalid');
         const prev = index.get(e.collection)?.get(e.key);
         if (prev && prev.checksum === checksum) continue; // unchanged -> skip
         const cur = currentRow(e.collection, e.key);
+        if (protectedRecord) {
+          const next = protectedValue;
+          if (cur && e.collection === 'protocolReceipt') throw new Error('protected_immutable_receipt_conflict');
+          if (e.collection === 'protocolHead') {
+            const prior = cur ? JSON.parse(cur.state_json) : null;
+            if (!Number.isSafeInteger(next.revision) || next.revision !== (prior?.revision ?? 0) + 1)
+              throw new Error('protected_head_CAS_revision_conflict');
+            if (prior && (prior.kind !== next.kind || prior.id !== next.id
+              || (prior.projectId ?? null) !== (next.projectId ?? null))) throw new Error('protected_head_identity_conflict');
+          }
+        }
         if (cur) pushHistory(cur);
         upsertRow(e.collection, e.key, e.projectId, stateJson, checksum, nextRevision, at);
       }

@@ -24,6 +24,7 @@ import { createPersistence, PersistenceCommitError } from './persistence.js';
 import { resolveMutationScope, FULL_SCOPE } from './state-scope.js';
 import { randomUUID } from 'node:crypto';
 import { createProjectInstanceId } from './project-id.js';
+import { createOrdinaryProtocolRecords, projectProtocolIds, readProjectProtocolBinding } from './project-protocol.js';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
 import { validateNodePermissions } from './workflow-node-permissions.js';
@@ -114,6 +115,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   const finalDeliverables = new Map();
   const reviewGateDecisions = new Map();
   const reviewConditions = new Map();
+  const protocolReceipts = new Map();
+  const protocolHeads = new Map();
+  const pendingCreateAssignments = new WeakMap();
+  const validatedCreate = Symbol('owner-validated-project-create');
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const activityContext = new AsyncLocalStorage();
   const activityReservations = new ProjectActivityReservations();
@@ -260,6 +265,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   // Restore state from disk. Unrecoverable load/corruption throws (never starts empty).
   if (persistence) {
     const saved = persistence.load();
+    for (const record of saved?.protocolReceipts || []) protocolReceipts.set(record.id,structuredClone(record));
+    for (const record of saved?.protocolHeads || []) protocolHeads.set(record.id,structuredClone(record));
     if (saved && saved.projects) {
       for (const p of saved.projects) {
         if (p.requiredProtocol && p.requiredProtocol !== 'room_workspace_v1') {
@@ -311,6 +318,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       reviewGateDecisions: [...reviewGateDecisions.values()],
       reviewConditions: [...reviewConditions.values()],
       humanActions,
+      protocolReceipts: [...protocolReceipts.values()],
+      protocolHeads: [...protocolHeads.values()],
     };
   }
 
@@ -344,6 +353,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
     for (const c of reviewConditions.values()) {
       if (inScope(c.projectId)) entities.push({ collection: 'reviewCondition', key: c.conditionId, projectId: c.projectId ?? null, value: c });
+    }
+    for (const [collection, records] of [['protocolReceipt',protocolReceipts],['protocolHead',protocolHeads]]) {
+      for (const record of records.values()) if (inScope(record.projectId)) entities.push({collection,key:record.id,projectId:record.projectId ?? null,value:record});
     }
     const newHumanActions = humanActions.slice(persistedHumanActionCount).map(a => ({
       collection: 'humanAction', key: a.id, projectId: a.projectId ?? null, value: a,
@@ -388,6 +400,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       }
       persistence.save(committedScope => buildScopedPersistencePayload(committedScope ?? scope, candidates), scope);
     } catch (error) { activityCommitError = error; throw error; }
+    if(context?.stagedCreate && affected.some(project=>project===context.stagedCreate)) context.createDurableCommitted=true;
+    try {
     for (const project of affected) {
       const candidate = candidates.get(project.id);
       const critical = (candidate.activityEventOutbox ?? []).filter(event => event.sourceSequence > (project.activityEventSeq ?? 0) && event.kind !== 'progress').length;
@@ -409,6 +423,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       for (const listener of activitySubscribers) { try { listener(notice); } catch { /* committed truth cannot be rolled back by a UI consumer */ } }
     }
     persistedHumanActionCount = humanActions.length;
+    } catch(cause) {
+      const error=new Error('[hub] durable commit applied; post-commit bookkeeping failed',{cause});
+      error.code='persistence_post_commit_failure';error.durableCommitted=true;
+      activityCommitError=error;
+      throw error;
+    }
   }
 
   function subscribeProjectActivity(listener) {
@@ -801,12 +821,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         if (reusable) return Promise.resolve(reusable);
       }
       return validateRoomFirstCreate(input, mutationCtx).then(({ primaryRoomId: resolvedRoomId,requiredProtocol }) =>
-        createProjectValidated({...input,requiredProtocol,autoAssignPo:requiredProtocol ? false : input.autoAssignPo}, mutationCtx, resolvedRoomId));
+        ({[validatedCreate]:()=>createProjectValidated({...input,requiredProtocol,autoAssignPo:requiredProtocol ? false : input.autoAssignPo}, mutationCtx, resolvedRoomId)}));
     }
     return createProjectValidated(input, mutationCtx, null);
   }
 
   function createProjectValidated(input, mutationCtx, resolvedRoomId) {
+    if (projects.has(input.id) || protocolReceipts.has(projectProtocolIds(input.id).binding)) throw new Error('project_already_exists');
     const {
       id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary,
       agentSelection = null, preparationContext = null, executionMode = 'direct',
@@ -899,6 +920,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       };
     }
     projects.set(id, project);
+    activityContext.getStore().stagedCreate=project;
     boards.set(id, createTaskBoard(id));
 
     eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: normalizedPoAgent });
@@ -925,8 +947,15 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       });
     }
 
+    // Staged with the project and original Room/activity outboxes, committed by
+    // the existing mutation wrapper in the same owner transaction.
+    const records=createOrdinaryProtocolRecords(project,sanitizeRequestContext(mutationCtx));
+    protocolReceipts.set(records.binding.id,records.binding);
+    protocolReceipts.set(records.createReceipt.id,records.createReceipt);
+
     if (autoAssignPo !== false && (!project.preparation || project.preparation.state === 'ready')) {
-      sendAssignPo(project, effectivePlanningGuidance);
+      eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
+      pendingCreateAssignments.set(project,()=>sendAssignPo(project,effectivePlanningGuidance,false));
     }
     return project;
   }
@@ -1279,7 +1308,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     };
   }
 
-  function sendAssignPo(project, effectivePlanningGuidance) {
+  function sendAssignPo(project, effectivePlanningGuidance, emitEvent = true) {
     if (bridge) {
       bridge.send({
         type: 'intent', kind: 'assign_po',
@@ -1293,7 +1322,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       });
     }
 
-    eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
+    if (emitEvent) eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
   }
 
   // ─── Human actions ─────────────────────────────────────────────────
@@ -6320,6 +6349,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     persisted[name] = (...args) => {
       assertPersistenceHealthy();
       if (name === 'createProject' && args[0] && !args[0].id) args[0] = { ...args[0], id: createProjectInstanceId() };
+      const createId=name==='createProject' ? args[0]?.id : null;
+      const priorProject=createId ? projects.get(createId) : undefined;
+      const actionWatermark=humanActions.length;
+      let createCommitted=false;
+      const rollbackCreate=()=>{
+        if (!createId || priorProject || createCommitted || context.createDurableCommitted || context.stagedCreate!==projects.get(createId) || !context.stagedCreate) return;
+        const staged=projects.get(createId);
+        if (staged) pendingCreateAssignments.delete(staged);
+        projects.delete(createId);boards.delete(createId);
+        const ids=projectProtocolIds(createId);
+        protocolReceipts.delete(ids.binding);protocolReceipts.delete(ids.receipt);
+        for (let i=humanActions.length-1;i>=actionWatermark;i--) if (humanActions[i].projectId===createId) humanActions.splice(i,1);
+        persistedHumanActionCount=Math.min(persistedHumanActionCount,humanActions.length);
+      };
       const admittedScope = resolveMutationScope(name, args, persistenceLookups);
       const context = { events: [], consumed: new Map(), active: true, reservations: new Map() };
       const release = () => { context.active = false; for (const reservation of context.reservations.values()) reservation.release(); };
@@ -6334,6 +6377,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         const commit = result => {
           try {
             assertPersistenceHealthy();
+            // Room validation may await, but staging and durable commit must
+            // share this synchronous continuation. No FULL writer can observe
+            // a half-created project between two promise callbacks.
+            if(name==='createProject' && result?.[validatedCreate])result=result[validatedCreate]();
             if (teamInputMutations.has(name)) {
               const projectId = typeof args[0] === 'string' ? args[0] : args[0]?.id;
               const project = projects.get(projectId);
@@ -6343,21 +6390,27 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
               }
             }
             persistState(resolveMutationScope(name, args, persistenceLookups));
+            createCommitted=true;
+            if (name==='createProject' && result && pendingCreateAssignments.has(result)) {
+              const assign=pendingCreateAssignments.get(result);pendingCreateAssignments.delete(result);
+              try {assign();}catch(error){emitDiagnostic('po.assignment_delivery_unknown',{projectId:result.id,error:String(error?.message ?? error)});}
+            }
             return result;
-          } finally { context.active = false; }
+          } catch(error){rollbackCreate();throw error;} finally { context.active = false; }
         };
         try {
           const result = fn(...args);
           // Room-first creation validates asynchronously; persist after it settles.
-          if (result && typeof result.then === 'function') return result.then(commit).finally(release);
+          if (result && typeof result.then === 'function') return result.then(commit,error=>{rollbackCreate();throw error;}).finally(release);
           try { return commit(result); } finally { release(); }
-        } catch (error) { release(); throw error; }
+        } catch (error) { rollbackCreate();release(); throw error; }
       });
     };
   }
 
   return {
     ...persisted,
+    getProjectProtocolBinding: projectId => readProjectProtocolBinding(projectId,protocolReceipts),
     getProject,
     mutateProjectState(projectId, action) {
       if (!projects.has(projectId)) throw new Error('project_not_found');
