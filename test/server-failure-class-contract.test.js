@@ -76,7 +76,7 @@ test('agent list refreshes broker presence and shares the routing profile overla
     source.indexOf('// ── Create agent ──'),
   );
 
-  assert.match(listRoute, /await refreshBrokerOnlineAgentIds\(\)/);
+  assert.match(listRoute, /await awaitServerOperation\(refreshBrokerOnlineAgentIds\(\)\)/);
   assert.match(listRoute, /listAgentProfilesForRouting\(\{ includeArchived \}\)/);
   assert.doesNotMatch(listRoute, /agentStore\.list\(/);
 });

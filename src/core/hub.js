@@ -445,6 +445,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return { ok: true, projectId, roomId: committed.activitySnapshot?.primaryRoomId ?? null, sourceDataEpoch: committed.activityDataEpoch };
   }
 
+  function subscribeProjectActivity(listener) {
+    activitySubscribers.add(listener);
+    return () => activitySubscribers.delete(listener);
+  }
+
+  function getProjectActivity(projectId, options) {
+    return readProjectActivity(committedActivities.get(projectId), options);
+  }
+  function getProjectActivityIdentity(projectId) {
+    const committed = committedActivities.get(projectId);
+    if (!committed) return { ok: false, code: 'project_activity_unavailable' };
+    return { ok: true, projectId, roomId: committed.activitySnapshot?.primaryRoomId ?? null, sourceDataEpoch: committed.activityDataEpoch };
+  }
+
   function getPersistenceHealth() {
     if (activityCommitError) return { ...persistence?.getHealth?.(), status: 'failed', errorCode: 'project_activity_commit_failed' };
     if (!persistence || typeof persistence.getHealth !== 'function') {

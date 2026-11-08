@@ -13,6 +13,9 @@ import { activityServiceIdentity } from './activity-service-identity.js';
 
 import http from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
+import { createServerOperations, shutdownSleep } from './server-operation-lifetime.js';
+import { createServerNetworkLifetime } from './server-network-lifetime.js';
+import { createServerWorkerLifetime } from './server-worker-lifetime.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { createHub } from '../core/hub.js';
@@ -87,6 +90,61 @@ import { isPersistenceCommitError, isPersistenceLoadError, EXIT_SAVE_FAILED, EXI
 
 // Explicit runtime floor probe — the durable SQLite backend needs node:sqlite.
 assertNodeRuntime();
+
+const serverOperations = createServerOperations();
+const workerLifetime = createServerWorkerLifetime();
+const brokerClients = new Set();
+let brokerRetryTimer = null;
+let shutdownPromise;
+let persistenceFailStopScheduled = false;
+const EXIT_SHUTDOWN_UNCONFIRMED = 70;
+const reportedShutdownFailures = new Set();
+
+function observeProducerFailure(error) {
+  if (isPersistenceCommitError(error)) failStopOnPersistenceCommit();
+  else if (serverOperations.closed && !isShutdownCancellation(error) && !reportedShutdownFailures.has(error)) {
+    reportedShutdownFailures.add(error);
+    try { log('warn', 'In-flight operation failed during shutdown', { error: String(error?.message || error) }); } catch { /* Diagnostics must not skip sibling drain. */ }
+  }
+}
+function isShutdownCancellation(error) {
+  return error?.code === 'server_shutting_down'
+    || (serverOperations.closed && error?.code === 'broker_client_closed');
+}
+function propagateServerFailure(error) {
+  observeProducerFailure(error);
+  // No business failure mutations after seal; preserve the original failure
+  // for the outer API/background diagnostic instead of replacing it with abort.
+  if (serverOperations.closed) throw error;
+}
+function consumeBackgroundFailure(error) {
+  observeProducerFailure(error);
+  return isShutdownCancellation(error);
+}
+async function awaitServerOperation(work) {
+  try {
+    const result = await work;
+    serverOperations.assertOpen();
+    return result;
+  } catch (error) {
+    propagateServerFailure(error);
+    throw error;
+  }
+}
+function runServerNotification(body) {
+  if (serverOperations.closed) return;
+  try { body(); } catch (error) {
+    if (!consumeBackgroundFailure(error)) log('error', 'Server notification failed', { error: String(error?.message || error) });
+  }
+}
+function spawnOwnedAutoWorker(config, options = {}) {
+  if (serverOperations.closed) return { ok: false, error: 'server_shutting_down' };
+  return spawnAutoWorkerProcess(config, { ...options, spawnFn: workerLifetime.spawn });
+}
+function scheduleBrokerRetry() {
+  if (serverOperations.closed || brokerRetryTimer) return;
+  brokerRetryTimer = setTimeout(() => { brokerRetryTimer = null; connectBroker(); }, 5_000);
+}
 
 const PORT = Number(process.env.KSWARM_PORT || 4400);
 const BROKER_URL = process.env.BROKER_URL || 'http://127.0.0.1:4318';
@@ -198,14 +256,14 @@ function createHubOrExit() {
       getAgentProfiles: () => listAgentProfilesForRouting(),
       getQualityOverlays: () => qualityOverlayStore.listOverlays(),
       brokerClient: {
-        getRoomSnapshot: (...args) => brokerClient?.getRoomSnapshot(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
-        acquireRoomMembershipLease: (...args) => brokerClient?.acquireRoomMembershipLease(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
-        publishRoomProjectEvent: (...args) => brokerClient?.publishRoomProjectEvent(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }),
-        verifyWorkspaceMappingTicket: (...args) => brokerClient?.verifyWorkspaceMappingTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
-        verifyWorkspaceClaim: (...args) => brokerClient?.verifyWorkspaceClaim(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
-        verifyWorkspaceCommitTicket: (...args) => brokerClient?.verifyWorkspaceCommitTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
-        workspaceMappingApplied: (...args) => brokerClient?.workspaceMappingApplied(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
-        workspaceMappingRejected: (...args) => brokerClient?.workspaceMappingRejected(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}),
+        getRoomSnapshot: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.getRoomSnapshot(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }))),
+        acquireRoomMembershipLease: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.acquireRoomMembershipLease(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }))),
+        publishRoomProjectEvent: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.publishRoomProjectEvent(...args) ?? Promise.resolve({ ok: false, code: 'kswarm_unavailable' }))),
+        verifyWorkspaceMappingTicket: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.verifyWorkspaceMappingTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}))),
+        verifyWorkspaceClaim: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.verifyWorkspaceClaim(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}))),
+        verifyWorkspaceCommitTicket: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.verifyWorkspaceCommitTicket(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}))),
+        workspaceMappingApplied: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.workspaceMappingApplied(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}))),
+        workspaceMappingRejected: (...args) => serverOperations.run(() => awaitServerOperation(brokerClient?.workspaceMappingRejected(...args) ?? Promise.resolve({ok:false,error:'workspace_broker_unavailable'}))),
       },
       runtimeInstanceAllocator: {
         getAgentConcurrency: () => getEffectiveAgentConcurrency({
@@ -395,7 +453,13 @@ function sendWorkflowResultReview(result) {
   return deliverWorkflowTaskReview({result,getTask:(projectId,taskId)=>hub.getBoard(projectId)?.getTask(taskId),sendReview:deliverReviewSubmission});
 }
 
-async function sendBrokerRequestTasks(projectId, taskIds = []) {
+function sendBrokerRequestTasks(...args) {
+  const work = serverOperations.run(() => sendBrokerRequestTasksImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function sendBrokerRequestTasksImplementation(projectId, taskIds = []) {
   if (!brokerClient || !brokerClient.isConnected() || taskIds.length === 0) return;
 
   const project = hub.getProject(projectId);
@@ -406,7 +470,7 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   for (const taskId of taskIds) {
     const task = board?.getTask(taskId);
     if (!task?.assignedAgent) continue;
-    const workspaceAdmission=await hub.authorizeWorkspaceDelivery(projectId,taskId);
+    const workspaceAdmission=await awaitServerOperation(hub.authorizeWorkspaceDelivery(projectId,taskId));
     if (!workspaceAdmission.ok) {
       log('warn','Workspace delivery rejected',{projectId,taskId,error:workspaceAdmission.error});
       continue;
@@ -448,15 +512,16 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
         recoveryResults.push(failed);
         continue;
       }
-      const delivery = await sendTaskToBrokerParticipant({
+      const delivery = await awaitServerOperation(sendTaskToBrokerParticipant({
         brokerClient,
         targetId: targetParticipantId,
         kind: 'request_task',
         isOnline: isAgentOnBroker,
+        signal: serverOperations.signal,
         waitTimeoutMs: 8_000,
         waitIntervalMs: 200,
         request: taskRequest.request,
-      });
+      }));
       if (!delivery.ok) {
         log('warn', `Failed to deliver request_task to ${targetAgent}`, {
           projectId,
@@ -479,15 +544,16 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
             targetParticipantId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
           });
           const fallbackDelivery = fallbackRequest.ok
-            ? await sendTaskToBrokerParticipant({
+            ? await awaitServerOperation(sendTaskToBrokerParticipant({
                 brokerClient,
                 targetId: XIAOK_DESKTOP_HOST_PARTICIPANT_ID,
                 kind: 'request_task',
                 isOnline: isAgentOnBroker,
-                waitTimeoutMs: 8_000,
+                signal: serverOperations.signal,
+        waitTimeoutMs: 8_000,
                 waitIntervalMs: 200,
                 request: fallbackRequest.request,
-              })
+              }))
             : { ok: false, error: fallbackRequest.error || 'fallback_handoff_failed' };
           if (fallbackDelivery.ok) {
             log('warn', `Agent runtime unavailable; task routed to Desktop current model`, {
@@ -520,6 +586,8 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
         recoveryResults.push(failed);
       }
     } catch (err) {
+      propagateServerFailure(err);
+
       log('warn', `Failed to send request_task to ${targetAgent}`, { projectId, taskId: task.id, agent: task.assignedAgent, targetParticipantId, runtimeInstance: task.assignedRuntimeInstance || null, error: err.message });
       if (!task.assignedRuntimeInstance && task.assignedAgent) {
         agentStore?.setOffline(task.assignedAgent);
@@ -537,11 +605,17 @@ async function sendBrokerRequestTasks(projectId, taskIds = []) {
   }
 
   if (recoveryResults.length > 0) {
-    await sendFailureRecovery(projectId, recoveryResults);
+    await awaitServerOperation(sendFailureRecovery(projectId, recoveryResults));
   }
 }
 
-async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
+function sendWorkflowNodeHandoffs(...args) {
+  const work = serverOperations.run(() => sendWorkflowNodeHandoffsImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function sendWorkflowNodeHandoffsImplementation(projectId, dispatches = []) {
   if (!Array.isArray(dispatches) || dispatches.length === 0) return [];
 
   const project = hub.getProject(projectId);
@@ -572,7 +646,7 @@ async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
         projectId,
         nodeId: dispatch.nodeId,
       });
-      const delivery = await withTimeout(brokerClient.sendTo(target, 'workflow_node_handoff', {
+      const delivery = await awaitServerOperation(withTimeout(brokerClient.sendTo(target, 'workflow_node_handoff', {
         taskId: dispatch.workflowRunId,
         payload: {
           ...dispatch,
@@ -585,7 +659,7 @@ async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
             workFolder: ws.path,
           } : { id: projectId, workFolder: ws.path },
         },
-      }), 8_000, 'workflow_handoff_send_timeout');
+      }), 8_000, 'workflow_handoff_send_timeout'));
       log('info', 'Workflow node handoff delivery result', {
         projectId,
         nodeId: dispatch.nodeId,
@@ -602,6 +676,8 @@ async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
       results.push({ ok: true, delivery, dispatch });
       broadcast({ type: 'workflow_node_dispatched', projectId, dispatch });
     } catch (err) {
+      propagateServerFailure(err);
+
       log('warn', 'Workflow node handoff delivery failed', {
         projectId,
         nodeId: dispatch.nodeId,
@@ -625,6 +701,7 @@ async function sendWorkflowNodeHandoffs(projectId, dispatches = []) {
 }
 
 function connectBroker() {
+  if (serverOperations.closed) return;
   try {
     brokerClient = createBrokerClient({
       brokerUrl: BROKER_URL,
@@ -634,45 +711,58 @@ function connectBroker() {
       roles: ['hub', 'coordinator'],
       capabilities: ['project_management', 'task_routing'],
       roomSystemToken: process.env.INTENT_BROKER_KSWARM_TOKEN || null,
-      onIntent: handleBrokerIntent,
+      onIntent: intent => runServerNotification(() => handleBrokerIntent(intent)),
       onConnect: () => {
+        if (serverOperations.closed) return;
         brokerConnected = true;
         log('info', 'Connected to intent-broker', { url: BROKER_URL });
         broadcast({ type: 'broker_status', connected: true });
         startWatchdog();
         flushReviewQueue().catch(err => {
+      if (consumeBackgroundFailure(err)) return;
           log('warn', 'Failed to flush durable review queue on reconnect', { error: String(err?.message || err) });
         });
         scheduleStartupRecovery(STARTUP_RECOVERY_DELAY_MS);
       },
       onDisconnect: () => {
+        if (serverOperations.closed) return;
         brokerConnected = false;
         broadcast({ type: 'broker_status', connected: false });
       },
     });
-    // Must register then connect
-    brokerClient.register()
-      .then(() => brokerClient.connect())
+    brokerClients.add(brokerClient);
+    const connectingClient = brokerClient;
+    // Must register then connect; this original instance owns both operations.
+    connectingClient.register()
+      .then(() => { serverOperations.assertOpen(); return connectingClient.connect(); })
       .catch(err => {
+      if (consumeBackgroundFailure(err)) return;
         log('warn', `Broker registration/connect failed: ${err.message}`);
-        setTimeout(connectBroker, 5000);
+        scheduleBrokerRetry();
       });
   } catch (err) {
+    if (consumeBackgroundFailure(err)) return;
     log('warn', `Broker connection failed: ${err.message}`);
-    setTimeout(connectBroker, 5000);
+    scheduleBrokerRetry();
   }
 }
 
-async function refreshBrokerOnlineAgentIds() {
+function refreshBrokerOnlineAgentIds(...args) {
+  const work = serverOperations.run(() => refreshBrokerOnlineAgentIdsImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function refreshBrokerOnlineAgentIdsImplementation() {
   try {
-    const res = await fetch(`${BROKER_URL}/participants`);
+    const res = await awaitServerOperation(fetch(`${BROKER_URL}/participants`, { signal: serverOperations.signal }));
     if (!res.ok) {
       brokerOnlineAgentIds = null;
       brokerOnlineAgentIdsUpdatedAt = 0;
       brokerOnlineParticipants = [];
       return null;
     }
-    const data = await res.json();
+    const data = await awaitServerOperation(res.json());
     const participants = data.participants || data || [];
     brokerOnlineParticipants = participants;
     brokerOnlineAgentIds = new Set(
@@ -685,7 +775,9 @@ async function refreshBrokerOnlineAgentIds() {
     );
     brokerOnlineAgentIdsUpdatedAt = Date.now();
     return brokerOnlineAgentIds;
-  } catch {
+  } catch (caughtError) {
+      propagateServerFailure(caughtError);
+
     brokerOnlineAgentIds = null;
     brokerOnlineAgentIdsUpdatedAt = 0;
     brokerOnlineParticipants = [];
@@ -693,8 +785,14 @@ async function refreshBrokerOnlineAgentIds() {
   }
 }
 
-async function getOnlineAgentIds() {
-  return await refreshBrokerOnlineAgentIds() || new Set();
+function getOnlineAgentIds(...args) {
+  const work = serverOperations.run(() => getOnlineAgentIdsImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function getOnlineAgentIdsImplementation() {
+  return await awaitServerOperation(refreshBrokerOnlineAgentIds()) || new Set();
 }
 
 function selectedAgentIdsForPreparation(project) {
@@ -727,12 +825,17 @@ function withAgentTargetPayload(agentId, payload = {}) {
 }
 
 function withTimeout(promise, timeoutMs, errorMessage) {
-  let timer = null;
+  let timer;
+  const signal = serverOperations.signal;
+  let cancel;
   const timeout = new Promise((_, reject) => {
+    cancel = () => reject(signal.reason);
+    if (signal.aborted) { cancel(); return; }
+    signal.addEventListener('abort', cancel, { once: true });
     timer = setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
+    clearTimeout(timer); signal.removeEventListener('abort', cancel);
   });
 }
 
@@ -750,7 +853,13 @@ function getCachedReadinessProbe(agentId, now = Date.now()) {
   return cached;
 }
 
-async function requestReadinessProbe({ projectId, agentId, role, forceProbe = false } = {}) {
+function requestReadinessProbe(...args) {
+  const work = serverOperations.run(() => requestReadinessProbeImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function requestReadinessProbeImplementation({ projectId, agentId, role, forceProbe = false } = {}) {
   const now = Date.now();
   const cached = !forceProbe ? getCachedReadinessProbe(agentId, now) : null;
   if (cached) return cached;
@@ -801,6 +910,11 @@ async function requestReadinessProbe({ projectId, agentId, role, forceProbe = fa
       threadId: `thread-${projectId || probeId}`,
       payload,
     }).catch(error => {
+      if (consumeBackgroundFailure(error)) return;
+      if (serverOperations.closed) {
+        log('warn', 'Readiness send failed during shutdown', { error: String(error?.message || error) });
+        return;
+      }
       clearTimeout(timeout);
       readinessProbeWaiters.delete(probeId);
       pendingProbeByAgentId.delete(agentId);
@@ -820,6 +934,7 @@ async function requestReadinessProbe({ projectId, agentId, role, forceProbe = fa
 }
 
 function handleReadinessProbeResult(intent) {
+  if (serverOperations.closed) return;
   const payload = intent?.payload || {};
   const now = Date.now();
   const normalized = normalizeReadinessProbeResult({
@@ -860,10 +975,16 @@ function runtimeCapacityByAgentId() {
   return result;
 }
 
-async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
+function prepareProjectForPlanning(...args) {
+  const work = serverOperations.run(() => prepareProjectForPlanningImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function prepareProjectForPlanningImplementation(project, { forceProbe = false } = {}) {
   if (!project) return null;
   reconcileProjectAgentSelectionWithEffectiveAgents(project);
-  await refreshBrokerOnlineAgentIds();
+  await awaitServerOperation(refreshBrokerOnlineAgentIds());
   const selected = selectedAgentIdsForPreparation(project);
   const agents = listAgentProfilesForRouting();
 
@@ -872,12 +993,12 @@ async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
     if (!isDesktopRuntimeAgent(agent)) continue;
     const route = resolveAgentIntentRoute(selectedAgent.agentId);
     if (!(brokerOnlineAgentIds instanceof Set) || !brokerOnlineAgentIds.has(route.targetParticipantId)) continue;
-    await requestReadinessProbe({
+    await awaitServerOperation(requestReadinessProbe({
       projectId: project.id,
       agentId: selectedAgent.agentId,
       role: selectedAgent.role,
       forceProbe,
-    });
+    }));
   }
 
   const probeResults = {};
@@ -902,12 +1023,12 @@ async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
       brokerOnlineAgentIds instanceof Set &&
       brokerOnlineAgentIds.has(resolveAgentIntentRoute(XIAOK_WORKER_AGENT_ID).targetParticipantId)
     ) {
-      await requestReadinessProbe({
+      await awaitServerOperation(requestReadinessProbe({
         projectId: project.id,
         agentId: XIAOK_WORKER_AGENT_ID,
         role: 'worker',
         forceProbe,
-      });
+      }));
       const cachedWorkerProbe = getCachedReadinessProbe(XIAOK_WORKER_AGENT_ID, Date.now());
       if (cachedWorkerProbe) probeResults[XIAOK_WORKER_AGENT_ID] = cachedWorkerProbe;
     }
@@ -949,7 +1070,13 @@ async function prepareProjectForPlanning(project, { forceProbe = false } = {}) {
   return project.preparation;
 }
 
-async function ensureProjectAgentsStarted(project) {
+function ensureProjectAgentsStarted(...args) {
+  const work = serverOperations.run(() => ensureProjectAgentsStartedImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function ensureProjectAgentsStartedImplementation(project) {
   if (!project?.poAgent) return { poTarget: null };
   let poTarget = getProjectPoTarget(project);
   if (isDefaultRuntimePo(project.poAgent)) {
@@ -957,21 +1084,27 @@ async function ensureProjectAgentsStarted(project) {
     if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
     else log('warn', 'Failed to ensure project PO runtime', { projectId: project.id, poAgent: project.poAgent, error: ensuredPo.error });
   } else {
-    await autoStartAgent(project.poAgent);
+    await awaitServerOperation(autoStartAgent(project.poAgent));
     poTarget = getProjectPoTarget(project);
   }
   for (const agentId of project.members || []) {
-    if (!isDefaultRuntimeWorker(agentId)) await autoStartAgent(agentId);
+    if (!isDefaultRuntimeWorker(agentId)) await awaitServerOperation(autoStartAgent(agentId));
   }
   return { poTarget };
 }
 
-async function sendAssignPoForProject(project, { delayMs = 0 } = {}) {
+function sendAssignPoForProject(...args) {
+  const work = serverOperations.run(() => sendAssignPoForProjectImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function sendAssignPoForProjectImplementation(project, { delayMs = 0 } = {}) {
   if (!project?.poAgent || !brokerClient || !brokerClient.isConnected()) return { sent: false, reason: 'broker_unavailable' };
-  const { poTarget } = await ensureProjectAgentsStarted(project);
+  const { poTarget } = await awaitServerOperation(ensureProjectAgentsStarted(project));
   if (!poTarget) return { sent: false, reason: 'po_target_missing' };
-  if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
-  await brokerClient.sendTo(poTarget, 'assign_po', {
+  if (delayMs > 0) await awaitServerOperation(shutdownSleep(delayMs, serverOperations.signal));
+  await awaitServerOperation(brokerClient.sendTo(poTarget, 'assign_po', {
     taskId: project.id,
     threadId: `thread-${project.id}`,
     payload: withAgentTargetPayload(project.poAgent, {
@@ -982,7 +1115,7 @@ async function sendAssignPoForProject(project, { delayMs = 0 } = {}) {
       planningGuidance: appendQualityPlanningGuidance(project.planningGuidance || '', project.qualityPlanningGuidance || ''),
       members: project.members || [],
     }).payload,
-  });
+  }));
   return { sent: true, poTarget };
 }
 
@@ -1010,7 +1143,13 @@ function persistReviewQueue() {
   }
 }
 
-async function deliverReviewSubmission({ projectId, taskId, fromWorker, result, submittedAt }) {
+function deliverReviewSubmission(...args) {
+  const work = serverOperations.run(() => deliverReviewSubmissionImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function deliverReviewSubmissionImplementation({ projectId, taskId, fromWorker, result, submittedAt }) {
   const project = hub.getProject(projectId);
   if (!project?.poAgent) return { ok: false, error: 'po_agent_missing' };
   const { entry, deduped } = reviewQueue.enqueue({
@@ -1031,21 +1170,29 @@ async function deliverReviewSubmission({ projectId, taskId, fromWorker, result, 
     return { ok: false, error: 'broker_unavailable', queued: true };
   }
   try {
-    await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
+    await awaitServerOperation(brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
       taskId,
       payload: withAgentTargetPayload(project.poAgent, { projectId, taskId, fromWorker, result, reviewKey: entry.key }).payload,
-    });
+    }));
     reviewQueue.markSent(entry.key);
     persistReviewQueue();
     return { ok: true, sent: true, key: entry.key };
   } catch (err) {
+      propagateServerFailure(err);
+
     reviewQueue.markFailed(entry.key, err.message || 'send_failed');
     persistReviewQueue();
     return { ok: false, error: err.message || 'send_failed', queued: true };
   }
 }
 
-async function flushReviewQueue() {
+function flushReviewQueue(...args) {
+  const work = serverOperations.run(() => flushReviewQueueImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function flushReviewQueueImplementation() {
   const sendable = reviewQueue.listSendable();
   if (sendable.length === 0) return;
   if (!brokerClient || !brokerClient.isConnected()) return;
@@ -1053,12 +1200,14 @@ async function flushReviewQueue() {
     const project = hub.getProject(entry.projectId);
     if (!project?.poAgent) continue;
     try {
-      await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
+      await awaitServerOperation(brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
         taskId: entry.taskId,
         payload: withAgentTargetPayload(project.poAgent, { projectId: entry.projectId, taskId: entry.taskId, fromWorker: entry.fromWorker, result: entry.result, reviewKey: entry.key }).payload,
-      });
+      }));
       reviewQueue.markSent(entry.key);
     } catch (err) {
+      propagateServerFailure(err);
+
       reviewQueue.markFailed(entry.key, err.message || 'send_failed');
     }
   }
@@ -1078,16 +1227,23 @@ function ackReviewSubmission(projectId, taskId, reviewKey = null) {
   return result;
 }
 
-async function sendRecoveryReviewSubmission({ projectId, taskId, fromWorker, result }) {
+function sendRecoveryReviewSubmission(...args) {
+  const work = serverOperations.run(() => sendRecoveryReviewSubmissionImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function sendRecoveryReviewSubmissionImplementation({ projectId, taskId, fromWorker, result }) {
   const project = hub.getProject(projectId);
   if (!brokerClient || !brokerClient.isConnected() || !project?.poAgent) return;
-  await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
+  await awaitServerOperation(brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
     taskId,
     payload: withAgentTargetPayload(project.poAgent, { projectId, taskId, fromWorker, result }).payload,
-  });
+  }));
 }
 
 function enterSystemSuspend() {
+  serverOperations.assertOpen();
   systemSuspended = true;
   if (pendingRecoveryTimer) {
     clearTimeout(pendingRecoveryTimer);
@@ -1096,6 +1252,7 @@ function enterSystemSuspend() {
   const result = hub.handleSuspendActiveRuns();
   if (suspendAutoResumeTimer) clearTimeout(suspendAutoResumeTimer);
   suspendAutoResumeTimer = setTimeout(() => {
+    if (serverOperations.closed) return;
     log('warn', 'Suspend auto-resume timeout reached; force-resuming', { maxSuspendMs: MAX_SUSPEND_MS });
     exitSystemResume(MAX_SUSPEND_MS);
   }, MAX_SUSPEND_MS);
@@ -1105,6 +1262,7 @@ function enterSystemSuspend() {
 }
 
 function exitSystemResume(sleptMs = 0) {
+  serverOperations.assertOpen();
   if (suspendAutoResumeTimer) {
     clearTimeout(suspendAutoResumeTimer);
     suspendAutoResumeTimer = null;
@@ -1118,6 +1276,7 @@ function exitSystemResume(sleptMs = 0) {
 }
 
 function scheduleStartupRecovery(delayMs = 0, options = { force: true }) {
+  if (serverOperations.closed) return;
   if (systemSuspended) return;
   if (pendingRecoveryTimer) {
     clearTimeout(pendingRecoveryTimer);
@@ -1126,22 +1285,29 @@ function scheduleStartupRecovery(delayMs = 0, options = { force: true }) {
   pendingRecoveryTimer = setTimeout(() => {
     pendingRecoveryTimer = null;
     runStartupRecovery(options).catch(err => {
+      if (consumeBackgroundFailure(err)) return;
       log('warn', 'Scheduled recovery failed', { error: String(err?.message || err) });
     });
   }, delayMs);
   if (typeof pendingRecoveryTimer.unref === 'function') pendingRecoveryTimer.unref();
 }
 
-async function runStartupRecovery({ force = false } = {}) {
+function runStartupRecovery(...args) {
+  const work = serverOperations.run(() => runStartupRecoveryImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function runStartupRecoveryImplementation({ force = false } = {}) {
   if (recoveryRunning) return;
   if (systemSuspended) return;
   if (!force && recoveryCompletedAt && Date.now() - recoveryCompletedAt < RECOVERY_DEBOUNCE_MS) return;
   recoveryRunning = true;
   try {
-    const onlineAgents = await getOnlineAgentIds();
-    await recoverProjectsIndependently({projects:hub.listProjects(),
+    const onlineAgents = await awaitServerOperation(getOnlineAgentIds());
+    await awaitServerOperation(recoverProjectsIndependently({projects:hub.listProjects(),
       onDeferred:(project,reason)=>log('info','Project recovery deferred to workspace owner',{projectId:project.id,reason}),
-      onError:(project,error)=>log('warn','Project recovery failed',{projectId:project.id,error:String(error?.message||error)}),
+      onError:(project,error)=>{ propagateServerFailure(error); log('warn','Project recovery failed',{projectId:project.id,error:String(error?.message||error)}); },
       recoverProject:async(project)=>{
       const board = hub.getBoard(project.id);
       if (!board) return;
@@ -1164,11 +1330,11 @@ async function runStartupRecovery({ force = false } = {}) {
       let deferred = false;
       for (const action of recoveryPlan.actions) {
         try {
-          const result = await executeRecoveryAction(action, {
+          const result = await awaitServerOperation(executeRecoveryAction(action, {
             hub,
             sendReviewSubmission: sendRecoveryReviewSubmission,
             sendRequestTask: (projectId, taskId) => sendBrokerRequestTasks(projectId, [taskId]),
-          });
+          }));
           if (result?.ok) {
             recovered++;
             if (result.deferred) deferred = true;
@@ -1179,6 +1345,8 @@ async function runStartupRecovery({ force = false } = {}) {
             broadcast({ type: 'task_recovery_failed', projectId: action.projectId, taskId: action.taskId, action: action.type, error: result?.error || 'unknown_error' });
           }
         } catch (err) {
+      propagateServerFailure(err);
+
           failed++;
           log('warn', `Startup recovery action failed`, { projectId: action.projectId, taskId: action.taskId, action: action.type, error: err.message });
           broadcast({ type: 'task_recovery_failed', projectId: action.projectId, taskId: action.taskId, action: action.type, error: err.message });
@@ -1190,7 +1358,7 @@ async function runStartupRecovery({ force = false } = {}) {
         if (dispatchResult.ok && (dispatchResult.dispatched.length > 0 || dispatchResult.workflowNodeDispatches?.length > 0)) {
           log('info', `Startup recovery redispatched tasks`, { projectId: project.id, dispatched: dispatchResult.dispatched });
           broadcast({ type: 'tasks_dispatched', projectId: project.id, dispatched: dispatchResult.dispatched });
-          await sendDispatchResult(project.id, dispatchResult);
+          await awaitServerOperation(sendDispatchResult(project.id, dispatchResult));
         }
       }
 
@@ -1201,7 +1369,7 @@ async function runStartupRecovery({ force = false } = {}) {
         log('info', `Deferred recovery scheduled for project ${project.id}`, { graceMs: DEFER_RECOVERY_GRACE_MS });
         scheduleStartupRecovery(DEFER_RECOVERY_GRACE_MS);
       }
-    }});
+    }}));
   } finally {
     recoveryCompletedAt = Date.now();
     recoveryRunning = false;
@@ -1209,6 +1377,7 @@ async function runStartupRecovery({ force = false } = {}) {
 }
 
 function handleBrokerIntent(intent) {
+  if (serverOperations.closed) return;
   const { kind, taskId, fromParticipantId, payload } = intent;
   const logicalParticipantId = resolveIncomingLogicalAgent({ fromParticipantId, payload });
 
@@ -1263,6 +1432,7 @@ function handleBrokerIntent(intent) {
       });
       broadcast({ type: 'task_failed', projectId: resolved.projectId, taskId: resolved.taskId, agent: logicalParticipantId, ...result });
       sendFailureRecovery(resolved.projectId, [result]).catch(err => {
+        if (consumeBackgroundFailure(err)) return;
         log('warn', 'Failed to deliver task recovery to broker', {
           projectId: resolved.projectId,
           taskId: resolved.taskId,
@@ -1291,7 +1461,7 @@ function handleBrokerIntent(intent) {
           fromWorker: logicalParticipantId,
           result: payload,
           submittedAt: Date.now(),
-        }).catch(err => log('warn', `Failed to enqueue review_submission`, { projectId: resolved.projectId, taskId: resolved.taskId, error: err.message }));
+        }).catch(err => { if (!consumeBackgroundFailure(err)) log('warn', `Failed to enqueue review_submission`, { projectId: resolved.projectId, taskId: resolved.taskId, error: err.message }); });
       }
       break;
     }
@@ -1348,6 +1518,7 @@ function handleBrokerIntent(intent) {
       sendWorkflowResultReview(result).catch(err => log('warn', 'Failed to enqueue workflow submission review', {projectId,workflowRunId:payload.workflowRunId,error:String(err?.message || err)}));
       if (result.dispatches?.length > 0) {
         sendWorkflowNodeHandoffs(projectId, result.dispatches).catch(err => {
+      if (consumeBackgroundFailure(err)) return;
           log('warn', 'Failed to deliver workflow node handoffs', {
             projectId,
             workflowRunId: payload.workflowRunId,
@@ -1426,14 +1597,22 @@ function emitTaskIntentError(kind, taskId, worker, result) {
 // ─── Auto-start agent helper ──────────────────────────────────────
 // If agent is in the store and offline, spawn its worker process automatically
 /** Check if an agent is actually connected to broker (not just status in store) */
-async function isAgentOnBroker(agentId) {
+function isAgentOnBroker(...args) {
+  const work = serverOperations.run(() => isAgentOnBrokerImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function isAgentOnBrokerImplementation(agentId) {
   try {
-    const res = await fetch(`${BROKER_URL}/participants`);
+    const res = await awaitServerOperation(fetch(`${BROKER_URL}/participants`, { signal: serverOperations.signal }));
     if (!res.ok) return false;
-    const data = await res.json();
+    const data = await awaitServerOperation(res.json());
     const participants = data.participants || data || [];
     return participants.some(p => p.participantId === agentId);
-  } catch {
+  } catch (caughtError) {
+      propagateServerFailure(caughtError);
+
     return false;
   }
 }
@@ -1462,6 +1641,7 @@ function shouldUseRuntimePool(agent) {
 }
 
 function spawnRuntimeInstance(instance, logicalAgent) {
+  serverOperations.assertOpen();
   if (!instance || !logicalAgent) return { ok: false, error: 'runtime_instance_missing' };
   const boundary = canSpawnAutoWorkerForTask({
     agent: logicalAgent,
@@ -1483,7 +1663,7 @@ function spawnRuntimeInstance(instance, logicalAgent) {
     logicalAgentId: logicalAgent.id,
     projectId: instance.role === 'project_owner' ? instance.projectId : undefined,
   });
-  const spawned = spawnAutoWorkerProcess(
+  const spawned = spawnOwnedAutoWorker(
     autoWorkerSpawnConfig(instance.instanceId, logicalAgent.name, logicalAgent.customArgs || [], childEnv),
     {
       onError: err => {
@@ -1577,7 +1757,13 @@ function reserveWorkerRuntimeInstance({ task } = {}) {
   return { ok: true, instanceId: ensured.instanceId, created: ensured.created };
 }
 
-async function autoStartAgent(agentId) {
+function autoStartAgent(...args) {
+  const work = serverOperations.run(() => autoStartAgentImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function autoStartAgentImplementation(agentId) {
   const agent = agentStore.get(agentId);
   if (!agent) {
     log('debug', `autoStartAgent: ${agentId} not in agent store, skipping`);
@@ -1600,7 +1786,7 @@ async function autoStartAgent(agentId) {
 
   // If agent claims to be online, verify with broker
   if (agent.status !== 'offline') {
-    const actuallyOnline = await isAgentOnBroker(agentId);
+    const actuallyOnline = await awaitServerOperation(isAgentOnBroker(agentId));
     if (actuallyOnline) {
       log('debug', `autoStartAgent: ${agentId} verified online on broker`);
       return true;
@@ -1612,7 +1798,7 @@ async function autoStartAgent(agentId) {
 
   try {
     const childEnv = buildAgentChildEnv(agent, agentId);
-    const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
+    const spawned = spawnOwnedAutoWorker(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
       onError: err => {
         agentStore.setOffline(agentId);
         log('error', `Auto-worker process error for ${agentId}: ${err.message}`);
@@ -1631,6 +1817,8 @@ async function autoStartAgent(agentId) {
     broadcast({ type: 'agent_started', agentId, runtimeId, pid: spawned.pid });
     return true;
   } catch (err) {
+      propagateServerFailure(err);
+
     log('error', `Failed to auto-start agent ${agentId}: ${err.message}`);
     return false;
   }
@@ -1640,7 +1828,13 @@ async function autoStartAgent(agentId) {
  * Force-restart an agent: kill old process, then spawn fresh.
  * Ensures the agent loads the latest code from disk.
  */
-async function forceRestartAgent(agentId) {
+function forceRestartAgent(...args) {
+  const work = serverOperations.run(() => forceRestartAgentImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function forceRestartAgentImplementation(agentId) {
   const agent = agentStore.get(agentId);
   if (!agent) return false;
 
@@ -1649,13 +1843,15 @@ async function forceRestartAgent(agentId) {
     const pidMatch = agent.runtimeId.match(/^pid-(\d+)$/);
     if (pidMatch) {
       const oldPid = parseInt(pidMatch[1], 10);
-      try { process.kill(oldPid, 'SIGTERM'); } catch (_) { /* already dead */ }
+      try { process.kill(oldPid, 'SIGTERM'); } catch (_) {
+      propagateServerFailure(_);
+ /* already dead */ }
     }
   }
 
   // Mark offline so autoStartAgent will re-spawn
   agentStore.setOffline(agentId);
-  await new Promise(r => setTimeout(r, 500));
+  await awaitServerOperation(shutdownSleep(500, serverOperations.signal));
 
   return autoStartAgent(agentId);
 }
@@ -1724,14 +1920,28 @@ function renderPlanMarkdown(plan) {
 // ─── HTTP API ─────────────────────────────────────────────────────
 function parseBody(req) {
   return new Promise((resolve, reject) => {
+    const signal = serverOperations.signal;
     let body = '';
     const decoder = new StringDecoder('utf8');
-    req.on('data', c => body += decoder.write(c));
-    req.on('end', () => {
+    function cleanup() {
+      req.removeListener('data', data); req.removeListener('end', end);
+      req.removeListener('aborted', aborted); req.removeListener('error', failed); req.removeListener('close', closed);
+      signal.removeEventListener('abort', cancelled);
+    }
+    function failed(error) { cleanup(); reject(error); }
+    function cancelled() { failed(signal.reason); }
+    function aborted() { failed(new Error('request_aborted')); }
+    function closed() { if (!req.complete) aborted(); }
+    function data(chunk) { body += decoder.write(chunk); }
+    function end() {
+      cleanup();
       body += decoder.end();
       try { resolve(body ? JSON.parse(body) : {}); }
       catch { reject(new Error('Invalid JSON')); }
-    });
+    }
+    if (signal.aborted) { cancelled(); return; }
+    req.on('data', data); req.once('end', end); req.once('aborted', aborted); req.once('error', failed); req.once('close', closed);
+    signal.addEventListener('abort', cancelled, { once: true });
   });
 }
 
@@ -1794,7 +2004,13 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-async function handleRequest(req, res) {
+function handleRequest(...args) {
+  const work = serverOperations.run(() => handleRequestImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function handleRequestImplementation(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -1850,18 +2066,18 @@ async function handleRequest(req, res) {
       if (!DESKTOP_MUTATION_TOKEN || req.headers['x-kswarm-mutation-token'] !== DESKTOP_MUTATION_TOKEN) return json(res,{ok:false,error:'mutation_credential_required'},401);
       const projectId=workspaceRoute[1], action=workspaceRoute[2];
       if (req.method === 'GET' && action === 'mapping') {
-        if(url.searchParams.get('dispatchCandidates')==='true')await refreshBrokerOnlineAgentIds();
+        if(url.searchParams.get('dispatchCandidates')==='true')await awaitServerOperation(refreshBrokerOnlineAgentIds());
         return json(res,hub.getWorkspaceMapping(projectId,url.searchParams.get('operationId'),url.searchParams.has('logicalAgentId')?url.searchParams.get('logicalAgentId'):undefined,url.searchParams.get('dispatchCandidates')==='true'));
       }
       if (req.method !== 'POST') return json(res,{ok:false,error:'method_not_allowed'},405);
       const context=resolveDesktopMutationContext(req);
       if (!context.ok) return json(res,{ok:false,error:context.error},context.status);
-      const body=await parseBody(req);
-      if(action==='dispatch')await refreshBrokerOnlineAgentIds();
-      const result=action === 'mapping' ? await hub.applyWorkspaceMapping(projectId,body,context.requestContext)
-        : action === 'dispatch' ? await hub.dispatchWorkspaceTask(projectId,body)
-        : await hub.submitWorkspaceTaskResult(projectId,body);
-      if (result.ok && action === 'dispatch' && (!result.reused||body.redeliver===true)) await sendBrokerRequestTasks(projectId,result.dispatched || []);
+      const body=await awaitServerOperation(parseBody(req));
+      if(action==='dispatch')await awaitServerOperation(refreshBrokerOnlineAgentIds());
+      const result=action === 'mapping' ? await awaitServerOperation(hub.applyWorkspaceMapping(projectId,body,context.requestContext))
+        : action === 'dispatch' ? await awaitServerOperation(hub.dispatchWorkspaceTask(projectId,body))
+        : await awaitServerOperation(hub.submitWorkspaceTaskResult(projectId,body));
+      if (result.ok && action === 'dispatch' && (!result.reused||body.redeliver===true)) await awaitServerOperation(sendBrokerRequestTasks(projectId,result.dispatched || []));
       return json(res,result,result.ok?200:409);
     }
 
@@ -1876,13 +2092,13 @@ async function handleRequest(req, res) {
       if (path === '/runtime/suspend') {
         return json(res, enterSystemSuspend());
       }
-      const body = await parseBody(req).catch(() => ({}));
+      const body = await awaitServerOperation(parseBody(req).catch(() => ({})));
       const sleptMs = Number(body?.sleptMs) || 0;
       return json(res, exitSystemResume(sleptMs));
     }
 
     if (path.startsWith('/quality/')) {
-      const body = req.method === 'POST' ? await parseBody(req) : null;
+      const body = req.method === 'POST' ? await awaitServerOperation(parseBody(req)) : null;
       const result = handleQualityApiRequest({
         method: req.method,
         path,
@@ -1896,7 +2112,7 @@ async function handleRequest(req, res) {
 
     // ── Room-first project creation (trusted Desktop user only) ──
     if (path === '/projects/room-first' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       if (body.requestSource !== 'user') {
@@ -1919,7 +2135,7 @@ async function handleRequest(req, res) {
       });
       const id = createProjectInstanceId();
       try {
-        const project = await hub.createProject({
+        const project = await awaitServerOperation(hub.createProject({
           id,
           name,
           goal: goal || '',
@@ -1936,7 +2152,7 @@ async function handleRequest(req, res) {
           primaryRoomId,
           sourceMessageIds,
           linkedBy: { kind: 'user', userId: 'user.local' },
-        }, context.requestContext);
+        }, context.requestContext));
 
         const workspaceBound=project.requiredProtocol === 'room_workspace_v1' || body.requiredProtocol === 'room_workspace_v1';
         if (workspaceBound) {
@@ -1948,17 +2164,19 @@ async function handleRequest(req, res) {
         }
         const ws = initProjectWorkspace(project.id, workFolder);
         project.workFolder = ws.path;
-        await ensureProjectAgentsStarted(project);
-        const preparation = await prepareProjectForPlanning(project);
+        await awaitServerOperation(ensureProjectAgentsStarted(project));
+        const preparation = await awaitServerOperation(prepareProjectForPlanning(project));
         const planningStart = preparation?.state === 'ready'
-          ? await sendAssignPoForProject(project, { delayMs: 0 })
-              .catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }))
+          ? await awaitServerOperation(sendAssignPoForProject(project, { delayMs: 0 })
+              .catch(err => { propagateServerFailure(err); return { sent: false, reason: err.message || 'assign_po_failed' }; }))
           : { sent: false, reason: 'preparation_blocked' };
-        const roomProjection = await hub.flushRoomEventOutbox()
-          .catch(err => ({ ok: false, code: err.message || 'room_projection_failed' }));
+        const roomProjection = await awaitServerOperation(hub.flushRoomEventOutbox()
+          .catch(err => { propagateServerFailure(err); return { ok: false, code: err.message || 'room_projection_failed' }; }));
         broadcast({ type: 'project_created', project });
         return json(res, { ok: true, project, preparation, planningStart, roomProjection }, 201);
       } catch (error) {
+      propagateServerFailure(error);
+
         const code = error?.code || error?.message || 'room_project_create_failed';
         const status = code === 'room_not_found' || code === 'room_message_not_found'
           ? 404
@@ -1994,7 +2212,7 @@ async function handleRequest(req, res) {
 
     // ── Create project (Human action) ──
     if (path === '/projects' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const { name, goal, requirements, planningGuidance, poAgent, members, workFolder, enableSummary, agentSelection, executionMode, startPolicy, requestedStartPolicy, autoStartPlanning, clientRequestKey, memberCount } = body;
@@ -2035,12 +2253,12 @@ async function handleRequest(req, res) {
       const ws = initProjectWorkspace(id, workFolder);
       project.workFolder = ws.path;
 
-      await ensureProjectAgentsStarted(project);
-      const preparation = await prepareProjectForPlanning(project);
+      await awaitServerOperation(ensureProjectAgentsStarted(project));
+      const preparation = await awaitServerOperation(prepareProjectForPlanning(project));
       let planningStart = { sent: false, reason: shouldAutoStartPlanning ? 'preparation_blocked' : 'auto_start_disabled' };
       if (shouldAutoStartPlanning && preparation?.state === 'ready') {
-        planningStart = await sendAssignPoForProject(project, { delayMs: 0 })
-          .catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }));
+        planningStart = await awaitServerOperation(sendAssignPoForProject(project, { delayMs: 0 })
+          .catch(err => { propagateServerFailure(err); return { sent: false, reason: err.message || 'assign_po_failed' }; }));
       }
 
       log('info', `Project created: ${name}`, {
@@ -2063,7 +2281,7 @@ async function handleRequest(req, res) {
 
     const teamPlanMatch = path.match(/^\/projects\/([^/]+)\/team\/plan$/);
     if (teamPlanMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok || body.requestSource !== 'user') return json(res, { ok: false, error: context.ok ? 'request_source_denied' : context.error }, context.ok ? 403 : (context.status || 401));
       const result = teamProvisioningHub.plan({
@@ -2077,7 +2295,7 @@ async function handleRequest(req, res) {
 
     const teamReconcileMatch = path.match(/^\/projects\/([^/]+)\/team\/reconcile$/);
     if (teamReconcileMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok || body.requestSource !== 'user') return json(res, { ok: false, error: context.ok ? 'request_source_denied' : context.error }, context.ok ? 403 : (context.status || 401));
       const result = teamProvisioningHub.reconcile({
@@ -2110,7 +2328,7 @@ async function handleRequest(req, res) {
     const executionModeMatch = path.match(/^\/projects\/([^/]+)\/execution-mode$/);
     if (executionModeMatch && req.method === 'PATCH') {
       const projectId = executionModeMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.updateProjectExecutionMode(projectId, body?.executionMode, {
@@ -2181,7 +2399,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowProposalMatch = path.match(/^\/projects\/([^/]+)\/workflows\/script-generated\/proposal$/);
     if (scriptWorkflowProposalMatch && req.method === 'POST') {
       const projectId = scriptWorkflowProposalMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.createScriptWorkflowProposal(projectId, body?.preview || body, {
@@ -2194,7 +2412,7 @@ async function handleRequest(req, res) {
     const workflowProposalMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/proposal$/);
     if (workflowProposalMatch && req.method === 'POST') {
       const [, projectId, workflowId] = workflowProposalMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.createWorkflowProposal(projectId, workflowId, {
@@ -2208,7 +2426,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowRunStartMatch = path.match(/^\/projects\/([^/]+)\/workflows\/script-generated\/runs$/);
     if (scriptWorkflowRunStartMatch && req.method === 'POST') {
       const projectId = scriptWorkflowRunStartMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.startScriptWorkflowRunFromProposal(body?.proposalId, {
@@ -2226,7 +2444,7 @@ async function handleRequest(req, res) {
     const workflowRunStartMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/runs$/);
     if (workflowRunStartMatch && req.method === 'POST') {
       const [, projectId, workflowId] = workflowRunStartMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.startWorkflowRunFromProposal(body?.proposalId, {
@@ -2238,7 +2456,7 @@ async function handleRequest(req, res) {
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_started', projectId, workflowRun: result.workflowRun });
-        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        await awaitServerOperation(sendWorkflowNodeHandoffs(projectId, result.dispatches));
         const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
         return json(res, { ...result, workflowRun }, 201);
       }
@@ -2248,7 +2466,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowParallelGroupMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/parallel-groups$/);
     if (scriptWorkflowParallelGroupMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowParallelGroupMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
@@ -2274,7 +2492,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowNodeMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes$/);
     if (scriptWorkflowNodeMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowNodeMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
@@ -2297,7 +2515,7 @@ async function handleRequest(req, res) {
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
-        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        await awaitServerOperation(sendWorkflowNodeHandoffs(projectId, result.dispatches));
         const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
         return json(res, { ...result, workflowRun }, 201);
       }
@@ -2307,7 +2525,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowNodeResultMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes\/([^/]+)\/result$/);
     if (scriptWorkflowNodeResultMatch && req.method === 'POST') {
       const [, projectId, workflowRunId, nodeId] = scriptWorkflowNodeResultMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
@@ -2324,7 +2542,7 @@ async function handleRequest(req, res) {
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
-        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        await awaitServerOperation(sendWorkflowNodeHandoffs(projectId, result.dispatches));
         const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
         return json(res, { ok: true, workflowRun, dispatches: result.dispatches || [] }, 200);
       }
@@ -2334,7 +2552,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowNodeRetryMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/nodes\/([^/]+)\/retry$/);
     if (scriptWorkflowNodeRetryMatch && req.method === 'POST') {
       const [, projectId, workflowRunId, nodeId] = scriptWorkflowNodeRetryMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
@@ -2347,7 +2565,7 @@ async function handleRequest(req, res) {
       });
       if (result.ok) {
         broadcast({ type: 'workflow_run_updated', projectId, workflowRun: result.workflowRun });
-        await sendWorkflowNodeHandoffs(projectId, result.dispatches || []);
+        await awaitServerOperation(sendWorkflowNodeHandoffs(projectId, result.dispatches || []));
         const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
         return json(res, { ...result, workflowRun }, 200);
       }
@@ -2357,7 +2575,7 @@ async function handleRequest(req, res) {
     const scriptWorkflowCompleteMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/script\/complete$/);
     if (scriptWorkflowCompleteMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = scriptWorkflowCompleteMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const existingRun = hub.getWorkflowRun(workflowRunId);
@@ -2377,7 +2595,7 @@ async function handleRequest(req, res) {
     const workflowRunProgressMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/progress$/);
     if (workflowRunProgressMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = workflowRunProgressMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const batch = body?.batch || body;
@@ -2395,7 +2613,7 @@ async function handleRequest(req, res) {
     const workflowRunCancelMatch = path.match(/^\/projects\/([^/]+)\/workflows\/([^/]+)\/cancel$/);
     if (workflowRunCancelMatch && req.method === 'POST') {
       const [, projectId, workflowRunId] = workflowRunCancelMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       const result = hub.cancelWorkflowRun(workflowRunId, {
@@ -2408,7 +2626,7 @@ async function handleRequest(req, res) {
     const diagnoseWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/project-diagnose$/);
     if (diagnoseWorkflowMatch && req.method === 'POST') {
       const projectId = diagnoseWorkflowMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const result = hub.startProjectDiagnoseWorkflow(projectId, {
         requestedBy: body?.requestedBy || 'human',
       });
@@ -2426,7 +2644,7 @@ async function handleRequest(req, res) {
     const agentSmokeWorkflowMatch = path.match(/^\/projects\/([^/]+)\/workflows\/agent-review-smoke$/);
     if (agentSmokeWorkflowMatch && req.method === 'POST') {
       const projectId = agentSmokeWorkflowMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const result = hub.startAgentReviewSmokeWorkflow(projectId, {
         requestedBy: body?.requestedBy || 'human',
       });
@@ -2437,7 +2655,7 @@ async function handleRequest(req, res) {
           dispatches: result.dispatches?.length || 0,
         });
         broadcast({ type: 'workflow_run_started', projectId, workflowRun: result.workflowRun });
-        await sendWorkflowNodeHandoffs(projectId, result.dispatches);
+        await awaitServerOperation(sendWorkflowNodeHandoffs(projectId, result.dispatches));
         const workflowRun = hub.getWorkflowRun(result.workflowRun.id) || result.workflowRun;
         return json(res, { ...result, workflowRun }, 201);
       }
@@ -2447,14 +2665,14 @@ async function handleRequest(req, res) {
     // ── Project preparation gate ──
     const prepareMatch = path.match(/^\/projects\/([^/]+)\/prepare$/);
     if (prepareMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const project = hub.getProject(prepareMatch[1]);
       if (!project) return json(res, { ok: false, error: 'project_not_found' }, 404);
-      const preparation = await prepareProjectForPlanning(project, { forceProbe: Boolean(body?.forceProbe) });
+      const preparation = await awaitServerOperation(prepareProjectForPlanning(project, { forceProbe: Boolean(body?.forceProbe) }));
       let startedPlanning = false;
       let planningStart = null;
       if (preparation?.state === 'ready' && project.status === 'created' && !project.plan) {
-        planningStart = await sendAssignPoForProject(project).catch(err => ({ sent: false, reason: err.message || 'assign_po_failed' }));
+        planningStart = await awaitServerOperation(sendAssignPoForProject(project).catch(err => { propagateServerFailure(err); return { sent: false, reason: err.message || 'assign_po_failed' }; }));
         startedPlanning = Boolean(planningStart?.sent);
       }
       broadcast({ type: 'project_prepared', projectId: project.id, preparation, startedPlanning });
@@ -2463,11 +2681,11 @@ async function handleRequest(req, res) {
 
     const activateAndStartMatch = path.match(/^\/projects\/([^/]+)\/activate-and-start$/);
     if (activateAndStartMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
       const projectId = activateAndStartMatch[1];
-      await refreshBrokerOnlineAgentIds();
+      await awaitServerOperation(refreshBrokerOnlineAgentIds());
       const result = hub.activateAndStartProject(projectId, {
         startPolicy: body.startPolicy || body.requestedStartPolicy,
         idempotencyKey: body.idempotencyKey || body.activationIdempotencyKey,
@@ -2491,7 +2709,7 @@ async function handleRequest(req, res) {
           workflowDispatched: result.dispatch?.workflowDispatched || [],
         });
         if (result.dispatch?.ok) {
-          await sendDispatchResult(projectId, result.dispatch);
+          await awaitServerOperation(sendDispatchResult(projectId, result.dispatch));
         }
       }
       return json(res, result, result.ok ? 200 : result.error === 'project_not_found' ? 404 : 400);
@@ -2513,8 +2731,8 @@ async function handleRequest(req, res) {
     const continueMatch = path.match(/^\/projects\/([^/]+)\/continue$/);
     if (continueMatch && req.method === 'POST') {
       const projectId = continueMatch[1];
-      const body = await parseBody(req);
-      await refreshBrokerOnlineAgentIds();
+      const body = await awaitServerOperation(parseBody(req));
+      await awaitServerOperation(refreshBrokerOnlineAgentIds());
       const result = hub.handleContinueProject(projectId, body || {});
       if (result.ok) {
         log('info', `Project continue requested`, {
@@ -2529,12 +2747,14 @@ async function handleRequest(req, res) {
           const fromWorker = result.fromWorker || task?.recoveredBy || task?.assignedAgent || 'continue_project';
           if (brokerClient && brokerClient.isConnected() && project?.poAgent) {
             try {
-              await brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
+              await awaitServerOperation(brokerClient.sendTo(getProjectPoTarget(project), 'review_submission', {
                 taskId: result.taskId,
                 payload: withAgentTargetPayload(project.poAgent, { projectId, taskId: result.taskId, fromWorker, result: result.result }).payload,
-              });
+              }));
               result.reviewNotification = 'sent';
             } catch (err) {
+      propagateServerFailure(err);
+
               result.reviewNotification = 'failed';
               result.reviewNotificationError = String(err?.message || err);
               log('warn', `Failed to send review_submission on project continue`, {
@@ -2548,7 +2768,7 @@ async function handleRequest(req, res) {
             result.reviewNotification = 'not_available';
           }
         }
-        await sendDispatchResult(projectId, result);
+        await awaitServerOperation(sendDispatchResult(projectId, result));
       }
       return json(res, result, result.status || (result.ok ? 200 : 400));
     }
@@ -2557,7 +2777,7 @@ async function handleRequest(req, res) {
     const resolveInterventionMatch = path.match(/^\/projects\/([^/]+)\/intervention\/resolve$/);
     if (resolveInterventionMatch && req.method === 'POST') {
       const projectId = resolveInterventionMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const ws = getProjectWorkspace(projectId);
       const project = hub.getProject(projectId);
       const canNotifyReview = Boolean(brokerClient && brokerClient.isConnected() && project?.poAgent);
@@ -2580,6 +2800,7 @@ async function handleRequest(req, res) {
             taskId,
             payload: withAgentTargetPayload(project.poAgent, payload).payload,
           }).catch(err => {
+      if (consumeBackgroundFailure(err)) return;
             log('warn', `Failed to send review_submission to ${poTarget}`, { projectId, taskId, poAgent: project.poAgent, error: err.message });
           });
         } : null,
@@ -2609,7 +2830,7 @@ async function handleRequest(req, res) {
       const projectForApproval = hub.getProject(approveMatch[1]);
       if (!projectForApproval) return json(res, { ok: false, error: 'project_not_found' }, 404);
       if (projectForApproval.status !== 'active') {
-        const preparation = await prepareProjectForPlanning(projectForApproval);
+        const preparation = await awaitServerOperation(prepareProjectForPlanning(projectForApproval));
         if (preparation?.state !== 'ready') {
           return json(res, {
             ok: false,
@@ -2635,17 +2856,17 @@ async function handleRequest(req, res) {
               if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
               else log('warn', 'Failed to ensure project PO runtime on approval', { projectId: project.id, poAgent: project.poAgent, error: ensuredPo.error });
             } else {
-              await autoStartAgent(project.poAgent);
+              await awaitServerOperation(autoStartAgent(project.poAgent));
               poTarget = getProjectPoTarget(project);
             }
             for (const memberId of (project.members || [])) {
-              if (!isDefaultRuntimeWorker(memberId)) await autoStartAgent(memberId);
+              if (!isDefaultRuntimeWorker(memberId)) await awaitServerOperation(autoStartAgent(memberId));
             }
           }
 
           // Notify PO that plan is approved — start execution
           if (brokerClient && brokerClient.isConnected() && poTarget) {
-            await new Promise(r => setTimeout(r, 500));
+            await awaitServerOperation(shutdownSleep(500, serverOperations.signal));
             brokerClient.sendTo(poTarget, 'respond_approval', {
               taskId: approveMatch[1],
               threadId: `thread-${approveMatch[1]}`,
@@ -2653,7 +2874,7 @@ async function handleRequest(req, res) {
                 projectId: approveMatch[1],
                 decision: 'approved',
               }).payload,
-            }).catch(err => log('warn', 'Failed to notify PO of approval', { target: poTarget, error: err.message }));
+            }).catch(err => { if (!consumeBackgroundFailure(err)) log('warn', 'Failed to notify PO of approval', { target: poTarget, error: err.message }); });
           }
         }
       }
@@ -2694,7 +2915,7 @@ async function handleRequest(req, res) {
           poStarted = ensuredPo.ok;
           if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
         } else {
-          poStarted = await autoStartAgent(project.poAgent);
+          poStarted = await awaitServerOperation(autoStartAgent(project.poAgent));
           poTarget = getProjectPoTarget(project);
         }
         if (!poStarted) {
@@ -2717,19 +2938,19 @@ async function handleRequest(req, res) {
               poStarted = ensuredPo.ok;
               if (ensuredPo.ok) poTarget = ensuredPo.instanceId;
             } else {
-              poStarted = await autoStartAgent(project.poAgent);
+              poStarted = await awaitServerOperation(autoStartAgent(project.poAgent));
               poTarget = getProjectPoTarget(project);
             }
           }
         }
         for (const memberId of (project.members || [])) {
-          if (!isDefaultRuntimeWorker(memberId)) await autoStartAgent(memberId);
+          if (!isDefaultRuntimeWorker(memberId)) await awaitServerOperation(autoStartAgent(memberId));
         }
       }
 
       hub.persistState();
 
-      const preparation = await prepareProjectForPlanning(project);
+      const preparation = await awaitServerOperation(prepareProjectForPlanning(project));
       if (preparation?.state !== 'ready') {
         return json(res, {
           ok: false,
@@ -2752,7 +2973,7 @@ async function handleRequest(req, res) {
           ...assignPoIntent,
           payload: withAgentTargetPayload(project.poAgent, assignPoIntent.payload || {}).payload,
         })
-          .catch(err => log('warn', 'Failed to send assign_po intent', { target: poTarget, error: err.message }));
+          .catch(err => { if (!consumeBackgroundFailure(err)) log('warn', 'Failed to send assign_po intent', { target: poTarget, error: err.message }); });
       }
 
       const retryInfo = {
@@ -2772,7 +2993,7 @@ async function handleRequest(req, res) {
     const planSubmitMatch = path.match(/^\/projects\/([^/]+)\/plan$/);
     if (planSubmitMatch && req.method === 'POST') {
       const projectId = planSubmitMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { plan, fromAgent } = body;
       if (!plan || !fromAgent) return json(res, { error: 'plan and fromAgent required' }, 400);
 
@@ -2801,7 +3022,7 @@ async function handleRequest(req, res) {
     const planReviseMatch = path.match(/^\/projects\/([^/]+)\/plan\/revise$/);
     if (planReviseMatch && req.method === 'POST') {
       const projectId = planReviseMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { revision, fromAgent } = body;
       if (!revision || !fromAgent) return json(res, { error: 'revision and fromAgent required' }, 400);
 
@@ -2832,7 +3053,7 @@ async function handleRequest(req, res) {
     const reviewMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/review$/);
     if (reviewMatch && req.method === 'POST') {
       const [, projectId, taskId] = reviewMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { review, fromAgent } = body;
       if (!review || !fromAgent) return json(res, { error: 'review and fromAgent required' }, 400);
 
@@ -2867,19 +3088,19 @@ async function handleRequest(req, res) {
 
         // If passed, auto-dispatch next available tasks
         if (effectivePassed) {
-          await refreshBrokerOnlineAgentIds();
+          await awaitServerOperation(refreshBrokerOnlineAgentIds());
           const dispatchResult = hub.handleRequestDispatch(projectId, fromAgent);
           if (dispatchResult.ok && (dispatchResult.dispatched.length > 0 || dispatchResult.workflowNodeDispatches?.length > 0)) {
             log('info', `Auto-dispatched after review`, { projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
             broadcast({ type: 'tasks_dispatched', projectId, dispatched: dispatchResult.dispatched, workflowDispatched: dispatchResult.workflowDispatched || [] });
-            await sendDispatchResult(projectId, dispatchResult);
+            await awaitServerOperation(sendDispatchResult(projectId, dispatchResult));
           }
         }
 
         // If rework created a fresh run, notify through the normal request_task path.
         if (result.rework && result.dispatch?.ok && ((result.dispatched || []).length > 0 || result.dispatch.workflowNodeDispatches?.length > 0)) {
           broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
-          await sendDispatchResult(projectId, result.dispatch);
+          await awaitServerOperation(sendDispatchResult(projectId, result.dispatch));
         } else if (result.rework && brokerClient && brokerClient.isConnected()) {
           const board = hub.getBoard(projectId);
           const task = board?.getTask(taskId);
@@ -2896,6 +3117,7 @@ async function handleRequest(req, res) {
                 ...(route.targetAgentId ? { targetAgentId: route.targetAgentId } : {}),
               },
             }).catch(err => {
+      if (consumeBackgroundFailure(err)) return;
               log('warn', 'Failed to deliver rework intent to worker', {
                 projectId,
                 taskId: task.id,
@@ -2914,7 +3136,7 @@ async function handleRequest(req, res) {
     const recoverMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/recover-submission$/);
     if (recoverMatch && req.method === 'POST') {
       const [, projectId, taskId] = recoverMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const fromAgent = body.fromAgent || 'human';
       const artifactNames = Array.isArray(body.artifacts) ? body.artifacts : [];
       if (artifactNames.length === 0) return json(res, { ok: false, error: 'artifacts_required' }, 400);
@@ -2961,7 +3183,7 @@ async function handleRequest(req, res) {
             fromWorker: fromAgent,
             result: resultPayload,
             submittedAt: Date.now(),
-          }).catch(err => log('warn', `Failed to enqueue recovered review_submission`, { projectId, taskId: result.taskId, error: err.message }));
+          }).catch(err => { if (!consumeBackgroundFailure(err)) log('warn', `Failed to enqueue recovered review_submission`, { projectId, taskId: result.taskId, error: err.message }); });
         }
       }
       return json(res, result);
@@ -2971,7 +3193,7 @@ async function handleRequest(req, res) {
     const synthesizeMatch = path.match(/^\/projects\/([^/]+)\/synthesize$/);
     if (synthesizeMatch && req.method === 'POST') {
       const projectId = synthesizeMatch[1];
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       let { synthesis, fromAgent } = body;
       if (!synthesis || !fromAgent) return json(res, { error: 'synthesis and fromAgent required' }, 400);
 
@@ -3051,6 +3273,8 @@ async function handleRequest(req, res) {
               project.taskScores = extractTaskScores(synthesis);
             });
           } catch (e) {
+      propagateServerFailure(e);
+
             log('warn', 'Failed to parse project summary', { projectId, error: String(e) });
           }
         }
@@ -3121,7 +3345,7 @@ async function handleRequest(req, res) {
     const reassignMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/reassign$/);
     if (reassignMatch && req.method === 'POST') {
       const [, projectId, taskId] = reassignMatch;
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { newAgent, reason, fromPO } = body;
       if (!newAgent) return json(res, { error: 'newAgent required' }, 400);
 
@@ -3139,7 +3363,7 @@ async function handleRequest(req, res) {
 
       if (result.dispatch?.ok) {
         broadcast({ type: 'tasks_dispatched', projectId, tasks: result.dispatched });
-        await sendDispatchResult(projectId, result.dispatch);
+        await awaitServerOperation(sendDispatchResult(projectId, result.dispatch));
       }
 
       return json(res, result);
@@ -3157,7 +3381,7 @@ async function handleRequest(req, res) {
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { error: context.error }, context.status || 401);
 
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { tasks: taskList } = body;
       if (!taskList) return json(res, { error: 'tasks required' }, 400);
       // Auto-generate id for tasks that don't have one
@@ -3175,7 +3399,7 @@ async function handleRequest(req, res) {
     // ── PO creates tasks ──
     const tasksMatch = path.match(/^\/projects\/([^/]+)\/tasks$/);
     if (tasksMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { tasks: taskList, fromAgent } = body;
       if (!taskList || !fromAgent) return json(res, { error: 'tasks and fromAgent required' }, 400);
       const result = hub.handleCreateTasks(tasksMatch[1], taskList, fromAgent);
@@ -3189,15 +3413,15 @@ async function handleRequest(req, res) {
     // ── Dispatch tasks (PO action) ──
     const dispatchMatch = path.match(/^\/projects\/([^/]+)\/dispatch$/);
     if (dispatchMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const projectId = dispatchMatch[1];
-      await refreshBrokerOnlineAgentIds();
+      await awaitServerOperation(refreshBrokerOnlineAgentIds());
       const result = hub.handleRequestDispatch(projectId, body.fromAgent);
       if (result.ok) {
         log('info', `Dispatched tasks for project ${projectId}`, { dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
         broadcast({ type: 'tasks_dispatched', projectId, dispatched: result.dispatched, workflowDispatched: result.workflowDispatched || [] });
 
-        await sendDispatchResult(projectId, result);
+        await awaitServerOperation(sendDispatchResult(projectId, result));
       }
       return json(res, result);
     }
@@ -3205,7 +3429,7 @@ async function handleRequest(req, res) {
     // ── Mark task done (PO confirms) ──
     const doneMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/done$/);
     if (doneMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const result = hub.handleMarkDone(doneMatch[1], doneMatch[2], body.fromAgent);
       if (result.ok) {
         log('info', `PO confirmed task done: ${result.taskId || doneMatch[2]}`, { projectId: doneMatch[1] });
@@ -3217,7 +3441,7 @@ async function handleRequest(req, res) {
     // ── Rework task (PO action) ──
     const reworkMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/rework$/);
     if (reworkMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const result = hub.handleRework(reworkMatch[1], reworkMatch[2], body.reason || '', body.fromAgent);
       if (result.ok) {
         broadcast({ type: 'task_rework', projectId: reworkMatch[1], taskId: result.taskId || reworkMatch[2] });
@@ -3244,20 +3468,20 @@ async function handleRequest(req, res) {
     // ── Task failure (with auto-retry) ──
     const failMatch = path.match(/^\/projects\/([^/]+)\/tasks\/([^/]+)\/fail$/);
     if (failMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const [, projectId, taskId] = failMatch;
       const result = hub.handleTaskFail(projectId, taskId, body.failureReason, body.errorMessage);
       if (result.ok) {
         log('info', `Task failed: ${taskId}`, { projectId, failureReason: result.failureReason, retried: result.retried });
         broadcast({ type: 'task_failed', projectId, taskId, ...result });
-        await sendFailureRecovery(projectId, [result]);
+        await awaitServerOperation(sendFailureRecovery(projectId, [result]));
       }
       return json(res, result);
     }
 
     const finalDeliverablesMatch = path.match(/^\/projects\/([^/]+)\/final-deliverables$/);
     if (finalDeliverablesMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
       const projectId = finalDeliverablesMatch[1];
@@ -3270,7 +3494,7 @@ async function handleRequest(req, res) {
 
     const finalDeliverableApproveMatch = path.match(/^\/projects\/([^/]+)\/final-deliverables\/([^/]+)\/approve$/);
     if (finalDeliverableApproveMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, 401);
       const [, projectId, deliverableId] = finalDeliverableApproveMatch;
@@ -3284,7 +3508,7 @@ async function handleRequest(req, res) {
     // ── PO delivers (submits deliverable, but does NOT close project) ──
     const deliverMatch = path.match(/^\/projects\/([^/]+)\/deliver$/);
     if (deliverMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const projectId = deliverMatch[1];
       const ws = getProjectWorkspace(projectId);
       const project = hub.getProject(projectId);
@@ -3305,6 +3529,8 @@ async function handleRequest(req, res) {
               deliveredAt: Date.now(),
             });
           } catch (err) {
+      propagateServerFailure(err);
+
             log('warn', `Delivery package build failed for project: ${projectId}`, { error: String(err?.message || err) });
             return { ok: false, error: 'delivery_package_build_failed' };
           }
@@ -3332,7 +3558,7 @@ async function handleRequest(req, res) {
     // ── Close project (Human only!) ──
     const closeMatch = path.match(/^\/projects\/([^/]+)\/close$/);
     if (closeMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const result = hub.handleCloseProject(closeMatch[1], body.summary || '');
       if (result.ok) {
         log('info', `Human closed project: ${closeMatch[1]}`);
@@ -3343,7 +3569,7 @@ async function handleRequest(req, res) {
 
     // ── Artifacts: upload (per-project) ──
     if (path === '/artifacts' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
 
@@ -3472,7 +3698,7 @@ async function handleRequest(req, res) {
         return json(res, { ok: false, error: 'unsupported_artifact_type' }, 415);
       }
 
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       if (typeof body.content !== 'string') {
         return json(res, { ok: false, error: 'content_required' }, 400);
       }
@@ -3562,7 +3788,7 @@ async function handleRequest(req, res) {
     // ── Set project workspace (Human action) ──
     const wsMatch = path.match(/^\/projects\/([^/]+)\/workspace$/);
     if (wsMatch && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       if (!body.path) return json(res, { error: 'path required' }, 400);
       const ws = setProjectWorkspace(wsMatch[1], body.path);
       log('info', `Project workspace set`, { projectId: wsMatch[1], path: ws.path });
@@ -3584,10 +3810,12 @@ async function handleRequest(req, res) {
     // ── Participants (from broker) ──
     if (path === '/participants' && req.method === 'GET') {
       try {
-        const resp = await fetch(`${BROKER_URL}/participants`);
-        const data = await resp.json();
+        const resp = await awaitServerOperation(fetch(`${BROKER_URL}/participants`, { signal: serverOperations.signal }));
+        const data = await awaitServerOperation(resp.json());
         return json(res, data);
       } catch (err) {
+      propagateServerFailure(err);
+
         return json(res, { error: 'broker_unreachable', participants: [] }, 502);
       }
     }
@@ -3600,12 +3828,12 @@ async function handleRequest(req, res) {
 
     // ── Spawn Worker (from Web UI) — legacy, kept for backward compat ──
     if (path === '/spawn-worker' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const { workerId, alias: workerAlias } = body;
       if (!workerId) return json(res, { error: 'workerId required' }, 400);
 
       try {
-        const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(workerId, workerAlias || 'Worker'), {
+        const spawned = spawnOwnedAutoWorker(autoWorkerSpawnConfig(workerId, workerAlias || 'Worker'), {
           onError: err => log('error', `Auto-worker process error for ${workerId}: ${err.message}`),
         });
         if (!spawned.ok) {
@@ -3615,6 +3843,8 @@ async function handleRequest(req, res) {
         log('info', `Spawned auto-worker: ${workerId}`, { alias: workerAlias, pid: spawned.pid });
         return json(res, { ok: true, workerId, pid: spawned.pid }, 201);
       } catch (err) {
+      propagateServerFailure(err);
+
         log('error', `Failed to spawn worker: ${err.message}`);
         return json(res, { error: err.message }, 500);
       }
@@ -3668,7 +3898,7 @@ async function handleRequest(req, res) {
     // ── List agents ──
     if (path === '/agents' && req.method === 'GET') {
       const includeArchived = url.searchParams.get('include_archived') === 'true';
-      await refreshBrokerOnlineAgentIds();
+      await awaitServerOperation(refreshBrokerOnlineAgentIds());
       const agents = listAgentProfilesForRouting({ includeArchived });
       // Redact secrets for listing
       return json(res, { agents: agents.map(a => agentStore.redact(a)) });
@@ -3676,7 +3906,7 @@ async function handleRequest(req, res) {
 
     // ── Create agent ──
     if (path === '/agents' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       const context = resolveDesktopMutationContext(req);
       if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
       if (hasForbiddenAgentPayload(body)) return json(res, { ok: false, error: 'agent_payload_forbidden' }, 400);
@@ -3685,6 +3915,8 @@ async function handleRequest(req, res) {
         try {
           agentInput = { ...body, ...resolveAgentRuntimeSelection(body, agentStore.detectCLIs()) };
         } catch (err) {
+      propagateServerFailure(err);
+
           return json(res, { ok: false, error: err.message }, 400);
         }
       }
@@ -3697,7 +3929,7 @@ async function handleRequest(req, res) {
 
     // ── Agent heartbeat ping ──
     if (path === '/agents/heartbeat' && req.method === 'POST') {
-      const body = await parseBody(req);
+      const body = await awaitServerOperation(parseBody(req));
       if (body.agentId) {
         heartbeatManager.ping(body.agentId);
       }
@@ -3731,7 +3963,7 @@ async function handleRequest(req, res) {
       }
 
       if (req.method === 'PUT') {
-        const body = await parseBody(req);
+        const body = await awaitServerOperation(parseBody(req));
         const context = resolveDesktopMutationContext(req);
         if (!context.ok) return json(res, { ok: false, error: context.error }, context.status || 401);
         if (hasForbiddenAgentPayload(body) || Object.hasOwn(body, 'runtimeType')) {
@@ -3793,7 +4025,7 @@ async function handleRequest(req, res) {
 
       try {
         const childEnv = buildAgentChildEnv(agent, agentId);
-        const spawned = spawnAutoWorkerProcess(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
+        const spawned = spawnOwnedAutoWorker(autoWorkerSpawnConfig(agentId, agent.name, agent.customArgs || [], childEnv), {
           onError: err => {
             agentStore.setOffline(agentId);
             log('error', `Auto-worker process error for ${agentId}: ${err.message}`);
@@ -3812,6 +4044,8 @@ async function handleRequest(req, res) {
         broadcast({ type: 'agent_started', agentId, runtimeId, pid: spawned.pid });
         return json(res, { ok: true, agentId, pid: spawned.pid, runtimeId }, 201);
       } catch (err) {
+      propagateServerFailure(err);
+
         log('error', `Failed to start agent: ${err.message}`);
         return json(res, { error: err.message }, 500);
       }
@@ -3829,7 +4063,9 @@ async function handleRequest(req, res) {
       if (agent.runtimeId) {
         const pidMatch = agent.runtimeId.match(/^pid-(\d+)$/);
         if (pidMatch) {
-          try { process.kill(parseInt(pidMatch[1], 10), 'SIGTERM'); } catch (_) {}
+          try { process.kill(parseInt(pidMatch[1], 10), 'SIGTERM'); } catch (_) {
+      propagateServerFailure(_);
+}
         }
       }
       agentStore.setOffline(agentId);
@@ -3846,7 +4082,7 @@ async function handleRequest(req, res) {
       const agentId = agentRestartMatch[1];
       const agent = agentStore.get(agentId);
       if (!agent) return json(res, { error: 'agent not found' }, 404);
-      const ok = await forceRestartAgent(agentId);
+      const ok = await awaitServerOperation(forceRestartAgent(agentId));
       if (ok) {
         const updated = agentStore.get(agentId);
         return json(res, { ok: true, agentId, runtimeId: updated.runtimeId });
@@ -3864,7 +4100,7 @@ async function handleRequest(req, res) {
       if (!agent) return json(res, { error: 'agent not found' }, 404);
 
       if (isDesktopRuntimeAgent(agent)) {
-        const readiness = await requestReadinessProbe({ agentId, role: agent.roles?.[0] || 'worker', forceProbe: true });
+        const readiness = await awaitServerOperation(requestReadinessProbe({ agentId, role: agent.roles?.[0] || 'worker', forceProbe: true }));
         return json(res, {
           agentId,
           runtimeType: agent.runtimeType,
@@ -3875,10 +4111,10 @@ async function handleRequest(req, res) {
         });
       }
 
-      const result = await probeAgentRuntime(agent, {
+      const result = await awaitServerOperation(probeAgentRuntime(agent, {
         enableGenerationProbe: supportsGenerationProbe(agent.runtimeType),
         generationProbe: probeAgentGeneration,
-      });
+      }));
       if (result.runtimeHealth) agentStore.updateRuntimeHealth(agentId, result.runtimeHealth);
       return json(res, result);
     }
@@ -3917,12 +4153,19 @@ async function handleRequest(req, res) {
     return json(res, { error: 'not_found', path }, 404);
 
   } catch (err) {
+    if (serverOperations.closed && !isPersistenceCommitError(err)) {
+      if (!isShutdownCancellation(err)) log('error', `API error during shutdown: ${err.message}`, { path, method: req.method });
+      return json(res, { error: 'server_shutting_down' }, 503);
+    }
+
     if (isPersistenceCommitError(err)) {
       // A durable commit failed. The mutation's in-memory/broker/event effects are
       // now uncertain: return 503 and fail-stop so Desktop restarts from the last
       // durable revision instead of serving unpersisted state.
       log('error', `Persistence commit failed: ${err.message}`, { path, method: req.method });
-      try { json(res, { error: 'persistence_commit_failed', uncertain: true }, 503); } catch { /* ignore */ }
+      try { json(res, { error: 'persistence_commit_failed', uncertain: true }, 503); } catch (caughtError) {
+      propagateServerFailure(caughtError);
+ /* ignore */ }
       return failStopOnPersistenceCommit();
     }
     log('error', `API error: ${err.message}`, { path, method: req.method });
@@ -3930,21 +4173,35 @@ async function handleRequest(req, res) {
   }
 }
 
-let persistenceFailStopScheduled = false;
 function failStopOnPersistenceCommit() {
   if (persistenceFailStopScheduled) return;
   persistenceFailStopScheduled = true;
-  log('error', `Fail-stop: exiting with code ${EXIT_SAVE_FAILED} after persistence commit failure`);
-  try { hub.closePersistence(); } catch { /* ignore */ }
+  process.exitCode = EXIT_SAVE_FAILED;
+  serverOperations.seal();
   const timer = setTimeout(() => process.exit(EXIT_SAVE_FAILED), 250);
-  if (typeof timer.unref === 'function') timer.unref();
+  // This original deadline remains ref'ed and cannot be extended by signal handling.
+  log('error', `Fail-stop: exiting with code ${EXIT_SAVE_FAILED} after persistence commit failure`);
+  void gracefulShutdown('persistence_failure');
 }
 
 // ─── Start ────────────────────────────────────────────────────────
-const server = http.createServer(handleRequest);
+const server = http.createServer((req, res) => {
+  if (serverOperations.closed) {
+    res.setHeader('Connection', 'close'); return json(res, { error: 'server_shutting_down' }, 503);
+  }
+  handleRequest(req, res).catch(error => {
+    observeProducerFailure(error);
+    if (!res.writableEnded && !res.destroyed) {
+      res.setHeader('Connection', 'close');
+      json(res, { error: serverOperations.closed ? 'server_shutting_down' : 'server_request_failed' }, 503);
+    }
+  });
+});
 const wss = new WebSocketServer({ server });
+const networkLifetime = createServerNetworkLifetime(server, wss);
 
 wss.on('connection', (ws) => {
+  if (serverOperations.closed) return;
   wsClients.add(ws);
   ws.send(JSON.stringify({
     type: 'init',
@@ -3956,7 +4213,8 @@ wss.on('connection', (ws) => {
   ws.on('close', () => wsClients.delete(ws));
 });
 
-server.listen(PORT, () => {
+networkLifetime.listen(PORT, () => {
+  if (serverOperations.closed) return;
   log('info', `KSwarm API server started on port ${PORT}`);
   loadReviewQueue();
   connectBroker();
@@ -3968,15 +4226,23 @@ server.listen(PORT, () => {
   scheduleStartupRecovery(STARTUP_RECOVERY_DELAY_MS);
 });
 
-async function flushRoomEventOutboxOnce() {
+function flushRoomEventOutboxOnce(...args) {
+  const work = serverOperations.run(() => flushRoomEventOutboxOnceImplementation(...args));
+  work.catch(observeProducerFailure);
+  return work;
+}
+
+async function flushRoomEventOutboxOnceImplementation() {
   if (roomEventOutboxFlushInFlight) return;
   roomEventOutboxFlushInFlight = true;
   try {
-    const result = await hub.flushRoomEventOutbox();
+    const result = await awaitServerOperation(hub.flushRoomEventOutbox());
     if (result?.ok && (result.published > 0 || result.suppressed > 0)) {
       log('info', 'Room event outbox flushed', result);
     }
   } catch (err) {
+      propagateServerFailure(err);
+
     log('warn', 'Room event outbox flush failed', { error: String(err?.message || err) });
   } finally {
     roomEventOutboxFlushInFlight = false;
@@ -3984,13 +4250,16 @@ async function flushRoomEventOutboxOnce() {
 }
 
 function startRoomEventOutboxPublisher() {
+  if (serverOperations.closed) return;
   if (roomEventOutboxTimer) return;
-  void flushRoomEventOutboxOnce();
-  roomEventOutboxTimer = setInterval(flushRoomEventOutboxOnce, ROOM_EVENT_OUTBOX_FLUSH_INTERVAL_MS);
+  const flush = () => { void flushRoomEventOutboxOnce().catch(observeProducerFailure); };
+  flush();
+  roomEventOutboxTimer = setInterval(flush, ROOM_EVENT_OUTBOX_FLUSH_INTERVAL_MS);
   if (typeof roomEventOutboxTimer.unref === 'function') roomEventOutboxTimer.unref();
 }
 
 function startWatchdog() {
+  if (serverOperations.closed) return;
   if (watchdogStarted) return;
   watchdogStarted = true;
   watchdog = createWatchdog({
@@ -4006,11 +4275,12 @@ function startWatchdog() {
   });
   watchdog.start();
   if (!stalledRunWatchdogTimer) {
-    stalledRunWatchdogTimer = setInterval(runStalledRunWatchdog, 60_000);
+    stalledRunWatchdogTimer = setInterval(() => runServerNotification(runStalledRunWatchdog), 60_000);
   }
 }
 
 function runStalledRunWatchdog() {
+  if (serverOperations.closed) return;
   for (const project of hub.listProjects()) {
     if (project.status === 'closed' || project.status === 'delivered') continue;
     const board = hub.getBoard(project.id);
@@ -4046,6 +4316,7 @@ function runStalledRunWatchdog() {
         log(result.ok ? 'warn' : 'error', `Marked run stalled: ${action.taskId}`, { ...action, result });
         broadcast({ type: 'run_stalled', ...action, result });
         sendFailureRecovery(action.projectId, [result]).catch(err => {
+        if (consumeBackgroundFailure(err)) return;
           log('warn', 'Failed to deliver stalled-run recovery task', {
             projectId: action.projectId,
             taskId: action.taskId,
@@ -4063,7 +4334,7 @@ function runStalledRunWatchdog() {
               ...action,
               ...(route.targetAgentId ? { targetAgentId: route.targetAgentId } : {}),
             },
-          }).catch(err => log('warn', `Failed to request cancel_run from ${action.agentId}`, { ...action, error: err.message }));
+          }).catch(err => { if (!consumeBackgroundFailure(err)) log('warn', `Failed to request cancel_run from ${action.agentId}`, { ...action, error: err.message }); });
         }
       }
     }
@@ -4107,30 +4378,76 @@ function recordAgentRuntimeFailure(agentId, failureClass, errorMessage) {
   }));
 }
 
-let shuttingDown = false;
 function gracefulShutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  if (roomEventOutboxTimer) {
-    clearInterval(roomEventOutboxTimer);
-    roomEventOutboxTimer = null;
+  if (shutdownPromise) return shutdownPromise;
+  serverOperations.seal();
+  let resolve;
+  shutdownPromise = new Promise(yes => { resolve = yes; });
+  const failures = [];
+  function shutdownLog(...args) {
+    try { log(...args); } catch (error) { failures.push({ name: 'diagnostic', error }); }
   }
-  log('info', `Received ${signal}; marking active runs suspended for clean restart`);
-  try {
-    const result = hub.handleSuspendActiveRuns();
-    log('info', 'Graceful shutdown suspend complete', { suspended: result.suspended });
-  } catch (err) {
-    log('warn', 'Graceful shutdown suspend failed', { error: String(err?.message || err) });
+  const exitCode = () => persistenceFailStopScheduled ? EXIT_SAVE_FAILED : failures.length ? EXIT_SHUTDOWN_UNCONFIRMED : 0;
+  const forceExit = setTimeout(() => {
+    shutdownLog('error', 'Server shutdown unconfirmed: actual resource close did not settle');
+    process.exit(persistenceFailStopScheduled ? EXIT_SAVE_FAILED : EXIT_SHUTDOWN_UNCONFIRMED);
+  }, 3_000);
+  function invoke(name, body) {
+    try { return Promise.resolve(body()).catch(error => { failed(name, error); }); }
+    catch (error) { failed(name, error); return Promise.resolve(); }
   }
-  try { hub.persistState(); } catch (err) {
-    log('warn', 'Graceful shutdown persist failed', { error: String(err?.message || err) });
+  function failed(name, error) {
+    failures.push({ name, error });
+    observeProducerFailure(error);
+    shutdownLog('error', 'Server shutdown step failed', { name, error: String(error?.message || error) });
   }
-  try { hub.closePersistence(); } catch (err) {
-    log('warn', 'Graceful shutdown persistence close failed', { error: String(err?.message || err) });
+  // Resolve original waiters before abort callbacks can rewrite their caches.
+  for (const waiter of [...readinessProbeWaiters.values()]) {
+    try { waiter.resolve({ ok: false, reason: 'server_shutting_down' }); } catch (error) { failed('readiness', error); }
   }
-  try { server.close(() => process.exit(0)); } catch { /* ignore */ }
-  const forceExit = setTimeout(() => process.exit(0), 3_000);
-  if (typeof forceExit.unref === 'function') forceExit.unref();
+  const stops = [
+    invoke('heartbeat', () => heartbeatManager.stop()),
+    invoke('watchdog', () => watchdog?.stop()),
+    invoke('stalled_timer', () => { clearInterval(stalledRunWatchdogTimer); stalledRunWatchdogTimer = null; }),
+    invoke('outbox_timer', () => { clearInterval(roomEventOutboxTimer); roomEventOutboxTimer = null; }),
+    invoke('recovery_timer', () => { clearTimeout(pendingRecoveryTimer); pendingRecoveryTimer = null; }),
+    invoke('resume_timer', () => { clearTimeout(suspendAutoResumeTimer); suspendAutoResumeTimer = null; }),
+    invoke('broker_retry_timer', () => { clearTimeout(brokerRetryTimer); brokerRetryTimer = null; }),
+    invoke('abort', () => serverOperations.abort()),
+  ];
+  const drains = [
+    ...stops,
+    invoke('operations', () => serverOperations.drain()),
+    ...[...brokerClients].map((client, index) => invoke(`broker-${index}`, () => client.close())),
+    invoke('network', () => networkLifetime.close()),
+    invoke('workers', () => workerLifetime.close()),
+  ];
+  shutdownLog('info', `Received ${signal}; draining server resources before persistence close`);
+  void (async () => {
+    await Promise.all(drains);
+    if (failures.length) {
+      // Settled rejection is not confirmation that a producer stopped.
+      // Keep its stores open until process exit; never manufacture a clean tail.
+      clearTimeout(forceExit);
+      const code = exitCode();
+      shutdownLog('error', 'Server shutdown unconfirmed: resource stop or drain failed', { code });
+      resolve({ code, failures });
+      process.exit(code);
+      return;
+    }
+    if (!persistenceFailStopScheduled) await invoke('suspend', () => hub.handleSuspendActiveRuns());
+    if (!persistenceFailStopScheduled) await invoke('persist', () => hub.persistState());
+    await invoke('persistence_close', () => hub.closePersistence());
+    await invoke('event_log_close', () => hub.getEventLog().close());
+    clearTimeout(forceExit);
+    const code = exitCode();
+    shutdownLog(code === 0 ? 'info' : 'error', 'Server shutdown resources settled', { code });
+    resolve({ code, failures });
+    process.exit(code);
+  })().catch(error => {
+    failed('shutdown', error); clearTimeout(forceExit); resolve({ code: exitCode(), failures }); process.exit(exitCode());
+  });
+  return shutdownPromise;
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
