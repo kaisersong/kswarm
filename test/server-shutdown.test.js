@@ -17,7 +17,7 @@ async function start(t, { monitor = false, brokerUrl, preload = null, env = {}, 
   const port = free.address().port; await new Promise(resolve => free.close(resolve));
   initialize?.(root);
   const accountPath=join(root,'account.mjs');
-  writeFileSync(accountPath,`import os from 'node:os';import{mkdirSync}from'node:fs';import{syncBuiltinESMExports}from'node:module';const root=${JSON.stringify(root)},original=os.userInfo;mkdirSync(root+'/config',{mode:0o700});os.homedir=()=>root;os.userInfo=options=>{const info=original(options);return {...info,homedir:Buffer.isBuffer(info.homedir)?Buffer.from(root):root};};syncBuiltinESMExports();`);
+  writeFileSync(accountPath,`import os from 'node:os';import{mkdirSync}from'node:fs';import{join}from'node:path';import{syncBuiltinESMExports}from'node:module';const root=${JSON.stringify(root)},original=os.userInfo;mkdirSync(join(root,'config'),{mode:0o700});os.homedir=()=>root;os.userInfo=options=>{const info=original(options);return {...info,homedir:Buffer.isBuffer(info.homedir)?Buffer.from(root):root};};syncBuiltinESMExports();`);
   const args = ['--import',accountPath];
   if (monitor) {
     const path = join(root, 'monitor.mjs');
