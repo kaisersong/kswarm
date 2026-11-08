@@ -273,6 +273,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         boards.set(projectId, restoreTaskBoard(tasks, projectId));
       }
       for (const run of (saved.workflowRuns || [])) {
+        // Restoration is read-only; the startup recovery mutation reconciles legacy owners.
         if (run?.id) workflowRuns.set(run.id, run);
       }
       for (const proposal of (saved.workflowProposals || [])) {
@@ -3871,7 +3872,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       const result = startProjectDiagnoseWorkflow(proposal.projectId, { requestedBy: approvedBy, now });
       if (!result.ok) return result;
       const workflowRun = applyProposalMetadataToRun(result.workflowRun, approvedProposal, { now });
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: [] };
     }
 
@@ -3892,7 +3893,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         workflowRunId: workflowRun.id,
@@ -3920,7 +3921,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         workflowRunId: workflowRun.id,
@@ -3950,7 +3951,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         taskId: sourceTask.task.id,
@@ -4034,7 +4035,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       now,
     });
     workflowRun = runtimeDispatch.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.started', {
       projectId: proposal.projectId,
       workflowRunId: workflowRun.id,
@@ -4119,7 +4120,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       },
     };
     const refreshed = refreshWorkflowRunState(nextRun);
-    workflowRuns.set(refreshed.id, refreshed);
+    storeWorkflowRun(refreshed);
     eventLog.emit('workflow.script.parallel_group.created', {
       projectId: refreshed.projectId,
       workflowRunId,
@@ -4255,7 +4256,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         input: node.input,
         now,
       });
-      workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+      storeWorkflowRun(dispatched.workflowRun);
       eventLog.emit('workflow.script.node.created', {
         projectId: dispatched.workflowRun.projectId,
         workflowRunId,
@@ -4269,7 +4270,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
     }
     // Node is pending (has unmet dependsOn) — persist but don't dispatch yet
-    workflowRuns.set(withNode.id, withNode);
+    storeWorkflowRun(withNode);
     eventLog.emit('workflow.script.node.created', {
       projectId: withNode.projectId,
       workflowRunId,
@@ -4317,7 +4318,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       input: node.input,
       now,
     });
-    workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+    storeWorkflowRun(dispatched.workflowRun);
     eventLog.emit('workflow.script.node.retry_dispatched', {
       projectId: dispatched.workflowRun.projectId,
       workflowRunId,
@@ -4389,7 +4390,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
           ],
         },
       };
-      workflowRuns.set(withResult.id, withResult);
+      storeWorkflowRun(withResult);
       eventLog.emit('workflow.run.blocked', {
         projectId: withResult.projectId,
         workflowRunId,
@@ -4415,7 +4416,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     });
     const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
     withResult = projectFinalization.workflowRun;
-    workflowRuns.set(withResult.id, withResult);
+    storeWorkflowRun(withResult);
     eventLog.emit('workflow.run.completed', {
       projectId: withResult.projectId,
       workflowRunId,
@@ -4445,7 +4446,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       requestedBy,
       now,
     });
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.completed', {
       projectId,
       workflowRunId: workflowRun.id,
@@ -4477,7 +4478,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       now,
     });
     workflowRun = dispatched.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.started', {
       projectId,
       workflowRunId: workflowRun.id,
@@ -4518,7 +4519,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       dispatches = dispatched.dispatches;
     }
 
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.node.output_received', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4552,7 +4553,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         },
       };
       blocked.summary = { ...blocked.summary, primaryMessage: 'Review gate blocked' };
-      workflowRuns.set(blocked.id, blocked);
+      storeWorkflowRun(blocked);
       eventLog.emit('workflow.node.reviewed', {
         projectId: blocked.projectId,
         workflowRunId,
@@ -4591,7 +4592,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     workflowRun = taskFinalization.workflowRun;
     const projectFinalization = maybeDeliverProjectWorkflowDeliverable(workflowRun, { now });
     workflowRun = projectFinalization.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.gate_completed', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4610,7 +4611,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       nodeId,
       reason,
     }, { now });
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.node.blocked', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4623,7 +4624,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
     const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
-    workflowRuns.set(cancelled.id, cancelled);
+    storeWorkflowRun(cancelled);
     const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
     eventLog.emit('workflow.run.cancelled', {
       projectId: cancelled.projectId,
@@ -4701,10 +4702,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         continue;
       }
       if (workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) continue;
+      if (['blocked', 'failed'].includes(workflowRun.status)) {
+        synchronizeBlockedTaskWorkflowSource(workflowRun);
+        continue;
+      }
       if (workflowRun.status !== 'running') continue;
       const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
       const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
-      workflowRuns.set(cancelled.id, cancelled);
+      storeWorkflowRun(cancelled);
       if (taskReset?.ok) {
         recovered.push({
           projectId: cancelled.projectId,
@@ -4728,6 +4733,26 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       }
     }
     return { ok: true, recovered, skipped, resumableScriptRuns };
+  }
+
+  function storeWorkflowRun(workflowRun) {
+    workflowRuns.set(workflowRun.id, workflowRun);
+    synchronizeBlockedTaskWorkflowSource(workflowRun);
+  }
+
+  function synchronizeBlockedTaskWorkflowSource(workflowRun) {
+    if (workflowRun?.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID || workflowRun.source !== 'po_generated'
+      || !['blocked', 'failed'].includes(workflowRun.status)
+      || workflowRun.scope?.projectId !== workflowRun.projectId) return;
+    const board = boards.get(workflowRun.projectId), task = board?.getTask(workflowRun.scope?.taskId);
+    if (!task || task.id !== workflowRun.scope.taskId || task.projectId !== workflowRun.projectId
+      || !['dispatched', 'accepted', 'in_progress'].includes(task.status)
+      || task.activeRunId !== 'workflow-' + workflowRun.id) return;
+    const reason = readWorkflowString(workflowRun.nodes?.find(node => node.status === 'blocked' || node.status === 'failed')?.error)
+      || readWorkflowString(workflowRun.gateDecision?.reason) || 'workflow_blocked';
+    const blocked = board.blockTask(task.id, { blockKind: 'workflow_blocked', blockedReason: reason, failureClass: 'workflow_runtime_error' });
+    if (!blocked.ok) throw new Error('workflow_source_block_failed:' + blocked.error);
+    // Existing workflow activity and the same durable project snapshot carry this change.
   }
 
   function maybeReleaseCancelledTaskWorkflow(workflowRun, { reason = 'workflow_cancelled' } = {}) {
@@ -4772,7 +4797,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       progressState: applied.snapshot.progressState,
       updatedAt: now,
     };
-    workflowRuns.set(updated.id, updated);
+    storeWorkflowRun(updated);
     eventLog.emit('workflow.progress.batch', {
       projectId: updated.projectId,
       workflowRunId: updated.id,
@@ -4890,6 +4915,28 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
   }
 
+  function workflowDependencyOutputs(workflowRun) {
+    const taskScope = workflowRun.workflowId === PO_GENERATED_TASK_WORKFLOW_ID;
+    if (!taskScope && workflowRun.workflowId !== PO_GENERATED_PROJECT_WORKFLOW_ID) return null;
+    const board = boards.get(workflowRun.projectId);
+    const source = taskScope ? board?.getTask(workflowRun.scope?.taskId) : null;
+    if (!board || taskScope && !source) return null;
+    const dependencies = taskScope ? new Set(source.dependencies || []) : null;
+    const outputs = {};
+    for (const task of board.getAllTasks()) {
+      if (task.status !== 'done' || dependencies && !dependencies.has(task.id)) continue;
+      const compact = compactNodeOutput({ id: task.id, title: task.title, output: task.result });
+      const artifactPaths = compact?.artifactPaths?.filter(path => typeof path === 'string' && path.length > 0);
+      if (!artifactPaths?.length) continue;
+      const workFolder = readWorkflowString(task.result?.workFolder) || readWorkflowString(task.result?.workspacePath);
+      outputs[task.id] = { taskId: task.id, title: task.title, artifactPaths,
+        ...(compact.summary ? { summary: compact.summary.slice(0, INLINE_MAX_CHARS) } : {}),
+        ...(workFolder ? { workFolder } : {}),
+      };
+    }
+    return outputs;
+  }
+
   function enrichWorkflowNodeInput(workflowRun, input = null, { nodeId = null } = {}) {
     const base = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : { value: input };
 
@@ -4934,6 +4981,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       upstreamOutputs = null;
     }
 
+    const dependencyOutputs = workflowDependencyOutputs(workflowRun);
     return {
       ...base,
       workflowRunId: workflowRun.id,
@@ -4944,6 +4992,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         taskId: workflowRun.scope?.taskId || null,
       },
       sourceTask: base.sourceTask || workflowRun.sourceTask || null,
+      ...(dependencyOutputs ? { dependencyOutputs } : {}),
       ...(upstreamOutputs ? { upstreamOutputs } : {}),
     };
   }
@@ -5519,7 +5568,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       if (projectId && workflowRun.projectId !== projectId) continue;
       const result = maybeDeliverScriptWorkflowProjectResult(workflowRun, { now });
       if (result.workflowRun !== workflowRun) {
-        workflowRuns.set(result.workflowRun.id, result.workflowRun);
+        storeWorkflowRun(result.workflowRun);
       }
       if (result.delivery?.ok) {
         delivered.push({ projectId: workflowRun.projectId, workflowRunId: workflowRun.id });

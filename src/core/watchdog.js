@@ -5,6 +5,8 @@
  * Automatically retries or marks tasks as permanently failed.
  */
 
+import { isWorkflowOwnedTask } from './run-watchdog.js';
+
 /**
  * @param {Object} opts
  * @param {Function} opts.listProjects - Returns array of { id, status }
@@ -40,6 +42,7 @@ export function createWatchdog(opts) {
       const tasks = board.getAllTasks();
       for (const task of tasks) {
         if (!['dispatched', 'accepted', 'in_progress'].includes(task.status)) continue;
+        if (isWorkflowOwnedTask(task)) continue;
 
         const elapsed = now - (task.updatedAt || task.createdAt || now);
         if (elapsed < timeoutMs) continue;

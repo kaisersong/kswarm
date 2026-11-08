@@ -74,7 +74,7 @@ function latestTimestamp(...values) {
   return timestamps.length > 0 ? Math.max(...timestamps) : null;
 }
 
-function isWorkflowOwnedTask(task) {
+export function isWorkflowOwnedTask(task) {
   if (!task || typeof task !== 'object') return false;
   if (task.assignedExecutor === 'workflow') return true;
   if (task.execution?.strategy === 'workflow') return true;
