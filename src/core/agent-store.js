@@ -345,6 +345,10 @@ export function createAgentStore(options = {}) {
     if (!agent) return { error: 'agent not found', code: 404 };
     if (agent.archivedAt) return { error: 'agent is archived', code: 410 };
 
+    if (Object.hasOwn(patch, 'expectedKteamProfileRevision') && patch.expectedKteamProfileRevision !== (agent.kteamProfile?.revision ?? 0)) {
+      return { error: 'bot_profile_changed', code: 409 };
+    }
+
     // Name uniqueness check if name is being changed
     if (patch.name && patch.name !== agent.name) {
       const conflict = Array.from(agents.values()).find(
@@ -356,7 +360,7 @@ export function createAgentStore(options = {}) {
     // Merge patch (shallow for top-level, deep for objects)
     const updated = { ...agent };
     for (const [key, val] of Object.entries(patch)) {
-      if (key === 'id' || key === 'createdAt') continue; // immutable
+      if (key === 'id' || key === 'createdAt' || key === 'expectedKteamProfileRevision') continue; // immutable
       if (key === 'customEnv' && typeof val === 'object') {
         updated.customEnv = { ...agent.customEnv, ...val };
       } else {
