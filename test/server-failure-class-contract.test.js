@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const source = readFileSync(join(process.cwd(), 'src/server/index.js'), 'utf-8');
+const deliveryOwnerSource=readFileSync(join(process.cwd(),'src/server/task-delivery-owner.js'),'utf-8');
 
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
@@ -26,35 +27,49 @@ test('server runtime failure list excludes task and output contract failures', (
 });
 
 test('every server task-failure entry point schedules retry and replacement deliveries', () => {
-  assert.match(source, /import \{ failureRecoveryTaskIds \} from ['"]\.\.\/core\/failure-recovery-dispatch\.js['"]/);
+  assert.match(source, /import \{ deliverDispatchResult, deliverFailureRecoveryResults, deliverWorkflowTaskReview \} from ['"]\.\/task-dispatch-delivery\.js['"]/);
+  assert.match(source, /deliverDispatchResult\(\{projectId, dispatch, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
+  assert.match(source, /deliverFailureRecoveryResults\(\{projectId, results, sendTasks:sendBrokerRequestTasks, sendWorkflowNodes:sendWorkflowNodeHandoffs\}\)/);
 
   const brokerFailure = source.slice(
     source.indexOf("case 'task_failed':"),
     source.indexOf("case 'submit_result':"),
   );
-  assert.match(brokerFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(brokerFailure, /sendBrokerRequestTasks\(resolved\.projectId, recoveryTaskIds\)/);
+  assert.match(brokerFailure, /sendFailureRecovery\(resolved\.projectId, \[result\]\)/);
 
   const restFailure = source.slice(
     source.indexOf('const failMatch = path.match'),
     source.indexOf('const finalDeliverablesMatch'),
   );
-  assert.match(restFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(restFailure, /sendBrokerRequestTasks\(projectId, recoveryTaskIds\)/);
+  assert.match(restFailure, /sendFailureRecovery\(projectId, \[result\]\)/);
 
   const watchdogFailure = source.slice(
     source.indexOf("if (action.type === 'mark_runtime_stalled')"),
     source.indexOf("if (action.type === 'request_cancel_run')"),
   );
-  assert.match(watchdogFailure, /failureRecoveryTaskIds\(result\)/);
-  assert.match(watchdogFailure, /sendBrokerRequestTasks\(action\.projectId, recoveryTaskIds\)/);
+  assert.match(watchdogFailure, /sendFailureRecovery\(action\.projectId, \[result\]\)/);
 
   const deliveryFailureHandler = source.slice(
-    source.indexOf('async function sendBrokerRequestTasks'),
+    source.indexOf('async function sendBrokerRequestTasksImplementation'),
     source.indexOf('async function sendWorkflowNodeHandoffs'),
   );
-  assert.equal((deliveryFailureHandler.match(/failureRecoveryTaskIds\(failed\)/g) || []).length, 3);
-  assert.doesNotMatch(deliveryFailureHandler, /failed\?\.retryDispatched/);
+  assert.match(source,/createServerTaskDeliveryOwner/);
+  assert.match(deliveryFailureHandler,/taskDeliveryOwner\.send\(projectId,taskIds,schedulerContext\)/);
+  assert.equal((deliveryOwnerSource.match(/failureRecoveryTaskIds\(failed\)/g) || []).length, 3);
+  assert.doesNotMatch(deliveryOwnerSource, /failed\?\.retryDispatched/);
+});
+
+test('startup, continue, reassign and backoff dispatch both adaptive result channels',()=>{
+  const startup=source.slice(source.indexOf('if (needsDispatch)'),source.indexOf('function handleBrokerIntent'));
+  assert.match(startup,/workflowNodeDispatches\?\.length/);
+  assert.match(startup,/sendDispatchResult\(project\.id, dispatchResult\)/);
+  const continueRoute=source.slice(source.indexOf('const continueMatch ='),source.indexOf('const resolveInterventionMatch'));
+  assert.match(continueRoute,/sendDispatchResult\(projectId, result\)/);
+  const reassign=source.slice(source.indexOf('const reassignMatch ='),source.indexOf('const humanTasksMatch ='));
+  assert.match(reassign,/sendDispatchResult\(projectId, result\.dispatch\)/);
+  const backoff=source.slice(source.indexOf('const dueRetry ='),source.indexOf('const AGENT_RUNTIME_FAILURE_CLASSES'));
+  assert.match(backoff,/workflowNodeDispatches\?\.length/);
+  assert.match(backoff,/sendDispatchResult\(project\.id, sweep\)/);
 });
 
 test('agent list refreshes broker presence and shares the routing profile overlay', () => {
@@ -63,9 +78,15 @@ test('agent list refreshes broker presence and shares the routing profile overla
     source.indexOf('// ── Create agent ──'),
   );
 
-  assert.match(listRoute, /await refreshBrokerOnlineAgentIds\(\)/);
+  assert.match(listRoute, /await awaitServerOperation\(refreshBrokerOnlineAgentIds\(\)\)/);
   assert.match(listRoute, /listAgentProfilesForRouting\(\{ includeArchived \}\)/);
   assert.doesNotMatch(listRoute, /agentStore\.list\(/);
+});
+
+test('workflow completion schedules the existing durable PO review delivery',()=>{
+  const brokerCase=source.slice(source.indexOf("case 'workflow_node_result':"),source.indexOf("case 'workflow_node_failed':"));
+  assert.match(brokerCase,/sendWorkflowResultReview\(result\)/);
+  assert.match(source,/sendReview:deliverReviewSubmission/);
 });
 
 let passed = 0;

@@ -1,0 +1,48 @@
+name: Original Hub producer registration
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  original-hub:
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.22.0', '24']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Actual original Hub cases must run and pass without skip
+        shell: bash
+        run: |
+          node --input-type=module <<'JS'
+          import {spawnSync} from 'node:child_process';
+          import {writeFileSync} from 'node:fs';
+          import {HUB_PRODUCER_REGISTRATION as registry} from './src/core/hub-producer-registration.js';
+          const run=spawnSync(process.execPath,['--test','--test-reporter=tap','test/hub-producer-registration.test.js'],{encoding:'utf8',timeout:60000});
+          writeFileSync('hub-producer-registration.tap',run.stdout??'');process.stdout.write(run.stdout??'');if(run.stderr)process.stderr.write(run.stderr);
+          if(run.error||run.status!==0||run.signal)throw Error('Original Hub producer tests failed');
+          const passed=new Set();for(const line of run.stdout.split('\n')){const match=/^ok\s+\d+\s+-\s+(.+)$/.exec(line.trim());if(match&&!/\s#\s*(SKIP|TODO)\b/i.test(match[1]))passed.add(match[1]);}
+          if(!registry.requiredRuntimeCases.length)throw Error('No original required cases registered');
+          for(const title of registry.requiredRuntimeCases)if(!passed.has(title))throw Error('Original case did not pass: '+title);
+          JS
+      - name: Preserve the complete original protected protocol suite
+        shell: bash
+        run: npm run test:protected-protocol | tee protected-protocol.tap
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hub-producer-registration-node-${{ matrix.node }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            hub-producer-registration.tap
+            protected-protocol.tap
+          if-no-files-found: error

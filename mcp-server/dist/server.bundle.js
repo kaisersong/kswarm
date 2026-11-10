@@ -1,3 +1,4 @@
+import {createRequire} from 'node:module'; const require = createRequire(import.meta.url);
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -25461,6 +25462,35 @@ async function handleCreateParallelGroup(httpClient2, args) {
 }
 
 // dist/tools/create-node.js
+var deniedCommandId = external_exports.enum(["git-diff", "git-stash"]);
+var deniedCommandLabel = external_exports.enum(["git diff", "git stash"]);
+var deniedCommandLabels = {
+  "git-diff": "git diff",
+  "git-stash": "git stash"
+};
+var boundedTrimmedString = external_exports.string().refine((value) => value === value.trim() && value.length >= 1 && value.length <= 64, "must be trimmed and contain 1..64 characters");
+var permissionsSchema = external_exports.object({
+  deniedCommandIds: external_exports.array(deniedCommandId).min(1).max(16).optional(),
+  deniedCommands: external_exports.array(deniedCommandLabel).min(1).max(16).optional(),
+  toolCategories: external_exports.array(boundedTrimmedString).min(1).max(32).optional()
+}).strict().superRefine((permissions, ctx) => {
+  if (permissions.deniedCommandIds === void 0 && permissions.deniedCommands === void 0 && permissions.toolCategories === void 0) {
+    ctx.addIssue({
+      code: external_exports.ZodIssueCode.custom,
+      message: "permissions must declare at least one restriction"
+    });
+  }
+  if (permissions.deniedCommands === void 0)
+    return;
+  const expected = permissions.deniedCommandIds?.map((id) => deniedCommandLabels[id]);
+  if (!expected || expected.length !== permissions.deniedCommands.length || expected.some((label, index) => label !== permissions.deniedCommands?.[index])) {
+    ctx.addIssue({
+      code: external_exports.ZodIssueCode.custom,
+      path: ["deniedCommands"],
+      message: "deniedCommands must match deniedCommandIds in order"
+    });
+  }
+});
 var createNodeSchema = {
   projectId: external_exports.string().describe("KSwarm project ID"),
   workflowRunId: external_exports.string().describe("Workflow run ID"),
@@ -25471,7 +25501,8 @@ var createNodeSchema = {
   parallelGroupId: external_exports.string().optional().describe("Parallel group to add this node to"),
   fanoutItemKey: external_exports.string().optional().describe("Fanout item key for multi-item iteration"),
   required: external_exports.boolean().default(true).describe("Whether this node is required for completion"),
-  options: external_exports.record(external_exports.unknown()).optional().describe("Additional options for the agent")
+  options: external_exports.record(external_exports.unknown()).optional().describe("Additional options for the agent"),
+  permissions: permissionsSchema.optional().describe("Advisory node restrictions using canonical command IDs")
 };
 var schema6 = external_exports.object(createNodeSchema);
 async function handleCreateNode(httpClient2, args) {

@@ -225,8 +225,8 @@ test('hub: recordHumanAction assigns stable UUIDs; same-ms actions do not collid
     const dataDir = sqliteDataDir(dir);
     const hub = createHub({ silent: true, dataDir });
     hub.createProject({ id: 'p1', name: 'A', goal: 'g', poAgent: 'po-1', members: [] });
-    hub.handleHumanAddTasks('p1', [{ title: 'task one', assignee: 'po-1' }]);
-    hub.handleCloseProject('p1', 'done');
+    hub.handleHumanAddTasks('p1', [{ title: 'task one', assignee: 'po-1' }], {requestSource: 'user'});
+    hub.handleCloseProject('p1', 'done', {requestSource:'user'});
     const actions = hub.getHumanActions('p1');
     assert.ok(actions.length >= 3, `expected >=3 human actions, got ${actions.map(a => a.action).join(',')}`);
     const ids = actions.map(a => a.id);

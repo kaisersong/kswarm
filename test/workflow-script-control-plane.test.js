@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 /**
  * Dynamic workflow script control-plane tests.
  *
@@ -28,7 +29,7 @@ function createActiveProject(hub, id = 'proj-script') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '整理项目现状', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(id).ok, true);
   return project;
@@ -212,6 +213,17 @@ test('script-generated project workflow delivers project state from artifact evi
     assert.equal(approved.ok, true);
     assert.equal(hub.getProject('proj-script-delivery').status, 'delivered');
     assert.equal(hub.getProject('proj-script-delivery').deliverable.provenance.finalDeliverableId, candidate.deliverableId);
+    const approvedProject = hub.getProject('proj-script-delivery');
+    assert.equal(approvedProject.closedAt, null);
+    assert.equal(approvedProject.closedBy, null);
+    assert.equal(finished.workflowRun.scriptResult.summary, '动态 workflow 已生成验证报告。');
+    assert.equal(finished.workflowRun.nodes.find(node => node.id === 'script-runtime').output.summary, '动态 workflow 已生成验证报告。');
+    assert.equal(tasks[0].result.provenance.workflowRunId, started.workflowRun.id);
+    assert.equal(approvedProject.deliverable.summary, 'Final deliverable approved: markdown');
+    assert.equal(approvedProject.deliverable.artifacts[0].path, realpathSync(artifactPath));
+    assert.equal(approvedProject.deliverable.provenance.runtimeSource, candidate.source);
+    assert.equal(approvedProject.deliverable.provenance.workflowRunId, started.workflowRun.id);
+    assert.equal(hub.getEventLog().getEvents().some(event => event.type === 'project.closed'), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -306,7 +318,7 @@ test('script-generated project workflow blocks delivery when final task requires
         assignedAgent: 'xiaok-worker',
         requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
       },
-    ]);
+    ], {requestSource: 'user'});
     assert.equal(added.ok, true);
     assert.equal(hub.handleApprove(projectId).ok, true);
 
@@ -384,7 +396,7 @@ test('blocked script-generated project workflow can redeliver after runtime supp
         assignedAgent: 'xiaok-worker',
         requiredOutputs: [{ type: 'report_html', enforcement: 'hard' }],
       },
-    ]);
+    ], {requestSource: 'user'});
     assert.equal(added.ok, true);
     assert.equal(hub.handleApprove(projectId).ok, true);
 

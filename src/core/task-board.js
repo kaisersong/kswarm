@@ -16,6 +16,29 @@
  * - 状态流转是否合法
  */
 
+import {captureObservationRow,captureObservationRows} from './observation-data.js';
+import {captureExecutionData} from './task-execution-content.js';
+const boardApply=Reflect.apply,boardWeakGet=WeakMap.prototype.get,boardWeakSet=WeakMap.prototype.set;
+const boardMapGet=Map.prototype.get,boardMapHas=Map.prototype.has,boardMapValues=Map.prototype.values,boardMapNext=Object.getPrototypeOf(new Map().values()).next;
+const boardDefine=Object.defineProperty,boardIsArray=Array.isArray,boardFinite=Number.isFinite,boardNow=Date.now,boardOwn=Object.hasOwn,boardDescriptors=Object.getOwnPropertyDescriptors,boardKeys=Reflect.ownKeys,boardDescriptor=Object.getOwnPropertyDescriptor;
+const boardAppend=(array,value)=>boardDefine(array,array.length,{__proto__:null,value,writable:true,configurable:true,enumerable:true});
+const boardValue=(value,key)=>{if(!value||typeof value!=='object')return undefined;const row=boardDescriptor(value,key);return row&&boardOwn(row,'value')?row.value:undefined;};
+function originalTaskValues(tasks){const out=[],iterator=boardApply(boardMapValues,tasks,[]);for(let next=boardApply(boardMapNext,iterator,[]);!next.done;next=boardApply(boardMapNext,iterator,[]))boardAppend(out,next.value);return out;}
+
+const originalBoardReaders=new WeakMap();
+/** Detached data from the original private task Map, never a public method lookup. */
+export function readTaskBoardSnapshot(board){const read=boardApply(boardWeakGet,originalBoardReaders,[board]);if(!read)throw Error('TASK_BOARD_SOURCE_UNAVAILABLE');return read.snapshot();}
+
+/** Fixed original state-machine call for the Hub's authenticated timeout owner.
+ * This low-level function exposes no raw task and is not a model tool. */
+export function transitionOriginalTaskBoard(board,taskId,status){const owner=boardApply(boardWeakGet,originalBoardReaders,[board]);if(!owner)throw Error('TASK_BOARD_SOURCE_UNAVAILABLE');const result=owner.transition(taskId,status);return result.ok?{ok:true,from:result.from,to:result.to}:{ok:false,error:result.error};}
+export function captureOriginalTaskBoardTask(board,taskId){const owner=boardApply(boardWeakGet,originalBoardReaders,[board]);if(!owner)throw Error('TASK_BOARD_SOURCE_UNAVAILABLE');return owner.captureTask(taskId);}
+export function resumeOriginalTaskBoard(board,taskId,options){const owner=boardApply(boardWeakGet,originalBoardReaders,[board]);if(!owner)throw Error('TASK_BOARD_SOURCE_UNAVAILABLE');return owner.resume(taskId,options);}
+
+/** Readonly original private readiness data, never an admission capability. */
+export function readOriginalTaskBoardFirstAdmitReadiness(board,taskId,gateContext){const owner=boardApply(boardWeakGet,originalBoardReaders,[board]);if(!owner)throw Error('TASK_BOARD_SOURCE_UNAVAILABLE');return owner.readFirstAdmitReadiness(taskId,gateContext);}
+
+
 import {
   buildTaskAliases,
   isExecutableTaskInput,
@@ -48,10 +71,10 @@ export function createTaskBoard(projectId = 'legacy-project') {
   }
 
   function resolveTaskId(taskId) {
-    if (tasks.has(taskId)) return taskId;
-    const alias = aliases.get(taskId);
+    if (boardApply(boardMapHas,tasks,[taskId])) return taskId;
+    const alias = boardApply(boardMapGet,aliases,[taskId]);
     if (alias) return alias;
-    const resolved = resolveTaskRef(projectId, taskId, [...tasks.values()]);
+    const resolved = resolveTaskRef(projectId, taskId, originalTaskValues(tasks));
     return resolved?.taskId || null;
   }
 
@@ -451,37 +474,57 @@ export function createTaskBoard(projectId = 'legacy-project') {
    * @param {Record<string, any>} [gateContext.currentGateFactsByTaskId]
    * @param {boolean} [gateContext.schemaV2=false]
    */
+  function pendingTaskDependencyReason(task){
+    if(boardValue(task,'status')!=='pending')return'task_not_pending';
+    if(boardValue(task,'isCompositeParent'))return'composite_parent';
+    const unresolved=boardValue(task,'unresolvedDependencies');if(unresolved&&unresolved.length!==0)return'unresolved_dependencies';
+    return null;
+  }
+  function evaluatePendingTaskDependencyReadiness(task,dependencyTasks,gateContext={}){
+    const reason=pendingTaskDependencyReason(task);if(reason)return{ok:false,reason};
+    const {dependencyPolicies={},gateEvaluationsByTaskId={},consumedArtifactIdsByDependencyTaskId={},currentGateFactsByTaskId={},schemaV2=false}=gateContext;
+    return evaluateDependencySatisfaction({task,dependencyTasks,dependencyPolicies,gateEvaluationsByTaskId,consumedArtifactIdsByDependencyTaskId,currentGateFactsByTaskId,schemaV2});
+  }
   function getDispatchable(gateContext = {}) {
-    const {
-      dependencyPolicies = {},
-      gateEvaluationsByTaskId = {},
-      consumedArtifactIdsByDependencyTaskId = {},
-      currentGateFactsByTaskId = {},
-      schemaV2 = false,
-    } = gateContext;
-    const allTasks = [...tasks.values()];
-    return allTasks
-      .filter(t => t.status === 'pending')
-      .filter(t => !t.isCompositeParent)
-      .filter(t => !t.unresolvedDependencies || t.unresolvedDependencies.length === 0)
-      .filter(t => {
-        const deps = Array.isArray(t.dependencies) ? t.dependencies : [];
-        if (deps.length === 0) return true;
-        const dependencyTasks = deps.map(depRef => {
-          const depId = resolveTaskId(depRef);
-          return depId ? tasks.get(depId) : null;
-        }).filter(Boolean);
-        const evaluation = evaluateDependencySatisfaction({
-          task: t,
-          dependencyTasks,
-          dependencyPolicies,
-          gateEvaluationsByTaskId,
-          consumedArtifactIdsByDependencyTaskId,
-          currentGateFactsByTaskId,
-          schemaV2,
-        });
-        return evaluation.ok;
-      });
+    const {dependencyPolicies={},gateEvaluationsByTaskId={},consumedArtifactIdsByDependencyTaskId={},currentGateFactsByTaskId={},schemaV2=false}=gateContext;
+    const context={dependencyPolicies,gateEvaluationsByTaskId,consumedArtifactIdsByDependencyTaskId,currentGateFactsByTaskId,schemaV2};
+    const all=originalTaskValues(tasks),ready=[];
+    for(let i=0;i<all.length;i++){
+      const task=all[i];if(pendingTaskDependencyReason(task))continue;const dependencies=boardIsArray(task.dependencies)?task.dependencies:[],dependencyTasks=[];
+      for(let n=0;n<dependencies.length;n++){const id=resolveTaskId(dependencies[n]),dep=id?boardApply(boardMapGet,tasks,[id]):null;if(dep)boardAppend(dependencyTasks,dep);}
+      if(evaluatePendingTaskDependencyReadiness(task,dependencyTasks,context).ok)boardAppend(ready,task);
+    }
+    return ready;
+  }
+  function readFirstAdmitReadiness(taskId,rawContext){
+    const denied=reason=>captureExecutionData({ok:false,reason});
+    if(typeof taskId!=='string'||!taskId)return denied('canonical_task_required');
+    let gateContext;
+    try{gateContext=captureExecutionData(rawContext);}catch{return denied('gate_context_unavailable');}
+    const required=['dependencyPolicies','gateEvaluationsByTaskId','consumedArtifactIdsByDependencyTaskId','currentGateFactsByTaskId','schemaV2'];
+    if(!gateContext||typeof gateContext!=='object'||boardIsArray(gateContext))return denied('gate_context_unavailable');
+    const fields=boardDescriptors(gateContext);if(boardKeys(fields).length!==required.length)return denied('gate_context_unavailable');
+    for(let i=0;i<required.length;i++)if(!boardOwn(fields,required[i]))return denied('gate_context_unavailable');
+    if(typeof gateContext.schemaV2!=='boolean')return denied('gate_schema_unavailable');
+    for(let i=0;i<4;i++){const value=gateContext[required[i]];if(!value||typeof value!=='object'||boardIsArray(value))return denied('gate_context_unavailable');}
+    const raw=boardApply(boardMapGet,tasks,[taskId]);if(!raw)return denied('canonical_task_required');
+    let task;
+    try{task=captureExecutionData(raw);}catch{return denied('task_content_unavailable');}
+    if(task.id!==taskId||task.status!=='pending')return denied('task_not_pending');
+    if(task.isCompositeParent)return denied('composite_parent');
+    const unresolved=boardValue(task,'unresolvedDependencies');if(unresolved!==undefined&&(!boardIsArray(unresolved)||unresolved.length))return denied('unresolved_dependencies');
+    const dependencies=boardValue(task,'dependencies');if(dependencies!==undefined&&!boardIsArray(dependencies))return denied('dependencies_unavailable');
+    const activeRunId=boardValue(task,'activeRunId'),runLease=boardValue(task,'runLease');if(activeRunId!==undefined&&activeRunId!==null||runLease!==undefined&&runLease!==null)return denied('execution_reconciliation_required');
+    const now=boardNow();if(!boardFinite(now)||now<0)return denied('clock_unavailable');
+    const retryNotBefore=boardValue(task,'retryNotBefore');if(retryNotBefore!==undefined&&retryNotBefore!==null&&(!boardFinite(retryNotBefore)||retryNotBefore<0||retryNotBefore>now))return denied('retry_backoff');
+    const ids=dependencies||[],dependencyTasks=[];
+    for(let i=0;i<ids.length;i++){
+      if(typeof ids[i]!=='string'||!ids[i])return denied('dependencies_unavailable');
+      const dep=boardApply(boardMapGet,tasks,[ids[i]]);
+      if(dep){try{boardAppend(dependencyTasks,captureExecutionData(dep));}catch{return denied('dependency_content_unavailable');}}
+    }
+    const result=evaluatePendingTaskDependencyReadiness(task,dependencyTasks,gateContext);
+    return captureExecutionData({ok:result.ok,taskId,checkedAt:now,...(result.ok?{}:{reason:result.reason||'dependency_blocked',blockedDependencies:result.blockedDependencies||[]})});
   }
 
   /**
@@ -518,53 +561,19 @@ export function createTaskBoard(projectId = 'legacy-project') {
    * 不能只修 getDispatchable 而漏掉这条兄弟路径。
    */
   function getDispatchableInPhase(phaseId, gateContext = {}) {
-    return getDispatchable(gateContext).filter(t => t.phaseId === phaseId);
+    const all=getDispatchable(gateContext),selected=[];for(let i=0;i<all.length;i++)if(all[i].phaseId===phaseId)boardAppend(selected,all[i]);return selected;
   }
 
   /**
    * 获取某阶段的完成状态
    */
-  function getPhaseStatus(phaseId, sourceTasks = [...tasks.values()]) {
-    const phaseTasks = sourceTasks.filter(t => t.phaseId === phaseId);
-    return {
-      total: phaseTasks.length,
-      pending: phaseTasks.filter(t => t.status === 'pending').length,
-      done: phaseTasks.filter(t => t.status === 'done').length,
-      inProgress: phaseTasks.filter(t => !['pending', 'done', 'cancelled', 'failed'].includes(t.status)).length,
-      failed: phaseTasks.filter(t => t.status === 'failed').length,
-    };
-  }
+  function getPhaseStatus(phaseId,sourceTasks=[...tasks.values()]) { return taskBoardPhaseStatus(phaseId,sourceTasks); }
 
   /**
    * 获取整体 plan 进度（按阶段聚合）
    */
-  function getPlanProgress() {
-    const all = [...tasks.values()];
-    const planTasks = all.filter(task => !isRetryAttempt(task));
-    const phaseIds = [...new Set(planTasks.map(t => t.phaseId).filter(Boolean))];
-    const executionAttempts = {
-      total: all.length,
-      failed: all.filter(t => t.status === 'failed').length,
-      pending: all.filter(t => t.status === 'pending').length,
-      done: all.filter(t => t.status === 'done').length,
-      inProgress: all.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
-    };
-    return {
-      phases: phaseIds.map(id => ({ phaseId: id, ...getPhaseStatus(id, planTasks) })),
-      total: planTasks.length,
-      pending: planTasks.filter(t => t.status === 'pending').length,
-      done: planTasks.filter(t => t.status === 'done').length,
-      failed: planTasks.filter(t => t.status === 'failed').length,
-      inProgress: planTasks.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
-      executionAttempts,
-    };
-  }
+  function getPlanProgress() { return taskBoardPlanProgress([...tasks.values()]); }
 
-  function isRetryAttempt(task = {}) {
-    if (!task.parentTaskId && !task.retryOfTaskId) return false;
-    if (Number(task.attempt || 1) > 1) return true;
-    return /-retry-\d+$/.test(String(task.id || ''));
-  }
 
   function getStats() {
     const all = [...tasks.values()];
@@ -668,7 +677,7 @@ export function createTaskBoard(projectId = 'legacy-project') {
     task.nextActions = [];
   }
 
-  return {
+  const api={
     addTasks,
     addTasksChecked,
     transition,
@@ -693,6 +702,12 @@ export function createTaskBoard(projectId = 'legacy-project') {
     getStats,
     loadTasks,
   };
+  boardApply(boardWeakSet,originalBoardReaders,[api,{snapshot:()=>captureObservationRows(originalTaskValues(tasks)),transition,resume:refreshLeaseForResume,readFirstAdmitReadiness,captureTask(taskId){
+    let task=tasks.get(taskId);
+    if(!task){captureObservationRows([...tasks.values()]);task=getTask(taskId);}if(!task)return null;
+    const snapshot=captureObservationRow(task),assertCurrent=()=>{if(tasks.get(snapshot.id)!==task)throw Error('RECOVERY_TASK_STALE');};assertCurrent();
+    return Object.freeze({task:snapshot,assertCurrent,read(){assertCurrent();return captureObservationRow(task);}});
+  }}]);return api;
 }
 
 /**
@@ -703,3 +718,36 @@ export function restoreTaskBoard(taskArray, projectId = 'legacy-project') {
   board.loadTasks(taskArray);
   return board;
 }
+
+function taskBoardPhaseStatus(phaseId,sourceTasks){
+ const phaseTasks=sourceTasks.filter(task=>task.phaseId===phaseId);
+ return{total:phaseTasks.length,pending:phaseTasks.filter(task=>task.status==='pending').length,done:phaseTasks.filter(task=>task.status==='done').length,inProgress:phaseTasks.filter(task=>!['pending','done','cancelled','failed'].includes(task.status)).length,failed:phaseTasks.filter(task=>task.status==='failed').length};
+}
+
+function isRetryAttempt(task = {}) {
+    if (!task.parentTaskId && !task.retryOfTaskId) return false;
+    if (Number(task.attempt || 1) > 1) return true;
+    return /-retry-\d+$/.test(String(task.id || ''));
+  }
+
+export function taskBoardPlanProgress(all) {
+    const planTasks = all.filter(task => !isRetryAttempt(task));
+    const phaseIds = [...new Set(planTasks.map(t => t.phaseId).filter(Boolean))];
+    const executionAttempts = {
+      total: all.length,
+      failed: all.filter(t => t.status === 'failed').length,
+      pending: all.filter(t => t.status === 'pending').length,
+      done: all.filter(t => t.status === 'done').length,
+      inProgress: all.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
+    };
+    return {
+      phases: phaseIds.map(id => ({ phaseId: id, ...taskBoardPhaseStatus(id, planTasks) })),
+      total: planTasks.length,
+      pending: planTasks.filter(t => t.status === 'pending').length,
+      done: planTasks.filter(t => t.status === 'done').length,
+      failed: planTasks.filter(t => t.status === 'failed').length,
+      inProgress: planTasks.filter(t => ['dispatched', 'accepted', 'in_progress', 'submitted'].includes(t.status)).length,
+      executionAttempts,
+    };
+  }
+
