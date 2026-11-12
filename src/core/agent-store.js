@@ -8,11 +8,11 @@
  * 持久化: ~/.kswarm/agents.json (未来可换 SQLite)
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'crypto';
-import { execSync } from 'child_process';
+import {findAgentExecutable} from './cli-discovery.js';
 import { createUnknownRuntimeHealth, recordRuntimeSuccess } from './runtime-health.js';
 import { resolveAgentExecution } from './agent-execution.js';
 import { CAPABILITY_DEFINITIONS } from './capability-catalog.js';
@@ -98,46 +98,12 @@ export function getKnownCLIs() {
   return KNOWN_AGENT_CLIS.map(c => ({ type: c.type, bin: c.bin, displayName: c.displayName, description: c.description }));
 }
 
-function _which(cmd) {
-  // Try execSync with PATH
-  try {
-    const result = execSync(`/usr/bin/which ${cmd} 2>/dev/null`, { encoding: 'utf-8', timeout: 3000 });
-    const path = result.trim().split('\n')[0];
-    if (path && path.startsWith('/')) return path;
-  } catch { /* fall through */ }
-
-  // Probe common locations (covers NVM, Homebrew, local installs)
-  const home = homedir();
-  const nvmDir = process.env.NVM_DIR || `${home}/.nvm`;
-  const candidates = [
-    `/usr/local/bin/${cmd}`,
-    `/opt/homebrew/bin/${cmd}`,
-    `${home}/.local/bin/${cmd}`,
-    `${home}/.opencode/bin/${cmd}`,
-  ];
-
-  // Scan all NVM node versions for the binary
-  try {
-    const versionsDir = `${nvmDir}/versions/node`;
-    if (existsSync(versionsDir)) {
-      const versions = readdirSync(versionsDir);
-      for (const v of versions) {
-        candidates.push(`${versionsDir}/${v}/bin/${cmd}`);
-      }
-    }
-  } catch { /* ignore */ }
-
-  for (const p of candidates) {
-    if (existsSync(p)) return p;
-  }
-  return null;
-}
 
 function _detectAgentCLIs() {
   const detected = [];
   for (const cli of KNOWN_AGENT_CLIS) {
     const binPath = process.env[cli.envPath] || cli.bin;
-    const resolvedPath = _which(binPath);
+    const resolvedPath = findAgentExecutable(binPath);
     if (resolvedPath) {
       detected.push({
         type: cli.type,
