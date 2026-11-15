@@ -82,7 +82,9 @@ test('actual Server configuration commit failure retains its remote cause and us
  const f=await fixture(t,{entry:'src/server/index.js',env:{KSWARM_PORT:String(port),BROKER_URL:'http://127.0.0.1:9',KSWARM_DESKTOP_PROFILE_ID:scope.profileId,KSWARM_DESKTOP_WORKSPACE_ID:scope.workspaceId}});
  let ready=false;for(let n=0;n<200;n++){try{if((await fetch('http://127.0.0.1:'+port+'/health')).ok){ready=true;break;}}catch{}if(f.child.exitCode!==null)break;await new Promise(resolve=>setTimeout(resolve,25));}assert.equal(ready,true);
  const nonce='9'.repeat(64),hello=await f.send({protocol,type:'hello',nonce,scope}),db=new DatabaseSync(join(f.root,'kswarm','state.sqlite'));
- let response;try{db.exec('BEGIN IMMEDIATE');response=await f.send({protocol,type:'request',nonce,scope,instance:hello.instance,id:1,op:'prepare_initial_plan_writer'});}finally{try{db.exec('ROLLBACK');}finally{db.close();}}
- assert.equal(response.type,'response');assert.equal(response.error.name,'PersistenceCommitError');assert.equal(response.error.durableCommitted,false);assert.ok(response.error.cause);
+ // Abort the actual configuration write; do not mix SQLite lock-sleep timing
+ // with the unchanged IPC response deadline. Real contention is covered separately.
+ let response;try{db.exec("CREATE TRIGGER fixture_config_abort BEFORE INSERT ON state_meta WHEN NEW.meta_key='writer_floor_v1' BEGIN SELECT RAISE(ABORT,'controlled_config_write_failure'); END");response=await f.send({protocol,type:'request',nonce,scope,instance:hello.instance,id:1,op:'prepare_initial_plan_writer'});assert.equal(db.prepare("SELECT count(*) n FROM state_meta WHERE meta_key='writer_floor_v1'").get().n,0);}finally{db.close();}
+ assert.equal(response.type,'response');assert.equal(response.error.name,'PersistenceCommitError');assert.equal(response.error.durableCommitted,false);assert.ok(response.error.cause);assert.match(response.error.cause.message,/controlled_config_write_failure/);
  const result=await f.closed;assert.equal(result.code,75);
 },{timeout:15000});
