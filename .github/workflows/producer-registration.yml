@@ -14,12 +14,29 @@ jobs:
       fail-fast: false
       matrix:
         node: ['22.22.0', '24']
+    defaults:
+      run:
+        working-directory: kswarm
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: kswarm
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: kaisersong/intent-broker
+          ref: 21defd02854fc38ae7526cdff9de3f46bf137311
+          path: intent-broker
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
+          cache-dependency-path: kswarm/package-lock.json
+      - name: Install the pinned original Broker dependencies
+        working-directory: intent-broker
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm ci --ignore-scripts
       - name: Actual original Hub cases must run and pass without skip
         shell: bash
@@ -41,8 +58,8 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: hub-producer-registration-node-${{ matrix.node }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: hub-producer-registration-node-${{ matrix.node }}-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            hub-producer-registration.tap
-            protected-protocol.tap
+            kswarm/hub-producer-registration.tap
+            kswarm/protected-protocol.tap
           if-no-files-found: error
