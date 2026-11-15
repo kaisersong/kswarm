@@ -340,28 +340,27 @@ test('sqlite: save failure sets failed health, rejects subsequent mutations (exi
 test('sqlite: single-writer lock rejects live writers and only reclaims dead owners', () => {
   const dir = tempDir('sql-lock');
   try {
-    const filePath = join(dir, 'state.sqlite');
-    const lockPath = `${filePath}.lock`;
-    realFs.mkdirSync(dir, { recursive: true });
-    // Foreign live writer holds the lock.
-    realFs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
-
-    const live = createSqlitePersistence({ filePath, isProcessAlive: () => true });
+    // Each liveness branch owns a distinct path: a rejected default Native
+    // source remains HELD and cannot authorize reopening the same path.
+    const livePath = join(dir, 'live.sqlite');
+    realFs.writeFileSync(`${livePath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
+    const live = createSqlitePersistence({ filePath: livePath, isProcessAlive: () => true });
     assert.throws(() => live.load(), (e) => e instanceof PersistenceLoadError);
+    live.close();
 
-    // Dead pid -> reclaim.
-    const dead = createSqlitePersistence({ filePath, isProcessAlive: () => false });
+    const deadPath = join(dir, 'dead.sqlite');
+    realFs.writeFileSync(`${deadPath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
+    const dead = createSqlitePersistence({ filePath: deadPath, isProcessAlive: () => false });
     assert.doesNotThrow(() => dead.load());
     dead.close();
 
-    // Age alone must never allow a live writer to be pre-empted.
-    realFs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() - 120_000 }));
-    const stale = createSqlitePersistence({ filePath, isProcessAlive: () => true });
+    const stalePath = join(dir, 'stale.sqlite');
+    realFs.writeFileSync(`${stalePath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() - 120_000 }));
+    const stale = createSqlitePersistence({ filePath: stalePath, isProcessAlive: () => true });
     assert.throws(() => stale.load(), (e) => e instanceof PersistenceLoadError);
     stale.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-
 test('sqlite: single-writer claim uses exclusive atomic file creation', () => {
   const dir = tempDir('sql-lock-atomic');
   try {

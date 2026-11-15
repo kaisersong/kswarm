@@ -1,3 +1,4 @@
+import {ordinarySqliteFactory} from './fixtures/ordinary-sqlite-factory.js';
 import {spawnSync} from 'node:child_process';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
@@ -26,12 +27,12 @@ test('floor is opt-in, same original commit, stable across reopen and cannot be 
  assert.deepEqual(f.store.getWriterProfile(),before);assert.equal(f.reopen().projects[0].name,'last');
 });
 test('unknown requested profile cannot write or activate',t=>{
- const f=fixture(t);f.store.save({entities:[row('before')]});
+ const f=fixture(t,{sqliteFactory:ordinarySqliteFactory});f.store.save({entities:[row('before')]});
  assert.throws(()=>f.store.save({requiredWriterProfile:'future_v2',entities:[row('after')]}),/writer.*profile/i);
  assert.equal(f.reopen().projects[0].name,'before');assert.equal(f.store.getWriterProfile().floor,null);
 });
 test('floor activation and trigger installation roll back with original entity write error',t=>{
- const f=fixture(t);f.store.save({entities:[row('before')]});
+ const f=fixture(t,{sqliteFactory:ordinarySqliteFactory});f.store.save({entities:[row('before')]});
  assert.throws(()=>f.store.save({requiredWriterProfile:profile,entities:[row('after'),{collection:'protocolHead',key:'bad',projectId:'p',value:{id:'bad',projectId:'p',kind:'head',revision:9}}]}),/CAS|revision/);
  assert.equal(f.reopen().projects[0].name,'before');assert.equal(f.store.getWriterProfile().floor,null);
  assert.equal(f.raw(db=>db.prepare("SELECT count(*) n FROM sqlite_master WHERE type='trigger' AND name LIKE 'kswarm_writer_floor_%'").get().n),0);
@@ -57,7 +58,7 @@ test('unaware real connection cannot write entities, history or metadata, or rep
 });
 test('missing and same-name altered trigger deny existing writer and future load without repairing',t=>{
  for(const alter of [false,true]){
-  const f=fixture(t);activate(f.store);
+  const f=fixture(t,{sqliteFactory:ordinarySqliteFactory});activate(f.store);
   const name=f.raw(db=>db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'kswarm_writer_floor_%' ORDER BY name").get().name);
   f.raw(db=>{db.exec('DROP TRIGGER '+name);if(alter)db.exec('CREATE TRIGGER '+name+' BEFORE UPDATE ON state_entities BEGIN SELECT 1; END');});
   assert.throws(()=>f.store.save({entities:[row('after')]}),/writer.*floor|floor.*integrity/i);

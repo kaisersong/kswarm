@@ -55,12 +55,28 @@ function captureSdkAccessors(row){
   const outcome=apply(nativeClose,baseline,[]);inventory(row,outcome);if(outcome!==undefined)fail('KSWARM_SQLITE_SOURCE_SDK_CLOSE_RETURN');sdkAccessors=next;resourceOwn(row,baseline);
  }catch(raw){row.unknown=true;sdkFailure??=row;first(row,raw);inventory(row,raw);if(baseline)append(row.raws,baseline);throw raw;}
 }
+// Ordinary factory method targets are configuration, not SDK return tails.
+// This exception never applies to Native authority and never makes a custom
+// connection eligible for assertKnown/positive physical certification.
+const nativeDatabasePrototype=NativeDatabase.prototype,getPrototype=Object.getPrototypeOf;
+function configuredMethod(row,raw,name,value){
+ if(row.custom!==true||row.authority||typeof name!=='string'||name==='constructor'||typeof value!=='function'||types.isProxy(value))return false;
+ const method=descriptor(nativeDatabasePrototype,name);
+ if(!method||!own(method,'value')||typeof method.value!=='function')return false;
+ let proto=raw;
+ for(let depth=0;proto&&depth<8;depth++){
+  if(types.isProxy(proto))return false;
+  if(proto===nativeDatabasePrototype)return true;
+  proto=getPrototype(proto);
+ }
+ return false;
+}
 function resourceOwn(row,raw){
  if(!raw||typeof raw!=='object'||types.isProxy(raw)){row.unknown=true;inventory(row,raw);return;}
  const names=keys(raw);
  for(const name of names){const d=descriptor(raw,name),known=row.authority&&name==='isTransaction'?{get:row.authority.namespace.transactionStateGetter,set:undefined,enumerable:false,configurable:false}:sdkAccessors?.get(name);
   if(!d){row.unknown=true;continue;}
-  if(own(d,'value')){inventory(row,d.value);continue;}
+  if(own(d,'value')){if(configuredMethod(row,raw,name,d.value))append(row.raws,d.value);else inventory(row,d.value);continue;}
   if(!known||d.get!==known.get||d.set!==known.set||d.enumerable!==known.enumerable||d.configurable!==known.configurable)row.unknown=true;
  }
 }

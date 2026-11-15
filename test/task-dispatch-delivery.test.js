@@ -8,7 +8,7 @@ function fixture() {
     id, status:'idle', brokerOnline:true, roles:['worker'], runtimeHealth:{state:'healthy',outputCapabilities:['markdown']},
   }))});
   const project = hub.createProject({id:'proj-fictional-recovery',name:'Fictional research',goal:'Write a fictional report',poAgent:'po',members:['worker-a','worker-b']});
-  assert.equal(hub.handleHumanAddTasks(project.id,[{title:'Analyze fictional material',assignedAgent:'worker-a',requiredOutputs:['markdown']}]).ok,true);
+  assert.equal(hub.handleHumanAddTasks(project.id,[{title:'Analyze fictional material',assignedAgent:'worker-a',requiredOutputs:['markdown']}],{requestSource:'user'}).ok,true);
   assert.equal(hub.handleApprove(project.id).ok,true);
   const board=hub.getBoard(project.id),task=board.getAllTasks()[0];
   task.executionStrategyOverride='direct';
