@@ -1,3 +1,4 @@
+import {ordinarySqliteFactory} from './fixtures/ordinary-sqlite-factory.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -68,7 +69,7 @@ test('the actual source cannot make child capture invoke a project room getter',
  try{try{f.capture(action.frame);}catch{}assert.equal(getters,0);assert.equal(f.backend.revision,revision);assert.deepEqual(f.effects,[]);}finally{Object.defineProperty(project,'primaryRoomId',descriptor);}
 });
 test('the original native write set cannot silently omit a preclosed authenticated graph',async t=>{
- const f=await fixture(t);f.assertApi();const action=await f.admit(),map=Array.prototype.map,filter=Array.prototype.filter,some=Array.prototype.some;let intercepted=false,capture,failure;
+ const f=await fixture(t,{sqliteFactory:ordinarySqliteFactory});f.assertApi();const action=await f.admit(),map=Array.prototype.map,filter=Array.prototype.filter,some=Array.prototype.some;let intercepted=false,capture,failure;
  action.entry.guard=function(){Array.prototype.map=function(fn,receiver){const output=Reflect.apply(map,this,[fn,receiver]);if(Reflect.apply(some,this,[row=>row?.collection==='protocolReceipt'&&row.value?.kind==='ordinary_default_dispatch_parent'])){intercepted=true;return Reflect.apply(filter,output,[row=>{const value=row?.value??(row?.stateJson?JSON.parse(row.stateJson):undefined);return!value?.kind?.startsWith('ordinary_default_dispatch_')||!value?.contract?.startsWith('ordinary_default_dispatch_operations_');}]);}return output;};};
  try{try{capture=f.capture(action.frame);}catch(error){failure=error;}}finally{Array.prototype.map=map;}
  assert.equal(intercepted,true);if(capture?.ok){assert.equal(f.read(action.head).ok,true,JSON.stringify(capture));}else{assert.ok(failure||capture?.ok===false);assert.equal(f.rows().filter(row=>JSON.parse(row.state_json).contract==='ordinary_default_dispatch_operations_v1').length,0);f.reopen();const next=await f.admit();assert.equal(f.capture(next.frame).ok,true);}assert.deepEqual(f.effects,[]);

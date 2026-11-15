@@ -1,3 +1,4 @@
+import {ordinarySqliteFactory} from './fixtures/ordinary-sqlite-factory.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
@@ -6,14 +7,14 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createSqlitePersistence} from '../src/core/sqlite-persistence.js';
 const payload=name=>({entities:[{collection:'project',key:'p',projectId:'p',value:{id:'p',name}}]});
-function fixture(t){
+function fixture(t,ordinary=false){
  const root=mkdtempSync(join(tmpdir(),'kswarm-stale-writer-')),filePath=join(root,'state.sqlite'),stores=[],loaded=new Map();
- const create=(options={})=>{const store=createSqlitePersistence({filePath,...options});stores.push(store);return store;};
+ const create=(options={})=>{const store=createSqlitePersistence({filePath,...(ordinary?{sqliteFactory:ordinarySqliteFactory}:{}),...options});stores.push(store);return store;};
  t.after(()=>{for(const store of stores)store.close();rmSync(root,{recursive:true,force:true});});
  return {root,filePath,create,state:store=>loaded.get(store),open(options={}){const store=create(options);loaded.set(store,store.load());return store;},raw(action){const db=new DatabaseSync(filePath);try{return action(db);}finally{db.close();}}};
 }
 test('real second writer cannot make a stale original writer silently overwrite committed business state',t=>{
- const f=fixture(t),first=f.open();first.save(payload('before'));
+ const f=fixture(t,true),first=f.open();first.save(payload('before'));
  // Fault injection simulates the existing lock-reclamation race: both writers
  // think they own the lock. Actual SQLite connections/transactions remain real.
  const second=f.open({isProcessAlive:()=>false});second.save(payload('second-committed'));
@@ -40,7 +41,7 @@ test('global revision exhaustion refuses a write without producing an unsafe com
  assert.equal(f.raw(db=>JSON.parse(db.prepare("SELECT state_json FROM state_entities WHERE collection='project'").get().state_json).name),'before');
 });
 test('original checksum recovery is one new commit and invalidates an earlier live writer snapshot',t=>{
- const f=fixture(t),first=f.open();first.save(payload('v1'));first.save(payload('v2'));
+ const f=fixture(t,true),first=f.open();first.save(payload('v1'));first.save(payload('v2'));
  f.raw(db=>db.exec("UPDATE state_entities SET state_json='corrupt' WHERE collection='project'"));
  const restored=f.open({isProcessAlive:()=>false});assert.equal(restored.getHealth().revision,3);
  assert.equal(f.raw(db=>JSON.parse(db.prepare("SELECT state_json FROM state_entities WHERE collection='project'").get().state_json).name),'v1');
