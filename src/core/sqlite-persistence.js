@@ -28,6 +28,8 @@ import {createSqliteWriterFloor} from './sqlite-writer-floor.js';
 import {types} from 'node:util';
 import {isAcceptanceRecord} from './initial-plan-acceptance-contract.js';
 import {registerInitialPlanWriteBackend,frozenInitialPlanWriteSet} from './initial-plan-write-fence.js';
+import { execFileSync } from 'node:child_process';
+import { join } from 'node:path';
 
 import {
   sha256Hex,
@@ -84,10 +86,23 @@ function defaultFs() {
   };
 }
 
-function defaultIsProcessAlive(pid) {
+export function windowsLockOwnerMatches(createdAt, startedAt) {
+  // Unknown identity is never evidence that a writer is dead. A process born
+  // after this lock was written cannot be its original owner (Windows reuses PIDs).
+  return !(Number.isFinite(createdAt) && createdAt > 0 && Number.isFinite(startedAt) && startedAt > createdAt);
+}
+
+function defaultIsProcessAlive(pid, createdAt) {
   if (!pid || pid === process.pid) return true;
   try {
     process.kill(pid, 0);
+    if (process.platform === 'win32' && Number.isSafeInteger(pid) && pid > 0) {
+      try {
+        const script = `[Console]::Write(([DateTimeOffset](Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds())`;
+        const startedAt = Number(execFileSync(join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { encoding: 'utf8', timeout: 5000, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).trim());
+        return windowsLockOwnerMatches(createdAt, startedAt);
+      } catch { return true; }
+    }
     return true;
   } catch (err) {
     return originalSqliteSourceErrorCode(err)==='EPERM'; // exists but not permitted -> alive
@@ -188,7 +203,7 @@ export function createSqlitePersistence(options = {}) {
     }
 
     const age = now() - (holder.createdAt || 0);
-    if (isProcessAlive(holder.pid)) {
+    if (isProcessAlive(holder.pid, holder.createdAt)) {
       const rejected=new PersistenceLoadError(
         `[sqlite-persistence] state locked by live writer pid=${holder.pid} (age=${age}ms)`,
       );preopenRejections.add(rejected);throw rejected;
