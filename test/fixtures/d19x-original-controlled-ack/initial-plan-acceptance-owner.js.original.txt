@@ -1,0 +1,274 @@
+import {createDefaultDispatchOperationRules} from './default-dispatch-operation-rules.js';
+import {createDurableDispatchPlanRules} from './durable-dispatch-plan-rules.js';
+import {createDefaultDispatchBirthRules} from './default-dispatch-birth-rules.js';
+import {createTaskAdditionProtocolRules,TaskAdditionStateError} from './initial-plan-task-addition-rules.js';
+import {isDeepStrictEqual,types} from 'node:util';
+import {bindInitialPlanWriteBackend} from './initial-plan-write-fence.js';
+import {DURABLE_DISPATCH_RUNTIME_WRITER_PROFILE,DEFAULT_DISPATCH_WRITER_PROFILE,isDefaultDispatchBirthProfile,ADDITIVE_INITIAL_PLAN,ACCEPTANCE_WRITER_PROFILE,ACCEPTANCE_WRITER_DIGEST,ADDITIVE_INITIAL_PLAN_DESCRIPTOR,TASK_ADDITIVE_INITIAL_PLAN,TASK_ADDITIVE_DESCRIPTOR,TASK_WRITER_PROFILE,semanticWriterByProfile,isAcceptanceRecord,acceptanceRecordMatchesFloor} from './initial-plan-acceptance-contract.js';
+import {resolveProjectInputAuthority} from './project-input-authority.js';
+import {protocolDigest,projectProtocolIds,isProjectProtocolScope} from './project-protocol.js';
+import {readInitialPlanSemanticSnapshot,readInitialPlanPendingTasks,readInitialPlanCandidateInput,readInitialPlanActivityProjection,readInitialPlanTransportProjection,InitialPlanSemanticSchemaError} from './initial-plan-semantic-schema.js';
+import {projectActivitySnapshot} from './project-activity.js';
+class AcceptanceStateError extends Error {}
+const fail=code=>{throw new AcceptanceStateError(code);},deny=error=>({ok:false,error});
+const semanticFailure=error=>error instanceof AcceptanceStateError||error instanceof InitialPlanSemanticSchemaError||error instanceof TaskAdditionStateError;
+const sameScope=(a,b)=>a?.profileId===b?.profileId&&a?.workspaceId===b?.workspaceId;
+const idKey=(collection,id)=>JSON.stringify([collection,id]);
+const headId=reservationId=>reservationId+':acceptance';
+const roomTransport=['status','attempts','totalAttempts','nextAttemptAt','lastError','publishedAt','suppressedAt'];
+const stripRoom=item=>Object.fromEntries(Object.entries(item).filter(([key])=>!roomTransport.includes(key)));
+
+/** Original Hub-only controller. Its private backend frame is never returned
+ * by a business DTO. All durable state remains in the original owner maps. */
+export function createInitialPlanAcceptanceOwner({persistence,projects,boards,receipts,heads,readBinding,related,persist,isHeapEmpty,isFreshPreparationQuiescent,prepareTasks,commitTasks,defaultDispatchTransitionSource,defaultDispatchActionSource,defaultDispatchPreparationSource,invokeAdmissionGuard,retainAdmissionTail,isPreparationReadQuiescent,inspectPreparationTransportCall,readPreparationTransportCandidate}){
+ const backend=bindInitialPlanWriteBackend(persistence,{defaultDispatchTransitionSource}),creates=new Set(),births=new Map(),commits=new Map(),rejections=new Map(),roomAcks=new Map(),workspaceAcks=new Map();let preparing=null;
+ function floor(){const health=persistence?.getHealth?.();if(!backend||health?.status==='failed')return null;return backend.profile()?.floor??null;}
+ function qualified(scope,profile=ACCEPTANCE_WRITER_PROFILE){const value=floor(),writer=semanticWriterByProfile(isDefaultDispatchBirthProfile(value?.profile)&&profile===ACCEPTANCE_WRITER_PROFILE?value.profile:profile);return writer?.writable===true&&value?.schemaVersion===writer.schemaVersion&&value.profile===writer.profile&&value.writerProfileDigest===writer.digest&&(!scope||sameScope(scope,value.scope));}
+ const dispatchBirths=createDefaultDispatchBirthRules({persistence,backend,projects,boards,receipts,heads,readBinding,floor});
+ const dispatchPlans=createDurableDispatchPlanRules({backend,projects,boards,receipts,heads,readBinding,floor,readBirths:dispatchBirths.read,inspectBirths:dispatchBirths.inspect});
+ const dispatchOperations=createDefaultDispatchOperationRules({backend,projects,boards,receipts,heads,readBinding,floor,inspectPlan:dispatchPlans.inspect,source:defaultDispatchActionSource,preparationSource:defaultDispatchPreparationSource,invokeGuard:invokeAdmissionGuard,retainSourceTail:retainAdmissionTail,isPreparationReadQuiescent,inspectPreparationTransportCall,readPreparationTransportCandidate});
+ const taskRules=createTaskAdditionProtocolRules({persistence,backend,projects,boards,receipts,heads,readBinding,related,floor,prepareTasks,commitTasks});
+ function oldProject(projectId){return backend?.rows().find(row=>row.collection==='project'&&row.key===projectId)?.value;}
+ function view(projectId,candidates,provisional=false){
+  let project=candidates?.get(projectId)??projects.get(projectId);const tasks=boards.get(projectId)?.getAllTasks();if(!project||!tasks)fail('INITIAL_PLAN_ACCEPTANCE_STATE_UNAVAILABLE');
+  if(provisional&&project.activitySnapshot)project={...project,activitySnapshot:projectActivitySnapshot(project,tasks)};
+  return readInitialPlanSemanticSnapshot({project,tasks,related:related(projectId)});
+ }
+ function projectionVerified(projectId){
+  const raw=projects.get(projectId);readInitialPlanActivityProjection(raw);
+  const current=readInitialPlanTransportProjection(raw),previousRaw=oldProject(projectId),previous=previousRaw?readInitialPlanTransportProjection(previousRaw):{};
+  const room=current.roomEventOutbox??[],oldRoom=previous.roomEventOutbox??[];
+  if(new Set(room.map(item=>item.projectionEventId)).size!==room.length||new Set(oldRoom.map(item=>item.projectionEventId)).size!==oldRoom.length)return false;
+  if(room.length<oldRoom.length||oldRoom.some((item,index)=>room[index]?.projectionEventId!==item.projectionEventId||!isDeepStrictEqual(stripRoom(room[index]),stripRoom(item))))return false;
+  const wholeRoomAck=roomAcks.has(projectId)&&roomAcks.get(projectId)===protocolDigest(current.roomEventOutbox);
+  if(!wholeRoomAck){
+   for(let index=0;index<room.length;index++){
+    const item=room[index],old=oldRoom[index];
+    if(old){for(const key of roomTransport)if(!isDeepStrictEqual(item[key],old[key]))return false;}
+    else if(item.status!=='pending'||roomTransport.some(key=>key!=='status'&&Object.hasOwn(raw.roomEventOutbox[index],key)))return false;
+   }
+  }
+  const workspace=current.workspaceMappingOperations??{},oldWorkspace=previous.workspaceMappingOperations??{};
+  if(Object.keys(oldWorkspace).some(key=>!Object.hasOwn(workspace,key)))return false;
+  const wholeWorkspaceAck=workspaceAcks.has(projectId)&&workspaceAcks.get(projectId)===protocolDigest(current.workspaceMappingOperations);
+  for(const [key,item] of Object.entries(workspace)){
+   const old=oldWorkspace[key];
+   if(old){const {status,...payload}=item,{status:oldStatus,...oldPayload}=old;
+    if(!isDeepStrictEqual(payload,oldPayload)||!wholeWorkspaceAck&&status!==oldStatus)return false;
+   }else if(item.status!=='pending')return false;
+  }
+  return true;
+ }
+ function checkProjection(projectId){
+  try{return projectionVerified(projectId)?{ok:true}:deny('INITIAL_PLAN_PROJECTION_UNVERIFIED');}
+  catch(error){if(!(error instanceof InitialPlanSemanticSchemaError))throw error;return deny('INITIAL_PLAN_PROJECTION_UNVERIFIED');}
+ }
+ function newContract(projectId){return [ADDITIVE_INITIAL_PLAN,TASK_ADDITIVE_INITIAL_PLAN].includes(readBinding(projectId).binding?.initialPlanning?.contract?.protocol);}
+ function reservation(projectId){return [...receipts.values()].find(row=>row.projectId===projectId&&row.kind==='initial_plan_reservation');}
+ function checkedHead(projectId){
+  const claim=reservation(projectId),head=claim&&heads.get(headId(claim.id)),binding=readBinding(projectId),value=floor();
+  const expectedKeys=['id','kind','schemaVersion','contract','projectId','scope','revision','state','claimDigest','bindingDigest','writerStoreId','baseProjectRevision','tailProjectRevision','baseSemanticDigest','tailSemanticDigest','deltaCount','prevDeltaDigest',...(head?.state==='committed'?['commitCommandId']:head?.state==='invalidated'?['invalidationReceiptId']:[])];
+  if(!head||Object.keys(head).length!==expectedKeys.length||Object.keys(head).some(key=>!expectedKeys.includes(key))||head.contract!==ADDITIVE_INITIAL_PLAN
+   ||head.baseProjectRevision!==claim?.ownerRevision||head.tailProjectRevision!==head.baseProjectRevision||head.prevDeltaDigest!==null
+   ||!['claimDigest','bindingDigest','baseSemanticDigest','tailSemanticDigest'].every(key=>typeof head[key]==='string'&&/^[a-f0-9]{64}$/.test(head[key])))fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');
+  if(!qualified(binding.binding?.scope)||claim?.schemaVersion!==2||claim.contract!==ADDITIVE_INITIAL_PLAN||!head||head.kind!=='initial_plan_acceptance_head'||head.schemaVersion!==1
+   ||head.projectId!==projectId||head.id!==headId(claim.id)||head.claimDigest!==protocolDigest(claim)||head.bindingDigest!==protocolDigest(binding.binding)
+   ||head.writerStoreId!==value.storeId||!sameScope(head.scope,value.scope)||!Number.isSafeInteger(head.revision)||head.revision<1
+   ||!['valid','invalidated','committed'].includes(head.state)||head.deltaCount!==0)fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');
+  return {head,claim,binding};
+ }
+ function current(projectId){
+  const checked=checkedHead(projectId);if(checked.head.state!=='valid')return deny('INITIAL_PLAN_ACCEPTANCE_INVALIDATED');
+  const snapshot=view(projectId);if(snapshot.projectRevision!==checked.head.tailProjectRevision||snapshot.digest!==checked.head.tailSemanticDigest)return deny('INITIAL_PLAN_ACCEPTANCE_INVALIDATED');
+  return {ok:true,...checked,snapshot};
+ }
+ function restore(map,snapshot){map.clear();for(const [key,value] of snapshot)map.set(key,value);}
+ return Object.freeze({
+  emptyPlanningEpoch:()=>backend?.emptyPlanningEpoch(),
+  assertEmptyPlanningEpoch:(epoch,scope)=>backend?.assertEmptyPlanningEpoch(epoch,scope),
+  captureTransition:()=>backend.captureDefaultDispatchTransitionObservation(),
+  inspectTransition:observation=>backend.inspectDefaultDispatchTransitionObservation(observation),
+  transitionDefaultDispatch:(frame,context)=>backend.transitionDefaultDispatch(frame,context),
+  physicalRows:()=>backend?.rows()??[],
+  executionStart(projectId){
+   if(!projects.has(projectId))return deny('project_not_found');
+   if(dispatchBirths.active())return deny('DEFAULT_DISPATCH_EXECUTION_UNAVAILABLE');
+   const binding=readBinding(projectId),ids=projectProtocolIds(projectId);
+   const fixedKeys=new Set([ids.binding,ids.receipt]);
+   const physical=(backend?.rows()??[]).filter(row=>['protocolReceipt','protocolHead'].includes(row.collection)
+    &&(row.projectId===projectId||row.value.projectId===projectId||row.collection==='protocolReceipt'&&fixedKeys.has(row.key)));
+   for(const row of physical){
+    const original=(row.collection==='protocolReceipt'?receipts:heads).get(row.key);
+    if(row.key!==row.value.id||row.projectId!==row.value.projectId||!original||protocolDigest(original)!==protocolDigest(row.value))return deny('PROJECT_EXECUTION_PROTOCOL_UNVERIFIED');
+   }
+   const heap=[...receipts.values(),...heads.values()].filter(row=>row.projectId===projectId);
+   const reserved=[...heap,...physical.map(row=>row.value)].filter(isAcceptanceRecord);
+   if(binding.classification!=='ordinary'){
+    // Fixed immutable identity and physical ownership remain authoritative when
+    // damaged JSON ownership no longer points at this project. Only truly
+    // absent pre-protocol metadata retains the old compatibility domain.
+    const creation=receipts.has(ids.binding)||receipts.has(ids.receipt)
+     ||physical.some(row=>['project_protocol_binding','project_create_receipt'].includes(row.value.kind));
+    return binding.reasonCode==='PROTOCOL_BINDING_UNVERIFIED'&&!creation&&!reserved.length
+     ?{ok:true,classification:'legacy_ordinary'}:deny('PROJECT_EXECUTION_PROTOCOL_UNVERIFIED');
+   }
+   if(Object.hasOwn(binding.binding,'scope')&&!isProjectProtocolScope(binding.binding.scope))return deny('PROJECT_SCOPE_UNVERIFIED');
+   if(!reserved.length)return {ok:true,classification:'ordinary'};
+   const value=floor();
+   if(taskRules.isProtocol(projectId))return deny(taskRules.qualified(binding)?'CANDIDATE_WORKSPACE_UNAVAILABLE':'PROJECT_EXECUTION_PROFILE_UNQUALIFIED');
+   if(!qualified(binding.binding.scope)||reserved.some(row=>!acceptanceRecordMatchesFloor(row,value)||!sameScope(row.scope,value.scope)))return deny('PROJECT_EXECUTION_PROFILE_UNQUALIFIED');
+   if(!isDeepStrictEqual(binding.binding.initialPlanning?.contract,ADDITIVE_INITIAL_PLAN_DESCRIPTOR)
+    ||binding.createReceipt.snapshot.initialPlanWriterStoreId!==value.storeId)return deny('PROJECT_EXECUTION_PROTOCOL_UNVERIFIED');
+   return {ok:true,classification:'ordinary_initial_plan_additive_v1'};
+  },
+  noteDefaultDispatchProjectCreate:dispatchBirths.noteProjectCreate,prepareDispatchBirth:dispatchBirths.prepare,beforeDispatchBirth:dispatchBirths.beforeCommit,afterDispatchBirth:dispatchBirths.afterCommit,readDispatchBirths:dispatchBirths.read,
+  prepareDispatchHostRegistration:dispatchOperations.prepareHostRegistration,advanceRegisteredHost:dispatchOperations.advanceRegisteredHost,
+  readDispatchPreparationCall:dispatchOperations.readPreparationCall,readDispatchPreparationBasis:dispatchOperations.readPreparationBasis,readDispatchChild:dispatchOperations.readChild,readDispatchChildPreparation:dispatchOperations.readChildPreparation,prepareDispatchChild:dispatchOperations.prepareChild,admitDispatchChildPreparation:dispatchOperations.admitChildPreparation,acknowledgeDispatchChild:dispatchOperations.acknowledgeChild,prepareDispatchOperation:dispatchOperations.prepare,acceptDispatchOperation:dispatchOperations.accept,readDispatchOperation:dispatchOperations.read,
+  readDispatchPlan:dispatchPlans.read,prepareDispatchPlanChange:dispatchPlans.preparePlanChange,commitDispatchPlanChange:dispatchPlans.commitPlanChange,
+  profileMatches:binding=>taskRules.qualified(binding)||qualified(binding.binding?.scope)&&isDeepStrictEqual(binding.binding.initialPlanning?.contract,ADDITIVE_INITIAL_PLAN_DESCRIPTOR)&&binding.createReceipt?.snapshot.initialPlanWriterStoreId===floor().storeId,
+  isNew:projectId=>newContract(projectId),
+  isTaskProtocol:taskRules.isProtocol,
+  prepareTaskAddition(projectId,operation,tasks){const projection=checkProjection(projectId);return projection.ok?taskRules.prepare(projectId,operation,tasks):projection;},commitPreparedTaskAddition:taskRules.commitPrepared,
+  taskClaimEnvelope:taskRules.claimEnvelope,readTaskReceipt:taskRules.readTaskReceipt,snapshotTaskRows:projectId=>structuredClone(boards.get(projectId).getAllTasks()),
+  assertCreate(token){const authority=resolveProjectInputAuthority(token),contract=authority?.creation?.contract;
+   // Recognizing the future descriptor does not qualify the incomplete writer.
+   if(contract){const profile=contract.protocol===ADDITIVE_INITIAL_PLAN?ACCEPTANCE_WRITER_PROFILE:contract.protocol===TASK_ADDITIVE_INITIAL_PLAN&&isDeepStrictEqual(contract,TASK_ADDITIVE_DESCRIPTOR)?TASK_WRITER_PROFILE:null;
+    if(!profile||!qualified(authority,profile))fail('INITIAL_PLAN_PROFILE_UNQUALIFIED');}},
+  writerStoreId(){const value=floor();if(!value||!qualified(undefined,value.profile))fail('INITIAL_PLAN_PROFILE_UNQUALIFIED');return value.storeId;},
+  noteCreate(projectId){creates.add(projectId);},
+  prepareFresh(context){
+   if(!context||typeof context!=='object'||types.isProxy(context))return deny('INITIAL_PLAN_WRITER_AUTHORITY_REQUIRED');
+   const fields=Object.getOwnPropertyDescriptors(context);
+   if(Object.values(fields).some(row=>!Object.hasOwn(row,'value')))return deny('INITIAL_PLAN_WRITER_AUTHORITY_REQUIRED');
+   const authority=resolveProjectInputAuthority(fields.projectInputAuthority?.value);
+   if(fields.requestSource?.value!=='user'||authority?.requestSource!=='user'||authority.kind!=='desktop_control')return deny('INITIAL_PLAN_WRITER_AUTHORITY_REQUIRED');
+   if(!backend||typeof isHeapEmpty!=='function')return deny('INITIAL_PLAN_PROFILE_UNQUALIFIED');
+   const domain={profileId:authority.profileId,workspaceId:authority.workspaceId};
+   if(!isHeapEmpty())return deny('INITIAL_PLAN_FRESH_STORE_REQUIRED');
+   if(typeof isFreshPreparationQuiescent!=='function'||!isFreshPreparationQuiescent())return deny('INITIAL_PLAN_FRESH_RECONCILIATION_REQUIRED');
+   const current=floor();
+   if(current){
+    if(current.profile!==ACCEPTANCE_WRITER_PROFILE||!qualified(authority))return deny('INITIAL_PLAN_FRESH_RECONCILIATION_REQUIRED');
+    const epoch=backend.emptyPlanningEpoch();if(!epoch)return deny('INITIAL_PLAN_FRESH_RECONCILIATION_REQUIRED');
+    backend.assertEmptyPlanningEpoch(epoch,domain);
+    if(!backend.inspectFreshPreparation().empty)return deny('INITIAL_PLAN_FRESH_STORE_REQUIRED');
+    return {ok:true,profile:structuredClone(current)};
+   }
+   const fresh=backend.prepareFresh(domain);if(!fresh.ok)return fresh;
+   preparing=fresh.preparation;
+   try{persist();return fresh.result;}finally{preparing=null;}
+  },
+  prepare(context,profile=ACCEPTANCE_WRITER_PROFILE){
+   const authority=resolveProjectInputAuthority(context?.projectInputAuthority);
+   if(context?.requestSource!=='user'||authority?.requestSource!=='user'||authority.kind!=='desktop_control')return deny('INITIAL_PLAN_WRITER_AUTHORITY_REQUIRED');
+   if(!backend||semanticWriterByProfile(profile)?.writable!==true)return deny('INITIAL_PLAN_PROFILE_UNQUALIFIED');
+   if(profile===DURABLE_DISPATCH_RUNTIME_WRITER_PROFILE){
+    const current=floor();
+    if(current){if(!qualified(authority,profile))return deny('INITIAL_PLAN_PROFILE_UNQUALIFIED');return {ok:true,profile:structuredClone(current)};}
+    if(!isHeapEmpty())return deny('INITIAL_PLAN_FRESH_STORE_REQUIRED');
+    if(typeof isFreshPreparationQuiescent!=='function'||!isFreshPreparationQuiescent())return deny('INITIAL_PLAN_FRESH_RECONCILIATION_REQUIRED');
+    const fresh=backend.prepareFresh({profileId:authority.profileId,workspaceId:authority.workspaceId},profile);if(!fresh.ok)return fresh;
+    preparing=fresh.preparation;
+    try{persist();return fresh.result;}finally{preparing=null;}
+   }
+   if(isDefaultDispatchBirthProfile(profile)){const fresh=dispatchBirths.assertFreshPreparation(authority);if(!fresh.ok)return fresh;}
+   if(floor()){if(!qualified(authority,profile))return deny('INITIAL_PLAN_PROFILE_UNQUALIFIED');return {ok:true,profile:structuredClone(floor())};}
+   preparing=backend.prepare({profileId:authority.profileId,workspaceId:authority.workspaceId},profile);
+   try{persist();return {ok:true,profile:structuredClone(floor())};}finally{preparing=null;}
+  },
+  controlDigest:projectId=>taskRules.isProtocol(projectId)?taskRules.controlDigest(projectId):view(projectId).digest,
+  born(projectId,claim){births.set(projectId,claim);},
+  beforeClaim(projectId,input){
+   const task=taskRules.isProtocol(projectId);
+   if(!qualified(readBinding(projectId).binding?.scope,task?TASK_WRITER_PROFILE:ACCEPTANCE_WRITER_PROFILE))return deny('INITIAL_PLAN_PROFILE_UNQUALIFIED');
+   if(input?.protocol!==(task?TASK_ADDITIVE_INITIAL_PLAN:ADDITIVE_INITIAL_PLAN)||input.fromAgent!==projects.get(projectId)?.poAgent)return deny('INITIAL_PLAN_CLAIM_CONFLICT');
+   const projection=checkProjection(projectId);if(!projection.ok)return projection;
+   if(task)return taskRules.beforeClaim(projectId,input);
+   try{const state=view(projectId);if(state.semantic.tasks.length||input.expectedProjectControlDigest!==state.digest)return deny('INITIAL_PLAN_CONTROL_CONFLICT');return {ok:true};}
+   catch(error){if(!semanticFailure(error))throw error;return deny('INITIAL_PLAN_SEMANTIC_SCHEMA_UNAVAILABLE');}
+  },
+  validateCommit(projectId,input){
+   const projection=checkProjection(projectId);if(!projection.ok)return projection;
+   try{if(taskRules.isProtocol(projectId)){readInitialPlanCandidateInput({plan:input.plan,tasks:input.tasks});return taskRules.validateCommit(projectId,input);}
+    const result=current(projectId);if(!result.ok)return result;readInitialPlanCandidateInput({plan:input.plan,tasks:input.tasks});return result;}
+   catch(error){if(!semanticFailure(error))throw error;return deny('INITIAL_PLAN_ACCEPTANCE_INVALIDATED');}
+  },
+  committed(projectId,input,taskIds,beforeTasks){if(taskRules.isProtocol(projectId)){taskRules.committed(projectId,input,taskIds,beforeTasks);return;}commits.set(projectId,{input:structuredClone(input),taskIds:[...taskIds]});},
+  rejected(projectId,commandId){rejections.set(projectId,commandId);},
+  read(projectId){if(taskRules.isProtocol(projectId))return taskRules.read(projectId);try{return {ok:true,head:structuredClone(checkedHead(projectId).head)};}catch(error){if(!semanticFailure(error))throw error;return deny('INITIAL_PLAN_ACCEPTANCE_UNAVAILABLE');}},
+  noteRoomAck(project,before,item){
+   if(projects.get(project.id)!==project||!project.roomEventOutbox?.includes(item))return;
+   const previous=oldProject(project.id)?.roomEventOutbox;
+   const old=previous?.find(row=>row.projectionEventId===item.projectionEventId);
+   if(!old||!isDeepStrictEqual(old,before)||!isDeepStrictEqual(stripRoom(old),stripRoom(item))||old.status!=='pending'
+    ||item.attempts!==(old.attempts??0)+1||item.totalAttempts!==(old.totalAttempts??0)+1||!['pending','published','parked','suppressed_room_archived'].includes(item.status))return;
+   const expected=previous.map(row=>row===old?item:row);
+   if(!isDeepStrictEqual(expected,project.roomEventOutbox))return;
+   roomAcks.set(project.id,protocolDigest(expected));
+  },
+  noteWorkspaceAck(projectId,before,item){
+   const project=projects.get(projectId),previous=oldProject(projectId)?.workspaceMappingOperations,old=previous?.[item.operationId];
+   if(project?.workspaceMappingOperations?.[item.operationId]!==item||!isDeepStrictEqual(old,before)||before.status!=='pending'||item.status!=='applied'
+    ||!isDeepStrictEqual({...before,status:'applied'},item))return;
+   const expected={...previous,[item.operationId]:item};
+   if(!isDeepStrictEqual(expected,project.workspaceMappingOperations))return;
+   workspaceAcks.set(projectId,protocolDigest(expected));
+  },
+  abort(projectId){dispatchOperations.abort(projectId);dispatchPlans.abort(projectId);dispatchBirths.abort(projectId);taskRules.abort(projectId);creates.delete(projectId);births.delete(projectId);commits.delete(projectId);rejections.delete(projectId);roomAcks.delete(projectId);workspaceAcks.delete(projectId);},
+  stage(scope,candidates){
+   if(!backend)return {freeze:payload=>payload,commit(){},rollback(){}};
+   const savedHeads=new Map(heads),savedReceipts=new Map(receipts),inScope=id=>scope.type==='full'||scope.projectId===id,birthIds=[];
+   const clear=()=>{dispatchOperations.clear(scope);dispatchPlans.clear(scope);dispatchBirths.clear(scope);taskRules.clearScope(scope);for(const set of [creates,births,commits,rejections,roomAcks,workspaceAcks])for(const id of set.keys())if(inScope(id))set.delete(id);};
+   const rollback=error=>{if(!error?.durableCommitted){restore(heads,savedHeads);restore(receipts,savedReceipts);}clear();};
+   try{
+    // Every authority-bearing branch passes this before any early continue.
+    const strict=new Set([...creates,...births.keys(),...commits.keys(),...rejections.keys()]);
+    for(const projectId of projects.keys())if(newContract(projectId)&&(!reservation(projectId)||taskRules.hasMutation(projectId)))strict.add(projectId);
+    for(const projectId of strict)if(inScope(projectId)&&projects.has(projectId)&&!projectionVerified(projectId))fail('INITIAL_PLAN_PROJECTION_UNVERIFIED');
+    for(const projectId of creates)if(inScope(projectId))for(const record of receipts.values())if(record.projectId===projectId&&['project_protocol_binding','project_create_receipt'].includes(record.kind))birthIds.push(idKey('protocolReceipt',record.id));
+    for(const [projectId,claim] of births)if(inScope(projectId)){
+     if(heads.has(headId(claim.id)))fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');
+     if(taskRules.isProtocol(projectId)){if(taskRules.hasMutation(projectId))taskRules.stage(projectId,candidates,birthIds);taskRules.born(projectId,claim,candidates,birthIds);continue;}
+     const snapshot=view(projectId,candidates),binding=readBinding(projectId),head={id:headId(claim.id),kind:'initial_plan_acceptance_head',schemaVersion:1,contract:ADDITIVE_INITIAL_PLAN,projectId,
+      scope:structuredClone(binding.binding.scope),revision:1,state:'valid',claimDigest:protocolDigest(claim),bindingDigest:protocolDigest(binding.binding),writerStoreId:floor().storeId,
+      baseProjectRevision:claim.ownerRevision,tailProjectRevision:claim.ownerRevision,baseSemanticDigest:snapshot.digest,tailSemanticDigest:snapshot.digest,deltaCount:0,prevDeltaDigest:null};
+     if(snapshot.projectRevision!==claim.ownerRevision)fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');heads.set(head.id,head);birthIds.push(idKey('protocolReceipt',claim.id),idKey('protocolHead',head.id));
+    }
+    for(const [projectId,commandId] of rejections)if(inScope(projectId))birthIds.push(idKey('protocolReceipt',commandId));
+    for(const oldHead of [...heads.values()])if(oldHead.kind==='initial_plan_acceptance_head'&&oldHead.contract===ADDITIVE_INITIAL_PLAN&&inScope(oldHead.projectId)&&oldHead.state==='valid'&&!births.has(oldHead.projectId)){
+     const projectId=oldHead.projectId,commit=commits.get(projectId);
+     if(commit){
+      const tasks=readInitialPlanPendingTasks(boards.get(projectId).getAllTasks(),projectId);
+      if(tasks.length!==commit.taskIds.length||tasks.some(task=>!commit.taskIds.includes(task.id)))fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');
+      checkedHead(projectId);birthIds.push(idKey('protocolReceipt',commit.input.commandId));
+      heads.set(oldHead.id,{...oldHead,revision:oldHead.revision+1,state:'committed',commitCommandId:commit.input.commandId});continue;
+     }
+     let valid=false;
+     try{
+      checkedHead(projectId);const snapshot=view(projectId,candidates),raw=projects.get(projectId),old=oldProject(projectId);
+      valid=snapshot.projectRevision===oldHead.tailProjectRevision&&snapshot.digest===oldHead.tailSemanticDigest
+       &&protocolDigest(readInitialPlanActivityProjection(raw))===protocolDigest(readInitialPlanActivityProjection(old))
+       &&(isDeepStrictEqual(raw.roomEventOutbox,old?.roomEventOutbox)||roomAcks.get(projectId)===protocolDigest(raw.roomEventOutbox))
+       &&(isDeepStrictEqual(raw.workspaceMappingOperations,old?.workspaceMappingOperations)||workspaceAcks.get(projectId)===protocolDigest(raw.workspaceMappingOperations));
+     }catch(error){if(!semanticFailure(error))throw error;}
+     if(!valid){
+      const audit={id:oldHead.id+':invalidated:'+oldHead.revision,kind:'initial_plan_acceptance_invalidation',schemaVersion:1,contract:ADDITIVE_INITIAL_PLAN,projectId,scope:structuredClone(oldHead.scope),headDigest:protocolDigest(oldHead),reasonCode:'UNPROVEN_OWNER_CHANGE'};
+      if(receipts.has(audit.id))fail('INITIAL_PLAN_ACCEPTANCE_INTEGRITY_FAILED');receipts.set(audit.id,audit);birthIds.push(idKey('protocolReceipt',audit.id));
+      heads.set(oldHead.id,{...oldHead,revision:oldHead.revision+1,state:'invalidated',invalidationReceiptId:audit.id});
+     }
+    }
+    const taskProjects=new Set([...projects.keys(),...[...heads.values()].filter(head=>head.contract===TASK_ADDITIVE_INITIAL_PLAN).map(head=>head.projectId)]);
+    for(const projectId of taskProjects)if(inScope(projectId)&&taskRules.isProtocol(projectId)&&!births.has(projectId)){
+     let projectionOk=false;
+     try{projectionOk=projectionVerified(projectId)&&protocolDigest(readInitialPlanActivityProjection(projects.get(projectId)))===protocolDigest(readInitialPlanActivityProjection(oldProject(projectId)));}
+     catch(error){if(!semanticFailure(error))throw error;}
+     taskRules.stage(projectId,candidates,birthIds,projectionOk);
+    }
+    const dispatchChanges=dispatchBirths.stage(scope,birthIds);
+    dispatchPlans.stage(scope,birthIds,dispatchChanges);
+    dispatchOperations.stage(scope,birthIds,candidates);
+    return {freeze:payload=>backend.freeze(preparing?{...payload,requiredWriterProfile:preparing}:payload,{birthIds,profilePreparation:preparing,requiredRows:dispatchOperations.requiredRows(scope),runtimeChecks:dispatchOperations.runtimeChecks(scope)}),commit:clear,rollback};
+   }catch(error){rollback(error);throw error;}
+  },
+ });
+}

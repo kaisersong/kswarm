@@ -24,7 +24,7 @@ function createActiveProject(hub, id = 'proj-task-workflow') {
   const added = hub.handleHumanAddTasks(id, [
     { title: '生成客户分析报告', description: '需要有事实依据和复核结论', assignedAgent: 'xiaok-worker', acceptanceCriteria: '需要有事实依据和复核结论', requiredOutputs: ['markdown'] },
     { title: '整理引用材料', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   const approved = hub.handleApprove(id);
   assert.equal(approved.ok, true);

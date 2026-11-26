@@ -56,6 +56,52 @@ export function createEventLog({
   let logDirReady = false;
   let ready = false;
   const readyCbs = [];
+  let sealed = false;
+  let closing = null;
+  const streams = new Map();
+  const writerErrors = new Set();
+  const readyNotifications = new Set();
+
+  function warn(message, error) {
+    if (!silent) { try { console.warn(`[event-log] ${message}: ${error?.message || error}`); } catch { /* diagnostics cannot interrupt drain */ } }
+  }
+  function writerFailed(error, message) {
+    writerErrors.add(error);
+    warn(message, error);
+  }
+  function trackStream(stream) {
+    let resolveClosed;
+    const record = { stream, ending: false, closed: new Promise(resolve => { resolveClosed = resolve; }) };
+    streams.set(stream, record);
+    stream.on('error', error => writerFailed(error, 'write stream error'));
+    stream.once('close', () => {
+      streams.delete(stream);
+      if (fileStream === stream) fileStream = null;
+      resolveClosed();
+    });
+    return stream;
+  }
+  function endStream(stream) {
+    const record = streams.get(stream);
+    if (!record || record.ending) return;
+    record.ending = true;
+    try { stream.end(); }
+    catch (error) {
+      writerFailed(error, 'stream end failed');
+      try { stream.destroy(); } catch (destroyError) { writerFailed(destroyError, 'stream destroy failed'); }
+    }
+  }
+  function invokeReady(cb) {
+    try {
+      // onReady is a synchronous notification. Arbitrary returned async work
+      // is not a writer owned by this log (and may itself return close()).
+      const result = cb();
+      if (result && typeof result.then === 'function') {
+        void Promise.resolve(result).catch(error => warn('async onReady callback failed', error));
+      }
+    } catch (error) { warn('onReady callback threw', error); }
+  }
+
 
   const normalizedReplayDays = Math.max(1, Math.floor(Number(replayDays) || 0) || DEFAULT_REPLAY_DAYS);
 
@@ -180,16 +226,13 @@ export function createEventLog({
     const day = dayKey();
     if (day === currentDay && fileStream) return;
     if (fileStream) {
-      try { fileStream.end(); } catch { /* ignore */ }
+      endStream(fileStream);
     }
     currentDay = day;
     try {
-      fileStream = createWriteStream(join(logDir, `kswarm-${day}.ndjson`), { flags: 'a' });
-      fileStream.on('error', (err) => {
-        if (!silent) console.warn(`[event-log] write stream error: ${err.message}`);
-      });
+      fileStream = trackStream(createWriteStream(join(logDir, `kswarm-${day}.ndjson`), { flags: 'a' }));
     } catch (err) {
-      if (!silent) console.warn(`[event-log] failed to open ${day} stream: ${err.message}`);
+      writerFailed(err, `failed to open ${day} stream`);
       fileStream = null;
     }
   }
@@ -236,6 +279,7 @@ export function createEventLog({
 
   // ── Public API ────────────────────────────────────────────────────────
   function emit(type, payload = {}) {
+    if (sealed) throw Error('event_log_closed');
     let event = {
       ts: new Date().toISOString(),
       seq: nextSeq++,
@@ -252,7 +296,7 @@ export function createEventLog({
         try {
           fileStream.write(JSON.stringify(event) + '\n');
         } catch (err) {
-          if (!silent) console.warn(`[event-log] write failed: ${err.message}`);
+          writerFailed(err, 'write failed');
         }
       }
     }
@@ -298,31 +342,43 @@ export function createEventLog({
   }
 
   function close() {
-    if (!fileStream) return Promise.resolve();
-    const stream = fileStream;
-    fileStream = null;
-    return new Promise((resolve) => {
-      try {
-        stream.end(() => resolve());
-      } catch {
-        resolve();
-      }
+    if (closing) return closing;
+    sealed = true;
+    // Publish before replay callbacks or stream methods can reenter close.
+    closing = Promise.resolve().then(async () => {
+      await replayWork;
+      await Promise.all([...readyNotifications]);
+      const admitted = [...streams.values()];
+      for (const record of admitted) endStream(record.stream);
+      await Promise.all(admitted.map(record => record.closed));
+      if (writerErrors.size) throw new AggregateError([...writerErrors], 'event_log_close_unconfirmed');
     });
+    // Legacy callers may ignore close; retain its rejection without emitting an
+    // unrelated unhandled rejection. Awaiting callers receive the same failure.
+    void closing.catch(() => {});
+    return closing;
   }
 
   function isReady() { return ready; }
 
   function onReady(cb) {
+    if (sealed) throw Error('event_log_closed');
     if (ready) {
       // Defer to next tick so callers can wire up before the callback fires.
-      queueMicrotask(() => cb());
+      let done;
+      const notification = new Promise(resolve => { done = resolve; });
+      readyNotifications.add(notification);
+      queueMicrotask(() => {
+        try { invokeReady(cb); }
+        finally { readyNotifications.delete(notification); done(); }
+      });
       return;
     }
     readyCbs.push(cb);
   }
 
   // ── Kick off async replay ─────────────────────────────────────────────
-  (async () => {
+  const replayWork = (async () => {
     try {
       const { restored, maxSeq } = await replay();
 
@@ -344,11 +400,7 @@ export function createEventLog({
     } finally {
       ready = true;
       const cbs = readyCbs.splice(0, readyCbs.length);
-      for (const cb of cbs) {
-        try { cb(); } catch (err) {
-          if (!silent) console.warn(`[event-log] onReady callback threw: ${err.message}`);
-        }
-      }
+      for (const cb of cbs) invokeReady(cb);
     }
   })();
 

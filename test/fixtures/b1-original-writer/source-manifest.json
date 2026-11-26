@@ -1,0 +1,25 @@
+{
+  "note": "Exact B1 bytes after 61421193 Qoder component approval, before B2 migration; test-only actual old writer.",
+  "files": [
+    {
+      "source": "src/core/sqlite-persistence.js",
+      "sha256": "12bcf9a473fe65183cfb7ed157da29533fea7fde15091afa6717373f416bbc16"
+    },
+    {
+      "source": "src/core/state-scope.js",
+      "sha256": "cff945a47e32c3011f479512233c623950ffb3f606d5f34b9a57f269552d3a80"
+    },
+    {
+      "source": "src/core/sqlite-writer-floor.js",
+      "sha256": "9db5a112496475abc9815158e5f2516a1baffbb8ef9e34f597b73308bce15377"
+    },
+    {
+      "source": "src/core/initial-plan-write-fence.js",
+      "sha256": "609b310d561e2706eab4993e7fa9a94d24d1593d9d2257328d48f4b7fe7bfbd3"
+    },
+    {
+      "source": "src/core/initial-plan-acceptance-contract.js",
+      "sha256": "b4ce9da0ca3ca710fb9750049f67bdbe92c38147e014e614bd7b9937acc936f8"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "purpose": "data golden only; controlled composition source/user admission; NOT actual NativeMain authority",
+  "producer": "actual compiled MainUserSubmissionOwner.captureDefaultDispatch/readDefaultDispatchAction",
+  "sourceSha256": "3c1bbc175b11141465ef0e68303daaf79cfa27e6fa72ae66b75b06be7cf92639",
+  "compiledSha256": "2a332b4e9dcbd5ae3d8c90ca1da2ccfaf7ac0713ccfd8d9d6c6e8dd5f38bdd4d",
+  "observation": {
+    "scope": {
+      "profileId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspaceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "projectId": "p",
+    "planRevision": 2,
+    "dispatchGeneration": 1,
+    "bindingDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+    "taskSetDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "fact": {
+    "projectId": "p",
+    "planRevision": 2,
+    "dispatchGeneration": 1,
+    "scope": {
+      "profileId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "workspaceId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "bindingDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+    "taskSetDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "schemaVersion": 1,
+    "kind": "default_dispatch_user_action_v1",
+    "actorId": "desktop-user:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "actionId": "main-default-dispatch:4db70721eccc5a067b050c721d532871dcc8b6011e65d72c4bb7b8c2ce1d4236",
+    "payloadHash": "8481c119f6494700cd217cc715d4adf88d9b72caa74f6a2a4f27470fa3eec1af"
+  }
+}

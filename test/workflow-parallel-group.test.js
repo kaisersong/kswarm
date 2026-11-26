@@ -21,7 +21,7 @@ function createActiveProject(hub, id = 'proj-parallel') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '复核交付物', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(id).ok, true);
   return project;

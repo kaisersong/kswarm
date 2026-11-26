@@ -23,7 +23,10 @@ export const DELETABLE_COLLECTIONS = Object.freeze([
   'reviewCondition',
 ]);
 
-export const ALL_COLLECTIONS = Object.freeze([...DELETABLE_COLLECTIONS, 'humanAction']);
+// Protocol receipts are immutable; heads advance by explicit revision CAS.
+// Neither may participate in omission-as-deletion.
+export const PROTECTED_COLLECTIONS = Object.freeze(['protocolReceipt', 'protocolHead']);
+export const ALL_COLLECTIONS = Object.freeze([...DELETABLE_COLLECTIONS, 'humanAction', ...PROTECTED_COLLECTIONS]);
 
 export const FULL_SCOPE = Object.freeze({ type: 'full' });
 
@@ -76,6 +79,12 @@ export function decomposeState(state) {
     if (!c || !c.conditionId) continue;
     entities.push({ collection: 'reviewCondition', key: c.conditionId, projectId: c.projectId ?? null, value: c });
   }
+  for (const [field, collection] of [['protocolReceipts', 'protocolReceipt'], ['protocolHeads', 'protocolHead']]) {
+    for (const record of state[field] || []) {
+      if (!record || typeof record.id !== 'string') throw new Error('protected_record_identity_invalid');
+      entities.push({ collection, key: record.id, projectId: record.projectId ?? null, value: record });
+    }
+  }
   let seq = 0;
   for (const a of state.humanActions || []) {
     if (!a || typeof a !== 'object') continue;
@@ -99,6 +108,8 @@ export function composeEntities(entities) {
     reviewGateDecisions: [],
     reviewConditions: [],
     humanActions: [],
+    protocolReceipts: [],
+    protocolHeads: [],
   };
   for (const e of entities || []) {
     switch (e.collection) {
@@ -110,6 +121,8 @@ export function composeEntities(entities) {
       case 'reviewGateDecision': state.reviewGateDecisions.push(e.value); break;
       case 'reviewCondition': state.reviewConditions.push(e.value); break;
       case 'humanAction': state.humanActions.push(e.value); break;
+      case 'protocolReceipt': state.protocolReceipts.push(e.value); break;
+      case 'protocolHead': state.protocolHeads.push(e.value); break;
       default: break;
     }
   }

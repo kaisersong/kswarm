@@ -25,7 +25,7 @@ function createActiveProject(hub, { id = 'proj-execution-mode', executionMode = 
   });
   const added = hub.handleHumanAddTasks(id, tasks || [
     { title: '最终报告复核', description: '交付前做质量复核', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   const approved = hub.handleApprove(id);
   assert.equal(approved.ok, true);

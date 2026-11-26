@@ -1,0 +1,23 @@
+{
+  "kind": "unpublished-runtime6-pre-admission-original-source",
+  "reviewBundleSha256": "427eaca29366e7c26d80808a25089c815b792926c84c56e26920ce840e7a9d26",
+  "notReleasedBinary": true,
+  "relocationOnlyWhenLoaded": true,
+  "files": [
+    {
+      "source": "src/core/initial-plan-acceptance-contract.js",
+      "fixture": "initial-plan-acceptance-contract.js.original.txt",
+      "sha256": "3fda0cb28dc51adb95140bbd6f2befa210f92815a3a4655d0ee01088f8c0193d"
+    },
+    {
+      "source": "src/core/sqlite-writer-floor.js",
+      "fixture": "sqlite-writer-floor.js.original.txt",
+      "sha256": "c8457202a0f399982a7a9a205b9132547604f3d74fafd1172a97535f7d410342"
+    },
+    {
+      "source": "src/core/default-dispatch-runtime-data.js",
+      "fixture": "default-dispatch-runtime-data.js.original.txt",
+      "sha256": "e92875c3cf5257d6822dc05b5c00fcff321b4bced96e6f003df604b5ddf1b0f5"
+    }
+  ]
+}

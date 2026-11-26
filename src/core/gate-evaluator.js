@@ -20,6 +20,17 @@
  */
 
 import { countOpenBlockingConditions } from './review-condition.js';
+import {IntrinsicMap,IntrinsicSet} from './intrinsic-collections.js';
+import {types as dependencyTypes} from 'node:util';
+// Dependency admission uses the same evaluator after original source SDKs.
+// Keep its local failure accounting independent of late prototype hooks.
+const dependencyIsArray=Array.isArray,dependencyOwn=Object.hasOwn,dependencyDefine=Object.defineProperty,dependencyDescriptor=Object.getOwnPropertyDescriptor,dependencyCreate=Object.create,dependencyProxy=dependencyTypes.isProxy;
+const dependencyTrim=Function.prototype.call.bind(String.prototype.trim),dependencyParseTime=Date.parse,dependencyFinite=Number.isFinite;
+const dependencyAppend=(array,value)=>dependencyDefine(array,array.length,{__proto__:null,value,writable:true,configurable:true,enumerable:true});
+function dependencyValue(raw,key){if(!raw||typeof raw!=='object'||dependencyProxy(raw))return undefined;const row=dependencyDescriptor(raw,key);return row&&dependencyOwn(row,'value')?row.value:undefined;}
+function dependencyRecord(raw,names){if(!raw||typeof raw!=='object'||dependencyIsArray(raw)||dependencyProxy(raw))return null;const out=dependencyCreate(null);for(let i=0;i<names.length;i++)dependencyDefine(out,names[i],{__proto__:null,value:dependencyValue(raw,names[i]),enumerable:true});return out;}
+
+
 
 /**
  * @typedef {'completed'|'completed_for_remediation'|'verified_pass'} DependencyPolicy
@@ -74,69 +85,73 @@ export function evaluateDependencySatisfaction({
     return { ok: false, blockedDependencies: [{ dependencyTaskId: null, reason: 'task_required' }] };
   }
 
-  const dependencyTaskMap = new Map(dependencyTasks.map(dep => [dep.id, dep]));
-  const dependencyIds = Array.isArray(task.dependencies) ? task.dependencies : [];
+  const dependencyTaskMap = new IntrinsicMap();
+  for(let i=0;i<dependencyTasks.length;i++){const dep=dependencyTasks[i];dependencyTaskMap.set(dep.id,dep);}
+  const dependencyIds = dependencyIsArray(task.dependencies) ? task.dependencies : [];
   const blockedDependencies = [];
 
-  for (const dependencyTaskId of dependencyIds) {
+  for (let dependencyIndex=0;dependencyIndex<dependencyIds.length;dependencyIndex++) {
+    const dependencyTaskId=dependencyIds[dependencyIndex];
     const dep = dependencyTaskMap.get(dependencyTaskId);
     if (!dep) {
-      blockedDependencies.push({ dependencyTaskId, reason: 'dependency_task_not_found' });
+      dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'dependency_task_not_found' });
       continue;
     }
 
-    const policy = dependencyPolicies[dependencyTaskId];
+    const policy = dependencyValue(dependencyPolicies,dependencyTaskId);
 
     if (!policy) {
       if (schemaV2) {
-        blockedDependencies.push({ dependencyTaskId, reason: 'dependency_policy_missing' });
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'dependency_policy_missing' });
         continue;
       }
-      if (dep.status !== 'done') {
-        blockedDependencies.push({ dependencyTaskId, reason: 'dependency_not_completed' });
+      if (dependencyValue(dep,'status') !== 'done') {
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'dependency_not_completed' });
       }
       continue;
     }
 
     if (policy === 'completed' || policy === 'completed_for_remediation') {
-      if (dep.status !== 'done') {
-        blockedDependencies.push({ dependencyTaskId, reason: 'dependency_not_completed' });
+      if (dependencyValue(dep,'status') !== 'done') {
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'dependency_not_completed' });
       }
       continue;
     }
 
     if (policy === 'verified_pass') {
-      if (dep.status !== 'done') {
-        blockedDependencies.push({ dependencyTaskId, reason: 'dependency_not_completed' });
+      if (dependencyValue(dep,'status') !== 'done') {
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'dependency_not_completed' });
         continue;
       }
       if (!schemaV2) continue;
 
-      if (!Object.prototype.hasOwnProperty.call(consumedArtifactIdsByDependencyTaskId, dependencyTaskId)) {
-        blockedDependencies.push({ dependencyTaskId, reason: 'consumed_artifacts_missing' });
+      if (!dependencyOwn(consumedArtifactIdsByDependencyTaskId, dependencyTaskId)) {
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'consumed_artifacts_missing' });
         continue;
       }
-      const consumedArtifactIds = consumedArtifactIdsByDependencyTaskId[dependencyTaskId];
+      const consumedArtifactIds = dependencyValue(consumedArtifactIdsByDependencyTaskId,dependencyTaskId);
       if (!isUniqueNonEmptyStringArray(consumedArtifactIds)) {
-        blockedDependencies.push({ dependencyTaskId, reason: 'consumed_artifacts_invalid' });
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'consumed_artifacts_invalid' });
         continue;
       }
 
-      const currentFacts = currentGateFactsByTaskId[dependencyTaskId];
+      const currentFacts = dependencyValue(currentGateFactsByTaskId,dependencyTaskId);
       const currentFactsError = validateCurrentGateFacts(currentFacts, dependencyTaskId);
       if (currentFactsError) {
-        blockedDependencies.push({ dependencyTaskId, reason: currentFactsError });
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: currentFactsError });
         continue;
       }
 
-      const evaluations = gateEvaluationsByTaskId[dependencyTaskId];
-      if (evaluations !== undefined && !Array.isArray(evaluations)) {
-        blockedDependencies.push({ dependencyTaskId, reason: 'gate_evaluations_invalid' });
+      const evaluations = dependencyValue(gateEvaluationsByTaskId,dependencyTaskId);
+      if (evaluations !== undefined && !dependencyIsArray(evaluations)) {
+        dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'gate_evaluations_invalid' });
         continue;
       }
       let firstFailure = 'no_fresh_passed_evaluation';
       let satisfied = false;
-      for (const evaluation of evaluations || []) {
+      const candidates=evaluations||[];
+      for (let evaluationIndex=0;evaluationIndex<candidates.length;evaluationIndex++) {
+        const evaluation=candidates[evaluationIndex];
         const failure = validateEvaluationCandidate(evaluation, currentFacts, consumedArtifactIds);
         if (!failure) {
           satisfied = true;
@@ -146,31 +161,32 @@ export function evaluateDependencySatisfaction({
           firstFailure = failure;
         }
       }
-      if (!satisfied) blockedDependencies.push({ dependencyTaskId, reason: firstFailure });
+      if (!satisfied) dependencyAppend(blockedDependencies, { dependencyTaskId, reason: firstFailure });
       continue;
     }
 
-    blockedDependencies.push({ dependencyTaskId, reason: 'unknown_dependency_policy' });
+    dependencyAppend(blockedDependencies, { dependencyTaskId, reason: 'unknown_dependency_policy' });
   }
 
   return { ok: blockedDependencies.length === 0, blockedDependencies };
 }
 
 function validateCurrentGateFacts(facts, dependencyTaskId) {
-  if (!facts || typeof facts !== 'object' || Array.isArray(facts)) return 'current_gate_facts_missing';
+  facts=dependencyRecord(facts,['sourceRunId','evaluationSourceArtifact','canonicalArtifacts']);
+  if (!facts || typeof facts !== 'object' || dependencyIsArray(facts)) return 'current_gate_facts_missing';
   if (!isNonEmptyString(facts.sourceRunId)) return 'current_source_run_id_missing';
   if (!facts.evaluationSourceArtifact || !isArtifactIdentity(facts.evaluationSourceArtifact)) {
     return 'current_evaluation_source_artifact_missing';
   }
   if (!isUniqueArtifactIdentityArray(facts.canonicalArtifacts)) return 'current_canonical_artifacts_invalid';
-  if (facts.canonicalArtifacts.some(artifact => artifact.taskId !== dependencyTaskId)) {
-    return 'current_canonical_artifacts_invalid';
-  }
+  for(let i=0;i<facts.canonicalArtifacts.length;i++)if(dependencyValue(facts.canonicalArtifacts[i],'taskId')!==dependencyTaskId)return 'current_canonical_artifacts_invalid';
   return null;
 }
 
 function validateEvaluationCandidate(evaluation, facts, consumedArtifactIds) {
-  if (!evaluation || typeof evaluation !== 'object' || Array.isArray(evaluation) || evaluation.verdict !== 'passed') {
+  evaluation=dependencyRecord(evaluation,['verdict','schemaVersion','reasonCode','findingIds','conditionIds','createdAt','evaluator','sourceRunId','sourceArtifactId','sourceArtifactSha256','subjectArtifacts']);
+  facts=dependencyRecord(facts,['sourceRunId','evaluationSourceArtifact','canonicalArtifacts']);
+  if (!evaluation || typeof evaluation !== 'object' || dependencyIsArray(evaluation) || evaluation.verdict !== 'passed') {
     return 'evaluation_verdict_not_passed';
   }
   if (evaluation.schemaVersion !== 'gate-evaluation-v1') return 'evaluation_schema_invalid';
@@ -195,12 +211,16 @@ function validateEvaluationCandidate(evaluation, facts, consumedArtifactIds) {
     return 'evaluation_subject_artifacts_invalid';
   }
 
-  const canonicalById = new Map(facts.canonicalArtifacts.map(artifact => [artifact.artifactId, artifact.sha256]));
-  for (const subject of evaluation.subjectArtifacts) {
+  const canonicalById = new IntrinsicMap();
+  for(let i=0;i<facts.canonicalArtifacts.length;i++){const artifact=facts.canonicalArtifacts[i];canonicalById.set(artifact.artifactId,artifact.sha256);}
+  for (let i=0;i<evaluation.subjectArtifacts.length;i++) {
+    const subject=evaluation.subjectArtifacts[i];
     if (canonicalById.get(subject.artifactId) !== subject.sha256) return 'evaluation_subject_artifact_stale';
   }
-  const subjectsById = new Map(evaluation.subjectArtifacts.map(artifact => [artifact.artifactId, artifact.sha256]));
-  for (const artifactId of consumedArtifactIds) {
+  const subjectsById = new IntrinsicMap();
+  for(let i=0;i<evaluation.subjectArtifacts.length;i++){const artifact=evaluation.subjectArtifacts[i];subjectsById.set(artifact.artifactId,artifact.sha256);}
+  for (let i=0;i<consumedArtifactIds.length;i++) {
+    const artifactId=consumedArtifactIds[i];
     const currentHash = canonicalById.get(artifactId);
     if (!currentHash) return 'consumed_artifact_not_current';
     if (subjectsById.get(artifactId) !== currentHash) return 'consumed_artifact_not_covered';
@@ -209,19 +229,21 @@ function validateEvaluationCandidate(evaluation, facts, consumedArtifactIds) {
 }
 
 function isValidEvaluator(evaluator) {
-  if (!evaluator || typeof evaluator !== 'object' || Array.isArray(evaluator)) return false;
+  evaluator=dependencyRecord(evaluator,['participantId','role','independence','runnerId','modelFamily']);
+  if (!evaluator || typeof evaluator !== 'object' || dependencyIsArray(evaluator)) return false;
   if (!isNonEmptyString(evaluator.participantId)) return false;
-  if (!['independent_reviewer', 'deterministic_verifier'].includes(evaluator.role)) return false;
-  if (!['independent', 'degraded'].includes(evaluator.independence)) return false;
+  if (evaluator.role!=='independent_reviewer'&&evaluator.role!=='deterministic_verifier') return false;
+  if (evaluator.independence!=='independent'&&evaluator.independence!=='degraded') return false;
   if (evaluator.runnerId !== undefined && !isNonEmptyString(evaluator.runnerId)) return false;
   if (evaluator.modelFamily !== undefined && !isNonEmptyString(evaluator.modelFamily)) return false;
   return true;
 }
 
 function isUniqueArtifactIdentityArray(value) {
-  if (!Array.isArray(value)) return false;
-  const ids = new Set();
-  for (const artifact of value) {
+  if (!dependencyIsArray(value)) return false;
+  const ids = new IntrinsicSet();
+  for (let i=0;i<value.length;i++) {
+    const artifact=value[i];
     if (!isArtifactIdentity(artifact) || ids.has(artifact.artifactId)) return false;
     ids.add(artifact.artifactId);
   }
@@ -229,25 +251,27 @@ function isUniqueArtifactIdentityArray(value) {
 }
 
 function isUniqueNonEmptyStringArray(value) {
-  if (!Array.isArray(value)) return false;
-  const values = new Set();
-  for (const item of value) {
-    if (!isNonEmptyString(item) || item !== item.trim() || values.has(item)) return false;
+  if (!dependencyIsArray(value)) return false;
+  const values = new IntrinsicSet();
+  for (let i=0;i<value.length;i++) {
+    const item=value[i];
+    if (!isNonEmptyString(item) || item !== dependencyTrim(item) || values.has(item)) return false;
     values.add(item);
   }
   return true;
 }
 
 function isIsoTimestamp(value) {
-  return isNonEmptyString(value) && Number.isFinite(Date.parse(value));
+  return isNonEmptyString(value) && dependencyFinite(dependencyParseTime(value));
 }
 
 function isArtifactIdentity(value) {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && isNonEmptyString(value.artifactId) && isNonEmptyString(value.sha256));
+  value=dependencyRecord(value,['artifactId','sha256']);
+  return !!(value && typeof value === 'object' && !dependencyIsArray(value) && isNonEmptyString(value.artifactId) && isNonEmptyString(value.sha256));
 }
 
 function isNonEmptyString(value) {
-  return typeof value === 'string' && value.trim().length > 0;
+  return typeof value === 'string' && dependencyTrim(value).length > 0;
 }
 
 /**

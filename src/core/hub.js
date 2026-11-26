@@ -1,3 +1,14 @@
+import {readOriginalTaskDeliveryOwnerBirth,originalTaskDeliveryOwnerMatchesBinding} from './original-task-delivery-owner.js';
+import {originalPreparationClientMatchesSource,assertOriginalPreparationTransportCurrent,readOriginalPreparationTransportCompletion} from './original-preparation-transport.js';
+import {captureDispatchBusinessData} from './dispatch-business-data.js';
+import {HUB_PRODUCER_REGISTRATION,readHubProducerDescriptor} from './hub-producer-registration.js';
+import {IntrinsicMap,IntrinsicWeakMap,IntrinsicSet} from './intrinsic-collections.js';
+import {captureObservationRow,captureObservationRows,captureObservationComposite} from './observation-data.js';
+import {isOriginalWatchdog,consumeWatchdogDecision,applyWatchdogTimeout} from './watchdog.js';
+import {createHubMigrationBoundary} from './hub-migration-boundary.js';
+import {captureExecutionData} from './task-execution-content.js';
+import {taskDependencyGateView} from './task-dependency-gate-context.js';
+import {stageProjectDeliveryAttention,markProjectDeliveryUnqualified,assertProjectDeliveryWriteSet,projectDeliveryWriteWitness} from './project-activity-delivery.js';
 /**
  * Hub — KSwarm 的核心引擎
  *
@@ -12,7 +23,7 @@
  * - 即使所有任务 done，项目仍是 active 直到 Human 关闭
  */
 
-import { createTaskBoard, restoreTaskBoard } from './task-board.js';
+import { createTaskBoard, restoreTaskBoard, readTaskBoardSnapshot, taskBoardPlanProgress, transitionOriginalTaskBoard, captureOriginalTaskBoardTask, resumeOriginalTaskBoard } from './task-board.js';
 import { projectActivitySnapshot, createProjectActivityCandidate, ProjectActivityReservations, activityMutationCriticalBudget, PROJECT_ACTIVITY_FIELDS, readProjectActivity } from './project-activity.js';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -20,10 +31,16 @@ import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEventLog } from './event-log.js';
-import { createPersistence, PersistenceCommitError } from './persistence.js';
-import { resolveMutationScope, FULL_SCOPE } from './state-scope.js';
+import { createPersistence, PersistenceCommitError, bindJsonPersistenceWriteVerifier } from './persistence.js';
+import { resolveMutationScope, FULL_SCOPE, decomposeState } from './state-scope.js';
 import { randomUUID } from 'node:crypto';
 import { createProjectInstanceId } from './project-id.js';
+import { createOrdinaryProtocolRecords, projectProtocolIds, readProjectProtocolBinding, protocolDigest, isProjectProtocolScope } from './project-protocol.js';
+import {resolveProjectInputAuthority} from './project-input-authority.js';
+import {types as utilTypes} from 'node:util';
+import {createInitialPlanAcceptanceOwner} from './initial-plan-acceptance-owner.js';
+import {ADDITIVE_INITIAL_PLAN,TASK_ADDITIVE_INITIAL_PLAN,isAcceptanceRecord} from './initial-plan-acceptance-contract.js';
+import {createOrdinaryProjectInputs,initialPlanReservationId} from './ordinary-project-inputs.js';
 import * as retryStrategy from './retry-strategy.js';
 import { expandCompositeTasks } from './composite-task-expander.js';
 import { validateNodePermissions } from './workflow-node-permissions.js';
@@ -45,7 +62,7 @@ import { normalizeTaskGraphPolicies, applyTaskGraphPolicyWrites } from './task-g
 import { deriveRiskFloor, resolveEffectiveRiskProfile } from './risk-floor.js';
 import { inferTaskRequirements } from './task-requirements.js';
 import { validateDeliverableContract } from './deliverable-contract.js';
-import { normalizeProjectForPlanRetry } from './plan-retry-recovery.js';
+import { normalizeProjectForPlanRetry, resolvePlanRetryPoAgent } from './plan-retry-recovery.js';
 import { createTaskHandoffPackage } from './handoff-package.js';
 import { validateMappingPayload, validateWorkspaceClaim, workspaceDigest } from './room-workspace.js';
 import { deriveProjectPreparation } from './agent-readiness.js';
@@ -105,8 +122,55 @@ import { reconcileProjectAgentSelectionWithEffectiveAgents } from './agent-selec
 
 const TASK_LEVEL_WORKER_FAILURE_CLASSES = new Set(['model_empty_output', 'quality_evidence_missing', 'source_provider_unavailable']);
 const WORKFLOW_AGENT_CAPABILITIES = ['project_diagnosis', 'review_gate', 'writing', 'report_generation'];
+const transportFreeze=Object.freeze,transportCreate=Object.create,transportDefine=Object.defineProperty,transportDescriptors=Object.getOwnPropertyDescriptors,transportKeys=Reflect.ownKeys,transportOwn=Object.hasOwn;
+const TransportPromise=Promise,transportThen=Promise.prototype.then,transportApply=Reflect.apply,transportDescriptor=Object.getOwnPropertyDescriptor,transportPrototype=Object.getPrototypeOf;
+const transportPromisePrototype=Promise.prototype,transportSpecies=transportDescriptor(Promise,Symbol.species),transportIsPromise=utilTypes.isPromise,transportIsProxy=utilTypes.isProxy;
+const transportExec=Function.prototype.call.bind(RegExp.prototype.exec);
+function transportPromiseEnvironment(){
+ const ctor=transportDescriptor(transportPromisePrototype,'constructor'),species=transportDescriptor(TransportPromise,Symbol.species);
+ return !!ctor&&transportOwn(ctor,'value')&&ctor.value===TransportPromise&&!!species&&!!transportSpecies&&!transportOwn(species,'value')&&species.get===transportSpecies.get&&species.set===transportSpecies.set;
+}
+function transportStandardCompletion(raw){return transportIsPromise(raw)&&!transportIsProxy(raw)&&transportPrototype(raw)===transportPromisePrototype&&!transportDescriptor(raw,'then')&&!transportDescriptor(raw,'constructor')&&transportPromiseEnvironment();}
+function freezeTransportData(value){
+ if(value&&typeof value==='object'){const rows=transportDescriptors(value),names=transportKeys(rows);for(let i=0;i<names.length;i++)if(transportOwn(rows[names[i]],'value'))freezeTransportData(rows[names[i]].value);transportFreeze(value);}return value;
+}
 
-export function createHub({ bridge, eventLogDir, silent = false, dataDir, projectStorageRoot = null, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null, brokerClient = null } = {}) {
+const serverSchedulerOwners=new WeakMap();
+const dispatchBusinessOwners=new IntrinsicWeakMap();
+const dshBusinessOwners=new IntrinsicWeakMap();
+const hubProducerSurfaces=new IntrinsicWeakMap();
+/** Fixed original constructor surface, metadata only. No caller key or
+ * descriptor can mint a producer/Source capability. */
+export function readOriginalHubProducerSurface(hub){const row=hubProducerSurfaces.get(hub);if(!row)throw Error('HUB_ORIGINAL_PRODUCER_SURFACE_REQUIRED');return row;}
+const dispatchPreparationOwners=new IntrinsicWeakMap();
+/** Original composition only: the exact Hub and its constructor source must
+ * match before any candidate property is inspected. No operation setter. */
+export function bindHubDefaultDispatchBusiness(hub,source){
+ const entry=dispatchBusinessOwners.get(hub);if(!entry||entry.source!==source)throw Error('BUSINESS_HUB_OWNER_REQUIRED');return entry.ports;
+}
+/** Independent DSH lane: exact constructor Sources, no caller operation table. */
+export function bindHubDshBusiness(hub,source,budgetSource){
+ const entry=dshBusinessOwners.get(hub);
+ if(!entry||!source||!budgetSource||entry.source!==source||entry.budgetSource!==budgetSource)throw Error('DSH_BUSINESS_HUB_OWNER_REQUIRED');
+ return entry.ports;
+}
+/** One original composition binding, after the original scheduler/client pin.
+ * It connects fixed ports, never a supplied operation table or verifier. */
+export function bindHubDefaultDispatchPreparation(hub,source,owner,actor,client){
+ const entry=dispatchPreparationOwners.get(hub);
+ if(!entry||!entry.source||entry.source!==source)throw Error('PREPARATION_HUB_OWNER_REQUIRED');
+ if(!entry.bind)throw Error('DEFAULT_DISPATCH_PREPARATION_UNAVAILABLE');
+ return entry.bind(owner,actor,client);
+}
+const dshDescriptor=Object.getOwnPropertyDescriptor,dshOwn=Object.hasOwn,dshMapGet=Function.prototype.call.bind(Map.prototype.get);
+const dshStartsWith=Function.prototype.call.bind(String.prototype.startsWith);
+const agentReferenceMapGet=Function.prototype.call.bind(Map.prototype.get),agentReferenceMapEntries=Function.prototype.call.bind(Map.prototype.entries);
+const agentReferenceMapSize=Function.prototype.call.bind(Object.getOwnPropertyDescriptor(Map.prototype,'size').get);
+const agentReferenceMapNext=Function.prototype.call.bind(Object.getPrototypeOf(new Map().entries()).next);
+/** One original composition binding. Never exported through HTTP/model tools. */
+export function bindHubServerScheduler(hub){const bind=serverSchedulerOwners.get(hub);if(!bind)throw Error('SERVER_SCHEDULER_OWNER_REQUIRED');return bind();}
+
+export function createHub({ bridge, eventLogDir, silent = false, dataDir, projectStorageRoot = null, persistence: injectedPersistence = null, getAgentProfiles = null, getQualityOverlays = null, runtimeInstanceAllocator = null, brokerClient = null, defaultDispatchActionSource = null, defaultDispatchPreparationSource = null, dshBusinessSource = null, dshBudgetSource = null } = {}) {
   const projects = new Map();
   const boards = new Map();
   const workflowRuns = new Map();
@@ -114,14 +178,36 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   const finalDeliverables = new Map();
   const reviewGateDecisions = new Map();
   const reviewConditions = new Map();
+  const protocolReceipts = new IntrinsicMap();
+  const protocolHeads = new IntrinsicMap();
+  const pendingCreateAssignments = new WeakMap();
+  const hasPendingCreateAssignment=pendingCreateAssignments.has.bind(pendingCreateAssignments),readPendingCreateAssignment=pendingCreateAssignments.get.bind(pendingCreateAssignments),dropPendingCreateAssignment=pendingCreateAssignments.delete.bind(pendingCreateAssignments);
+  const validatedCreate = Symbol('owner-validated-project-create');
+  const initialPlanWriteContexts=new WeakSet();
+  const ordinaryTerminalAuthority=Object.freeze(Object.create(null));
+  const ordinaryTransactions=new IntrinsicMap();
+  const preparationSendRows=new IntrinsicSet();
+  const deliveryAdmissionFailures=new WeakSet(),markDeliveryAdmissionFailure=deliveryAdmissionFailures.add.bind(deliveryAdmissionFailures),isDeliveryAdmissionFailure=deliveryAdmissionFailures.has.bind(deliveryAdmissionFailures);
+  // Data-only response preparation. These private marks never grant authority.
+  const planningResponseInputs=new WeakSet(),planningClosedResponses=new WeakSet(),planningResponseFrames=new WeakMap();
+  const isPlanningResponseInput=planningResponseInputs.has.bind(planningResponseInputs),notePlanningResponseInput=planningResponseInputs.add.bind(planningResponseInputs);
+  const isClosedPlanningResponse=planningClosedResponses.has.bind(planningClosedResponses),noteClosedPlanningResponse=planningClosedResponses.add.bind(planningClosedResponses);
+  const readPlanningResponseFrame=planningResponseFrames.get.bind(planningResponseFrames),storePlanningResponseFrame=planningResponseFrames.set.bind(planningResponseFrames),dropPlanningResponseFrame=planningResponseFrames.delete.bind(planningResponseFrames);
+  function closePlanningResponse(value){
+    if(isClosedPlanningResponse(value))return value;
+    const closed=captureExecutionData(value);if(closed&&typeof closed==='object')noteClosedPlanningResponse(closed);return closed;
+  }
   const eventLog = createEventLog({ logDir: eventLogDir, silent });
   const activityContext = new AsyncLocalStorage();
   const activityReservations = new ProjectActivityReservations();
   const emitDiagnostic = eventLog.emit;
+  const readOriginalEventData=eventLog.getEvents.bind(eventLog);
   eventLog.emit = (type, payload = {}) => {
     // Capture business emission arguments, never replayed diagnostic log lines.
     const context = activityContext.getStore();
     if (context?.active && typeof payload.projectId === 'string') context.events.push({ type, payload });
+    const transaction=ordinaryTransactions.get(payload.projectId);
+    if(transaction){transaction.diagnostics.push({type,payload:structuredClone(payload)});return {type,...payload};}
     return emitDiagnostic(type, payload);
   };
   const committedActivities = new Map();
@@ -129,6 +215,55 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   const activitySubscribers = new Set();
 
   const persistence = injectedPersistence || (dataDir ? createPersistence(dataDir) : null);
+  const jsonDeliveryWrites=bindJsonPersistenceWriteVerifier(persistence);
+  let persistenceClosed=false;
+  function migrationActor(input,roles=['desktop_control']){
+    if(!input||typeof input!=='object'||utilTypes.isProxy(input))throw Error('DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED');
+    const fields=Object.getOwnPropertyDescriptors(input);if(Object.values(fields).some(row=>!Object.hasOwn(row,'value')))throw Error('DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED');
+    const token=fields.projectInputAuthority?.value,authority=resolveProjectInputAuthority(token);
+    if(fields.requestSource?.value!=='user'||authority?.requestSource!=='user'||!roles.includes(authority.kind))throw Error('DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED');
+    return Object.freeze({requestSource:'user',projectInputAuthority:token});
+  }
+  const migrationEpochs=new Map();
+  function migrationHeapDigest(){
+    const rows=decomposeState(buildFullState());
+    return protocolDigest(rows.map(row=>[row.collection,row.key,row.projectId??null,protocolDigest(captureExecutionData(row.value))]).sort((a,b)=>JSON.stringify(a.slice(0,2)).localeCompare(JSON.stringify(b.slice(0,2)))));
+  }
+  function migrationPhysicalDigest(){return protocolDigest(acceptanceOwner.physicalRows().map(row=>[row.collection,row.key,row.projectId??null,protocolDigest(row.value)]).sort((a,b)=>JSON.stringify(a.slice(0,2)).localeCompare(JSON.stringify(b.slice(0,2)))));}
+  function assertMigrationEpoch(actor){
+    const authority=resolveProjectInputAuthority(actor.projectInputAuthority),epoch=acceptanceOwner.emptyPlanningEpoch();
+    if(!epoch)throw Error('DEFAULT_DISPATCH_MIGRATION_RECONCILIATION_REQUIRED');
+    acceptanceOwner.assertEmptyPlanningEpoch(epoch,authority);return epoch;
+  }
+  const migrationBoundary=createHubMigrationBoundary({
+    authorize:input=>{const actor=migrationActor(input),authority=resolveProjectInputAuthority(actor.projectInputAuthority);return Object.freeze({...actor,profileId:authority.profileId,workspaceId:authority.workspaceId});},assertOrigin:actor=>{assertMigrationEpoch(actor);},healthy:()=>!persistenceClosed&&getPersistenceHealth().status!=='failed',
+    assertEligible(actor){
+      if(hasUnresolvedPreparationHost())throw Error('DEFAULT_DISPATCH_MIGRATION_BUSY');
+      assertMigrationEpoch(actor);if(migrationHeapDigest()!==migrationPhysicalDigest())throw Error('DEFAULT_DISPATCH_MIGRATION_RECONCILIATION_REQUIRED');
+      for(const project of projects.values()){
+        const binding=readProjectProtocolBinding(project.id,protocolReceipts),scope=resolveProjectInputAuthority(actor.projectInputAuthority);
+        if(binding.binding?.scope?.profileId!==scope.profileId||binding.binding?.scope?.workspaceId!==scope.workspaceId||project.requestedStartPolicy!=='plan_only')throw Error('DEFAULT_DISPATCH_MIGRATION_RECONCILIATION_REQUIRED');
+        const state=acceptanceOwner.read(project.id);if(!state.ok||state.head?.state!=='committed')throw Error('DEFAULT_DISPATCH_MIGRATION_PLANNING_NOT_QUIESCENT');
+      }
+      migrationEpochs.set(actor,{epoch:acceptanceOwner.emptyPlanningEpoch(),heap:migrationHeapDigest()});
+    },
+    capture:()=>acceptanceOwner.captureTransition(),inspect:frame=>acceptanceOwner.inspectTransition(frame),transition:(frame,actor)=>acceptanceOwner.transitionDefaultDispatch(frame,actor),
+    assertCurrent(actor,observation,audience){
+      const saved=migrationEpochs.get(actor),authority=resolveProjectInputAuthority(actor.projectInputAuthority),metadata=acceptanceOwner.inspectTransition(observation),revision=getPersistenceHealth().revision;
+      if(!saved||assertMigrationEpoch(actor)!==saved.epoch||audience.scope.profileId!==authority.profileId||audience.scope.workspaceId!==authority.workspaceId||audience.snapshotDigest!==metadata.digest||![metadata.revision,metadata.revision+1].includes(revision)||migrationHeapDigest()!==saved.heap||migrationPhysicalDigest()!==saved.heap)throw Error('DEFAULT_DISPATCH_MIGRATION_SOURCE_UNAVAILABLE');
+    },
+  });
+  function hasUnresolvedPreparationHost(){
+    try{return acceptanceOwner.hasUnresolvedHostRegistration();}catch{return true;}
+  }
+  let preparationTransportCallReader,preparationTransportCandidateReader,preparationHostSettlementReader;const preparationHostRows=new IntrinsicSet();
+  const acceptanceOwner=createInitialPlanAcceptanceOwner({persistence,projects,boards,dshBusinessSource,dshBudgetSource,createDshProject:(projectId,birth)=>{const project=createProjectValidated({id:projectId,name:'DSH draft',goal:'DSH draft',poAgent:'dsh-owner',members:[],requestedStartPolicy:'plan_only',autoAssignPo:false}, {requestSource:'scheduler'},null,true);if(birth){project.createdAt=birth.createdAt;project.requiredProtocol=birth.contract;}boards.get(projectId).addTasks([{id:'draft',title:'DSH draft',brief:'Dedicated DSH draft work',assignedAgent:null}]);return project;},defaultDispatchActionSource,defaultDispatchPreparationSource,readPreparationHostRegistration:(projectId,data)=>{if(!preparationHostSettlementReader)throw Error('DURABLE_DISPATCH_HOST_SETTLEMENT_REQUIRED');return preparationHostSettlementReader(projectId,data);},readPreparationTransportCandidate:(projectId,id,digest,sourceIncarnation)=>{if(!preparationTransportCandidateReader)throw Error('DEFAULT_DISPATCH_PREPARATION_CALL_UNAVAILABLE');return preparationTransportCandidateReader(projectId,id,digest,sourceIncarnation);},inspectPreparationTransportCall:(projectId,id,digest,sourceIncarnation)=>{if(!preparationTransportCallReader)throw Error('DEFAULT_DISPATCH_PREPARATION_CALL_UNAVAILABLE');return preparationTransportCallReader(projectId,id,digest,sourceIncarnation);},isPreparationReadQuiescent:()=>!ordinaryTransactions.size&&!activityReadCommitFrame,invokeAdmissionGuard:migrationBoundary.runAdmissionGuard,retainAdmissionTail:migrationBoundary.retainGuardTail,defaultDispatchTransitionSource:migrationBoundary.source,receipts:protocolReceipts,heads:protocolHeads,
+    readBinding:projectId=>readProjectProtocolBinding(projectId,protocolReceipts),
+    related:projectId=>Object.fromEntries(Object.entries({workflowRuns,workflowProposals,finalDeliverables,reviewGateDecisions,reviewConditions}).map(([key,rows])=>[key,[...rows.values()].filter(row=>row.projectId===projectId)])),
+    persist:()=>persistState(FULL_SCOPE),prepareTasks:prepareTaskAddition,commitTasks:commitPreparedTaskAddition,
+    isHeapEmpty:()=>![projects,boards,workflowRuns,workflowProposals,finalDeliverables,reviewGateDecisions,reviewConditions,protocolReceipts,protocolHeads].some(rows=>rows.size!==0)&&humanActions.length===0,
+    isFreshPreparationQuiescent:()=>{const state=migrationBoundary.inspectState();return preparationSendRows.size===0&&preparationHostRows.size===0&&!hasUnresolvedPreparationHost()&&state.phase==='open'&&state.activeRoots===1&&state.rawTails===0&&!state.provenanceUnknown&&!state.executionAttempt;},
+  });
   const storageFile = typeof dataDir === 'string' ? dataDir : dataDir?.filePath;
   const managedProjectRoot = projectStorageRoot || (storageFile ? join(dirname(storageFile), 'projects') : join(tmpdir(), 'kswarm-managed-projects'));
   const verifiedWorkspaceCalls = new WeakSet();
@@ -174,7 +309,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     if (receipt.status === 'applied') return;
     try {
       const result=await brokerClient?.workspaceMappingApplied?.({roomId:receipt.roomId,ticketId:receipt.ticketId,operationId:receipt.operationId,projectId,payloadDigest:receipt.payloadDigest,mappingRevision:receipt.mappingRevision});
-      if (result?.ok) { receipt.status='applied';persistState({type:'project',projectId}); }
+      if (result?.ok) {const before=structuredClone(receipt);receipt.status='applied';acceptanceOwner.noteWorkspaceAck(projectId,before,receipt);persistState({type:'project',projectId}); }
     } catch { /* Durable pending receipt is retried by the same operation. */ }
   }
 
@@ -200,18 +335,31 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return {...valid,project,task};
   }
 
+  async function prepareServerTaskDelivery(projectId,taskId) {
+    const checked=recoveryExecutionAdmission(projectId,taskId,{},true);if(!checked.ok)return captureExecutionData(checked);
+    const assertCurrent=()=>{
+      try{if(migrationBoundary.inspectState().phase!=='open')throw Error('TASK_DELIVERY_ADMISSION_STALE');checked.assertCurrent();}
+      catch(error){if(error&&typeof error==='object')markDeliveryAdmissionFailure(error);throw error;}
+    };
+    assertCurrent();
+    if(checked.projectSnapshot.requiredProtocol==='room_workspace_v1'){
+      const verified=await verifyWorkspaceTask(projectId,{taskId:checked.task.id,claimId:checked.task.workspaceContext?.claimId});
+      assertCurrent();if(!verified.ok)return captureExecutionData(verified);
+      if(verified.claim.runId!==checked.task.activeRunId||verified.claim.claimId!==checked.task.workspaceContext?.claimId
+        ||verified.claim.taskId&&verified.claim.taskId!==checked.task.id)return{ok:false,error:'workspace_run_mismatch'};
+    }
+    assertCurrent();return Object.freeze({ok:true,project:checked.projectSnapshot,task:checked.task,assertCurrent});
+  }
   async function authorizeWorkspaceDelivery(projectId,taskId) {
-    const project=projects.get(projectId),task=boards.get(projectId)?.getTask(taskId);
-    if (project?.requiredProtocol !== 'room_workspace_v1') return {ok:true};
-    const checked=await verifyWorkspaceTask(projectId,{taskId,claimId:task?.workspaceContext?.claimId});
-    if (!checked.ok) return checked;
-    return checked.claim.runId === task.activeRunId ? {ok:true} : {ok:false,error:'workspace_run_mismatch'};
+    const prepared=await prepareServerTaskDelivery(projectId,taskId);if(!prepared.ok)return prepared;prepared.assertCurrent();return{ok:true};
   }
 
   async function dispatchWorkspaceTask(projectId, input = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     assertPersistenceHealthy();
     const checked=await verifyWorkspaceTask(projectId,input);
     if (!checked.ok) return checked;
+    const currentAdmission=acceptanceOwner.executionStart(projectId);if(!currentAdmission.ok)return currentAdmission;
     const {project,task,claim}=checked;
     if (selectTaskExecutionStrategy({project,task}).strategy === 'workflow') return {ok:false,error:'workspace_workflow_protocol_required'};
     if (task.activeRunId === claim.runId && task.workspaceContext?.claimId === claim.claimId) return {ok:true,reused:true,dispatched:[task.id]};
@@ -260,19 +408,22 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   // Restore state from disk. Unrecoverable load/corruption throws (never starts empty).
   if (persistence) {
     const saved = persistence.load();
+    for (const record of saved?.protocolReceipts || []) protocolReceipts.set(record.id,structuredClone(record));
+    for (const record of saved?.protocolHeads || []) protocolHeads.set(record.id,structuredClone(record));
     if (saved && saved.projects) {
       for (const p of saved.projects) {
-        if (p.requiredProtocol && p.requiredProtocol !== 'room_workspace_v1') {
+        if (p.requiredProtocol && p.requiredProtocol !== 'room_workspace_v1' && !((p.requiredProtocol==='dsh_owner_v1'||p.requiredProtocol==='dsh_owner_admission_v1')&&acceptanceOwner.dsh.active()&&acceptanceOwner.dsh.isProject(p.id))) {
           persistence.close?.();
           throw new Error(`workspace_protocol_unsupported:${p.requiredProtocol}`);
         }
-        const project = normalizeRecoveredProject(p);
+        const project = (p.requiredProtocol==='dsh_owner_v1'||p.requiredProtocol==='dsh_owner_admission_v1')?p:normalizeRecoveredProject(p);
         projects.set(project.id, project);
       }
       for (const { projectId, tasks } of (saved.boards || [])) {
         boards.set(projectId, restoreTaskBoard(tasks, projectId));
       }
       for (const run of (saved.workflowRuns || [])) {
+        // Restoration is read-only; the startup recovery mutation reconciles legacy owners.
         if (run?.id) workflowRuns.set(run.id, run);
       }
       for (const proposal of (saved.workflowProposals || [])) {
@@ -310,11 +461,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       reviewGateDecisions: [...reviewGateDecisions.values()],
       reviewConditions: [...reviewConditions.values()],
       humanActions,
+      protocolReceipts: [...protocolReceipts.values()],
+      protocolHeads: [...protocolHeads.values()],
     };
   }
 
-  function getWorkspaceProtocolBaseline() {
-    return {protocols:{room_workspace_v1:{contextVersion:1,resultVersion:1,releaseVersion:1}},workspaceBaseline:{requiredProtocols:[...new Set([...projects.values()].map(p=>p.requiredProtocol).filter(Boolean))]}};
+  function fullDeliveryRows(state){
+    const rows=[];
+    for(const project of state.projects??[])rows.push({collection:'project',key:project.id,projectId:project.id,value:project});
+    for(const board of state.boards??[])rows.push({collection:'board',projectId:board.projectId,value:board});
+    for(const [name,collection]of [['workflowRuns','workflowRun'],['finalDeliverables','finalDeliverable'],['reviewGateDecisions','reviewGateDecision'],['reviewConditions','reviewCondition']])for(const value of state[name]??[])rows.push({collection,projectId:value.projectId,value});
+    return rows;
+  }
+
+  function getWorkspaceProtocolBaseline(projectRows=projects.values()) {
+    return {protocols:{room_workspace_v1:{contextVersion:1,resultVersion:1,releaseVersion:1}},workspaceBaseline:{requiredProtocols:[...new Set([...projectRows].map(p=>p.requiredProtocol).filter(Boolean))]}};
   }
 
   // Scoped persistence accessor: materialize only the entities affected by a
@@ -344,6 +505,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     for (const c of reviewConditions.values()) {
       if (inScope(c.projectId)) entities.push({ collection: 'reviewCondition', key: c.conditionId, projectId: c.projectId ?? null, value: c });
     }
+    for (const [collection, records] of [['protocolReceipt',protocolReceipts],['protocolHead',protocolHeads]]) {
+      for (const record of records.values()) if (inScope(record.projectId)) entities.push({collection,key:record.id,projectId:record.projectId ?? null,value:record});
+    }
     const newHumanActions = humanActions.slice(persistedHumanActionCount).map(a => ({
       collection: 'humanAction', key: a.id, projectId: a.projectId ?? null, value: a,
     }));
@@ -351,7 +515,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function withActivityBudget(name, scope, action) {
-    assertPersistenceHealthy();
+    migrationBoundary.assertInternal();assertPersistenceHealthy();
     const current = activityContext.getStore();
     if (current?.active && current.reservations.has(scope.projectId)) return action();
     const budget = activityMutationCriticalBudget(name);
@@ -366,48 +530,95 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     });
   }
 
+  const projectDeliveryInputs=project=>({project,tasks:boards.get(project.id)?.getAllTasks()??[],workflowRuns:listProjectWorkflowRuns(project.id),finalDeliverables:listFinalDeliverables(project.id),reviewGateDecisions:listReviewGateDecisions(project.id),reviewConditions:listReviewConditions(project.id)});
   let activityCommitError = null;
-  function persistState(scope = FULL_SCOPE) {
+  let activityReadCommitFrame;
+  function persistState(scope = FULL_SCOPE, planningFrame) {
+    migrationBoundary.assertInternal();const previous=activityReadCommitFrame;activityReadCommitFrame=Object.freeze({});
+    try{return persistStateNow(scope,planningFrame);}finally{activityReadCommitFrame=previous;}
+  }
+  function persistStateNow(scope,planningFrame) {
     if (!persistence) return;
     assertPersistenceHealthy();
-    const affected = [...projects.values()].filter(project => scope.type === 'full' || project.id === scope.projectId);
-    const candidates = new Map();
+    const actualFull=scope.type==='full'||persistence?.getHealth?.().backend!=='sqlite';
+    const affected = [...projects.values()].filter(project => actualFull || project.id === scope.projectId);
+    const candidates = new IntrinsicMap();
+    const deliveryWriteSet = new Map();
     const previousActivityHeads = new Map(affected.map(project => [project.id, committedActivities.get(project.id)?.committedActivitySeq ?? 0]));
+    const previousDeliveries=new Map(affected.map(project=>[project.id,committedActivities.get(project.id)?.activityDeliveryHead?.recordDigest]));
+    const previousDeliveryUnavailable=new Map(affected.map(project=>[project.id,committedActivities.get(project.id)?.activityDeliveryUnavailable===true]));
     const context = activityContext.getStore();
     const eventWatermark = context?.events.length ?? 0;
+    let acceptanceStage,projectionError,projectionFailed=false;
     try {
       for (const project of affected) {
         const consumed = context?.consumed.get(project.id) ?? 0;
         const observations = (context?.events ?? []).slice(consumed, eventWatermark).filter(item => item.payload.projectId === project.id);
         const previousActivity = committedActivities.get(project.id);
-        const candidate = context?.active ? createProjectActivityCandidate(project, projectActivitySnapshot(project, boards.get(project.id)?.getAllTasks() ?? []), observations) : previousActivity ? { ...project, ...previousActivity, activityEventSeq: previousActivity.committedActivitySeq } : project;
+        const qualified=context?.active&&(scope.type==='full'||project.id===scope.projectId);
+        const candidate = qualified ? createProjectActivityCandidate(project, projectActivitySnapshot(project, boards.get(project.id)?.getAllTasks() ?? []), observations) : previousActivity ? { ...project, ...Object.fromEntries(PROJECT_ACTIVITY_FIELDS.filter(field=>Object.hasOwn(previousActivity,field)).map(field=>[field,previousActivity[field]])), activityEventSeq: previousActivity.committedActivitySeq } : project;
+        if(qualified)stageProjectDeliveryAttention(candidate,projectDeliveryInputs(project),previousActivity);
+        else markProjectDeliveryUnqualified(candidate,projectDeliveryInputs(project),previousActivity);
         const critical = (candidate.activityEventOutbox ?? []).filter(event => event.sourceSequence > (project.activityEventSeq ?? 0) && event.kind !== 'progress').length;
         context?.reservations?.get(project.id)?.assertFits(critical);
         candidates.set(project.id, candidate);
+        deliveryWriteSet.set(project.id,projectDeliveryWriteWitness(candidate));
       }
-      persistence.save(committedScope => buildScopedPersistencePayload(committedScope ?? scope, candidates), scope);
-    } catch (error) { activityCommitError = error; throw error; }
+      const response=readPlanningResponseFrame(planningFrame);
+      if(response){
+        const candidate=candidates.get(response.projectId);
+        if(!candidate||projects.get(response.projectId)!==response.original)throw Error('PLANNING_RESPONSE_UNAVAILABLE');
+        try{response.closed=closePlanningResponse(candidate);}catch(error){projectionFailed=true;projectionError=error;throw error;}
+      }
+      persistence.save(committedScope => {
+        const actualScope=committedScope??scope;acceptanceStage=acceptanceOwner.stage(actualScope,candidates);
+        const payload=buildScopedPersistencePayload(actualScope,candidates),full=payload.full;
+        // The JSON backend materializes full state only when it already did.
+        payload.full=()=>{const state=full();if(actualFull)assertProjectDeliveryWriteSet(fullDeliveryRows(state),deliveryWriteSet);return state;};
+        const frozen=acceptanceStage.freeze(payload);
+        const scopedDelivery=new Map([...deliveryWriteSet].filter(([id])=>actualScope.type==='full'||id===actualScope.projectId));
+        assertProjectDeliveryWriteSet(frozen.entities,scopedDelivery);
+        if(jsonDeliveryWrites)jsonDeliveryWrites.authorize(frozen,state=>{
+          assertProjectDeliveryWriteSet(fullDeliveryRows(state),deliveryWriteSet);
+        });
+        return frozen;
+      },scope);
+      acceptanceStage?.commit();
+    } catch (error) { acceptanceStage?.rollback(error);if(!projectionFailed||error!==projectionError)activityCommitError = error; throw error; }
+    if(context?.stagedCreate && affected.some(project=>project===context.stagedCreate)) context.createDurableCommitted=true;
+    try {
     for (const project of affected) {
       const candidate = candidates.get(project.id);
       const critical = (candidate.activityEventOutbox ?? []).filter(event => event.sourceSequence > (project.activityEventSeq ?? 0) && event.kind !== 'progress').length;
       context?.reservations?.get(project.id)?.consume(critical);
-      for (const field of PROJECT_ACTIVITY_FIELDS) if (field in candidate) project[field] = candidate[field];
+      for (const field of PROJECT_ACTIVITY_FIELDS) {
+        if (Object.hasOwn(candidate,field)) project[field]=candidate[field];
+        else delete project[field];
+      }
       context?.consumed.set(project.id, eventWatermark);
     }
     for (const project of affected) committedRoomOutboxes.set(project.id, structuredClone(project.roomEventOutbox ?? []));
     for (const id of committedRoomOutboxes.keys()) if (!projects.has(id)) committedRoomOutboxes.delete(id);
     // Never serve mutable/failed staged state through the activity replay API.
     for (const project of affected) if (project.activityDataEpoch) committedActivities.set(project.id, structuredClone({
-      activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
+      projectId:project.id, activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
       activitySnapshot: project.activitySnapshot, activityEventOutbox: project.activityEventOutbox, activityGapRanges: project.activityGapRanges,
+      ...(Object.hasOwn(project,'activityDeliveryHead')?{activityDeliveryHead:project.activityDeliveryHead}:{}),
+      ...(Object.hasOwn(project,'activityDeliveryUnavailable')?{activityDeliveryUnavailable:project.activityDeliveryUnavailable}:{}),
     }));
     for (const id of committedActivities.keys()) if (!projects.has(id)) committedActivities.delete(id);
-    for (const project of affected) if (context?.active && project.activityDataEpoch && project.committedActivitySeq > previousActivityHeads.get(project.id)) {
+    for (const project of affected) if (project.activityDataEpoch && (context?.active&&(project.committedActivitySeq > previousActivityHeads.get(project.id)||project.activityDeliveryHead?.recordDigest!==previousDeliveries.get(project.id))||project.activityDeliveryUnavailable===true&&!previousDeliveryUnavailable.get(project.id))) {
       const notice = { type: 'project_activity', projectId: project.id,
-        sourceDataEpoch: project.activityDataEpoch, headSeq: project.committedActivitySeq };
-      for (const listener of activitySubscribers) { try { listener(notice); } catch { /* committed truth cannot be rolled back by a UI consumer */ } }
+        sourceDataEpoch: project.activityDataEpoch, headSeq: project.committedActivitySeq,...(project.activityDeliveryUnavailable===true?{deliveryUnavailable:true}:project.activityDeliveryHead?{deliveryReference:{incarnation:project.activityDeliveryHead.incarnation,deliveryRevision:project.activityDeliveryHead.deliveryRevision}}:{}) };
+      for (const listener of [...activitySubscribers]) { if(!activitySubscribers.has(listener))continue;try { listener(notice); } catch { /* committed truth cannot be rolled back by a UI consumer */ } }
     }
     persistedHumanActionCount = humanActions.length;
+    } catch(cause) {
+      const error=new Error('[hub] durable commit applied; post-commit bookkeeping failed',{cause});
+      error.code='persistence_post_commit_failure';error.durableCommitted=true;
+      activityCommitError=error;
+      throw error;
+    }
   }
 
   function subscribeProjectActivity(listener) {
@@ -417,6 +628,50 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
 
   function getProjectActivity(projectId, options) {
     return readProjectActivity(committedActivities.get(projectId), options);
+  }
+
+  function captureProjectActivityOptions(options){
+    if(options===undefined)options={};
+    if(!options||typeof options!=='object'||Array.isArray(options)||utilTypes.isProxy(options)||Object.getOwnPropertySymbols(options).length
+      ||![Object.prototype,null].includes(Object.getPrototypeOf(options)))throw Error('invalid_activity_options');
+    const fields=Object.getOwnPropertyDescriptors(options),captured={};
+    for(const[name,field]of Object.entries(fields)){
+      if(!['after','limit'].includes(name)||!field.enumerable||!Object.hasOwn(field,'value'))throw Error('invalid_activity_options');
+      captured[name]=field.value;
+    }
+    return Object.freeze(captured);
+  }
+  function readScopedProjectActivity(projectId,options,token){
+    const authority=resolveProjectInputAuthority(token);
+    if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return{ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'};
+    if(typeof projectId!=='string'||!projectId||projectId.length>256||projectId.trim()!==projectId||projectId.includes('\0'))throw Error('invalid_activity_project');
+    const captured=captureProjectActivityOptions(options);
+    if(persistenceClosed)return{ok:false,error:'PROTECTED_PROTOCOL_STORAGE_REQUIRED'};
+    const health=getPersistenceHealth();if(health.backend!=='sqlite'||health.status==='failed')return{ok:false,error:'PROTECTED_PROTOCOL_STORAGE_REQUIRED'};
+    if(activityReadCommitFrame||ordinaryTransactions.size)return{ok:false,error:'PROJECT_ACTIVITY_READ_BUSY'};
+    const binding=readProjectProtocolBinding(projectId,protocolReceipts);
+    if(binding.classification!=='ordinary')return{ok:false,error:binding.reasonCode??'PROTOCOL_BINDING_UNVERIFIED'};
+    if(!isProjectProtocolScope(binding.binding.scope))return{ok:false,error:'PROJECT_SCOPE_UNVERIFIED'};
+    if(binding.binding.scope.profileId!==authority.profileId||binding.binding.scope.workspaceId!==authority.workspaceId)return{ok:false,error:'PROJECT_SCOPE_MISMATCH'};
+    const page=getProjectActivity(projectId,captured);if(!page.ok)return page;
+    return{ok:true,protocol:'scoped_project_activity_v1',projectId,scope:{profileId:authority.profileId,workspaceId:authority.workspaceId},bindingDigest:protocolDigest(binding.binding),page};
+  }
+  function readProjectSourceActivity(projectId,options,token){
+    const authority=resolveProjectInputAuthority(token);
+    if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return{ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'};
+    if(typeof projectId!=='string'||!projectId||projectId.length>256||projectId.trim()!==projectId||projectId.includes('\0'))throw Error('invalid_activity_project');
+    const captured=captureProjectActivityOptions(options),scoped=readScopedProjectActivity(projectId,captured,token);
+    if(scoped.ok||!['PROTOCOL_BINDING_UNVERIFIED','PROJECT_SCOPE_UNVERIFIED'].includes(scoped.error))return scoped;
+    const ids=projectProtocolIds(projectId),binding=readProjectProtocolBinding(projectId,protocolReceipts);let related=0,reserved=false;
+    for(const collection of [protocolReceipts,protocolHeads])for(const record of collection.values())if(record?.projectId===projectId){
+      related++;if(isAcceptanceRecord(record)||Object.hasOwn(record,'initialPlanning')||Object.hasOwn(record.snapshot??{},'initialPlanWriterStoreId'))reserved=true;
+    }
+    if(reserved)return{ok:false,error:'PROTOCOL_BINDING_UNVERIFIED'};
+    const absent=!protocolReceipts.has(ids.binding)&&!protocolReceipts.has(ids.receipt)&&related===0;
+    const legacy=binding.classification==='ordinary'&&!Object.hasOwn(binding.binding,'scope')&&!Object.hasOwn(binding.createReceipt,'scope');
+    if(!absent&&!legacy)return scoped;
+    const page=getProjectActivity(projectId,captured);
+    return page.ok?{...page,delivery:{status:'unavailable',reasonCode:'SNAPSHOT_INCOMPLETE'}}:page;
   }
   function getProjectActivityIdentity(projectId) {
     const committed = committedActivities.get(projectId);
@@ -433,14 +688,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function closePersistence() {
+    if(preparationSendRows.size||preparationHostRows.size)throw Error('DEFAULT_DISPATCH_MIGRATION_BUSY');
+    migrationBoundary.assertGuardTailsCanClose();if(migrationBoundary.inspectState().phase!=='open')migrationBoundary.assertCanClose();persistenceClosed=true;
     if (persistence && typeof persistence.close === 'function') persistence.close();
   }
 
   for (const project of projects.values()) committedRoomOutboxes.set(project.id, structuredClone(project.roomEventOutbox ?? []));
 
   for (const project of projects.values()) if (project.activityDataEpoch) committedActivities.set(project.id, structuredClone({
-    activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
+    projectId:project.id, activityDataEpoch: project.activityDataEpoch, committedActivitySeq: project.committedActivitySeq,
     activitySnapshot: project.activitySnapshot, activityEventOutbox: project.activityEventOutbox, activityGapRanges: project.activityGapRanges,
+      ...(Object.hasOwn(project,'activityDeliveryHead')?{activityDeliveryHead:project.activityDeliveryHead}:{}),
+      ...(Object.hasOwn(project,'activityDeliveryUnavailable')?{activityDeliveryUnavailable:project.activityDeliveryUnavailable}:{}),
   }));
 
   if (persistence) {
@@ -472,44 +731,39 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     });
   }
 
-  function buildDispatchPlan(projectId) {
-    const board = boards.get(projectId);
+  // Both existing user and PO graph writers use these exact original
+  // normalization/mutation primitives. Keep authorization in their owners.
+  function prepareTaskAddition(projectId,project,board,taskList) {
+    const prepared=prepareTasksForBoard(project,taskList);
+    if(!prepared.ok)return prepared;
+    const identityPreview=normalizeTasksForProject(projectId,prepared.tasks,board.getAllTasks());
+    if(!identityPreview.ok)return identityPreview;
+    const policyResult=normalizeTaskGraphPolicies({originalTaskList:taskList,identityPreviewTasks:identityPreview.tasks});
+    if(!policyResult.ok)return policyResult;
+    const addition={ok:true,prepared,identityPreview:identityPreview.tasks,policyWrites:policyResult.policyWrites};
+    acceptanceOwner.prepareDispatchBirth(project,board,addition);return addition;
+  }
+  function commitPreparedTaskAddition(project,board,addition) {
+    acceptanceOwner.beforeDispatchBirth(project,board,addition);
+    const added=board.addTasksChecked(addition.prepared.tasks);if(!added.ok)return added;
+    applyTaskGraphPolicyWrites(project,addition.policyWrites);acceptanceOwner.afterDispatchBirth(project,board,addition,added);return added;
+  }
+
+  function buildDispatchPlan(projectId,view) {
+    const board = view?view.board:boards.get(projectId);
     if (!board) return null;
-    const project = projects.get(projectId);
-    const tasks = board.getAllTasks();
-    const consumedArtifactIdsByTaskId = {};
-    for (const task of tasks) {
-      const declarations = task?.consumedArtifactIdsByDependencyTaskId;
-      if (!declarations || typeof declarations !== 'object' || Array.isArray(declarations)) continue;
-      consumedArtifactIdsByTaskId[task.id] = declarations;
-    }
-    const currentGateFactsByTaskId = {};
-    for (const dependencyTask of tasks) {
-      const serviceFacts = project?.currentGateFacts?.[dependencyTask.id];
-      const currentRunId = dependencyTask?.lastRunLease?.runId || dependencyTask?.recoveredRunId || null;
-      if (!currentRunId || !serviceFacts || serviceFacts.sourceRunId !== currentRunId) continue;
-      currentGateFactsByTaskId[dependencyTask.id] = {
-        sourceRunId: serviceFacts.sourceRunId,
-        canonicalArtifacts: serviceFacts.canonicalArtifacts,
-        evaluationSourceArtifact: serviceFacts.evaluationSourceArtifact,
-      };
-    }
+    const project = view?view.project:projects.get(projectId);
+    const tasks = view?view.tasks:board.getAllTasks();
+    const dependencyGateView=taskDependencyGateView(project,tasks);
     return planDispatch({
       projectId,
       tasks,
-      allActiveTasks: getActiveTasksAcrossLiveProjects(),
-      agentProfiles: getProjectAgentProfiles(project),
-      agentConcurrency: typeof runtimeInstanceAllocator?.getAgentConcurrency === 'function'
+      allActiveTasks: view?view.allActiveTasks:getActiveTasksAcrossLiveProjects(),
+      agentProfiles: view?view.agents:getProjectAgentProfiles(project),
+      agentConcurrency: view?view.concurrency:typeof runtimeInstanceAllocator?.getAgentConcurrency === 'function'
         ? runtimeInstanceAllocator.getAgentConcurrency()
         : {},
-      dependencyPolicies: project?.dependencyPolicies || {},
-      gateEvaluationsByTaskId: project?.gateEvaluations || {},
-      consumedArtifactIdsByTaskId,
-      currentGateFactsByTaskId,
-      // design §13 Rollout invariant: 只有项目显式声明 executionGateSchemaVersion === 2
-      // 才启用 v2 fail-closed 依赖判定；未声明或为 1 的项目走 legacy `completed` 语义，
-      // 不因为本次改动而改变既有行为。
-      schemaV2: project?.executionGateSchemaVersion === 2,
+      ...dependencyGateView,
     });
   }
 
@@ -759,16 +1013,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     // membership-use lease for the PO and every member (design §8.2 step 4)
     const operationId = `room-create:${input.clientRequestKey ?? input.id}`;
     for (const agentId of requiredAgents) {
-      const leaseResult = await brokerClient.acquireRoomMembershipLease({
-        roomId: primaryRoomId,
-        logicalAgentId: agentId,
-        operationId,
-      });
+      let leaseResult;
+      try{leaseResult = await brokerClient.acquireRoomMembershipLease({roomId:primaryRoomId,logicalAgentId:agentId,operationId});}
+      catch(error){migrationBoundary.markUnknown('room_create_lease_unknown',error);throw error;}
       if (!leaseResult || leaseResult.ok === false) {
-        throw roomContractError('room_membership_lease_required', {
-          cause: leaseResult?.code ?? 'room_membership_lease_required',
-          agentId,
-        });
+        const error=roomContractError('room_membership_lease_required',{cause:leaseResult?.code??'room_membership_lease_required',agentId});
+        migrationBoundary.markUnknown('room_create_lease_unknown',error);throw error;
       }
     }
 
@@ -776,6 +1026,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function createProject(input = {}, mutationCtx = undefined) {
+    acceptanceOwner.assertCreate(mutationCtx?.projectInputAuthority);
     const {
       id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary,
       agentSelection = null, preparationContext = null, executionMode = 'direct',
@@ -800,12 +1051,13 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         if (reusable) return Promise.resolve(reusable);
       }
       return validateRoomFirstCreate(input, mutationCtx).then(({ primaryRoomId: resolvedRoomId,requiredProtocol }) =>
-        createProjectValidated({...input,requiredProtocol,autoAssignPo:requiredProtocol ? false : input.autoAssignPo}, mutationCtx, resolvedRoomId));
+        ({[validatedCreate]:()=>createProjectValidated({...input,requiredProtocol,autoAssignPo:requiredProtocol ? false : input.autoAssignPo}, mutationCtx, resolvedRoomId)}));
     }
     return createProjectValidated(input, mutationCtx, null);
   }
 
-  function createProjectValidated(input, mutationCtx, resolvedRoomId) {
+  function createProjectValidated(input, mutationCtx, resolvedRoomId, dshCreate = false) {
+    if (projects.has(input.id) || protocolReceipts.has(projectProtocolIds(input.id).binding)) throw new Error('project_already_exists');
     const {
       id, name, goal, requirements, planningGuidance, poAgent, members = [], enableSummary,
       agentSelection = null, preparationContext = null, executionMode = 'direct',
@@ -821,7 +1073,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     const qualityRuleSet = compileEffectiveQualityRuleSet({
       goal: goal || '',
       requirements: requirements || '',
-      overlays: typeof getQualityOverlays === 'function' ? getQualityOverlays() : [],
+      overlays: !dshCreate && typeof getQualityOverlays === 'function' ? getQualityOverlays() : [],
       now: createdAt,
     });
     const qualityPlanningGuidance = qualityRuleSet.rules.length > 0
@@ -898,6 +1150,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       };
     }
     projects.set(id, project);
+    activityContext.getStore().stagedCreate=project;
     boards.set(id, createTaskBoard(id));
 
     eventLog.emit('project.created', { projectId: id, projectName: effectiveName, po: normalizedPoAgent });
@@ -924,8 +1177,20 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       });
     }
 
-    if (autoAssignPo !== false && (!project.preparation || project.preparation.state === 'ready')) {
-      sendAssignPo(project, effectivePlanningGuidance);
+    if(dshCreate){project.requiredProtocol='dsh_owner_v1';project.dispatchPolicy='draft_only_no_business_dispatch';return project;}
+
+    // Staged with the project and original Room/activity outboxes, committed by
+    // the existing mutation wrapper in the same owner transaction.
+    const newInitial=[ADDITIVE_INITIAL_PLAN,TASK_ADDITIVE_INITIAL_PLAN].includes(resolveProjectInputAuthority(mutationCtx?.projectInputAuthority)?.creation?.contract?.protocol);
+    const records=createOrdinaryProtocolRecords(project,sanitizeRequestContext(mutationCtx),mutationCtx?.projectInputAuthority,newInitial?acceptanceOwner.writerStoreId():undefined);
+    protocolReceipts.set(records.binding.id,records.binding);
+    protocolReceipts.set(records.createReceipt.id,records.createReceipt);
+    if(newInitial)acceptanceOwner.noteCreate(project.id);
+    acceptanceOwner.noteDefaultDispatchProjectCreate(project,boards.get(project.id));
+
+    if (!records.binding.initialPlanning && autoAssignPo !== false && (!project.preparation || project.preparation.state === 'ready')) {
+      eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
+      pendingCreateAssignments.set(project,()=>sendAssignPo(project,effectivePlanningGuidance,false));
     }
     return project;
   }
@@ -960,6 +1225,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         if (persistence && (!committed || !['roomId','projectId','eventType','summary','sourceRefs'].every(key => JSON.stringify(committed[key]) === JSON.stringify(item[key])))) continue;
 
         assertPersistenceHealthy();
+        const acceptanceBefore=structuredClone(item);
         item.attempts = (item.attempts ?? 0) + 1;
         item.totalAttempts = (item.totalAttempts ?? 0) + 1;
         try {
@@ -974,7 +1240,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
             const result = await brokerClient.publishRoomProjectEvent({
               projectionEventId: item.projectionEventId, roomId: item.roomId,
               projectId: item.projectId, eventType: item.eventType,
-              summary: item.summary, sourceRefs: item.sourceRefs,
+              summary: item.summary, sourceRefs: structuredClone(item.sourceRefs),
             });
             assertPersistenceHealthy();
             const message = result?.message ?? result?.details?.message;
@@ -991,11 +1257,12 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
           }
           delete item.nextAttemptAt; delete item.lastError;
         } catch (error) {
-          assertPersistenceHealthy();
+          migrationBoundary.markUnknown('room_publish_unknown',error);assertPersistenceHealthy();
           item.lastError = String(error?.message ?? error).slice(0, 256);
           item.nextAttemptAt = Date.now() + Math.min(60_000, 1000 * 2 ** Math.min(item.attempts, 6));
           if (item.attempts >= 10) item.status = 'parked';
         }
+        acceptanceOwner.noteRoomAck(project,acceptanceBefore,item);
         persistState({ type: 'project', projectId: project.id });
       }
     }
@@ -1027,10 +1294,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     });
   }
 
-  function getRoomEventOutboxHealth() {
+  function getRoomEventOutboxHealth(view) {
     let pending = 0, parked = 0, oldestPendingAt = null;
-    const retryCapacityProjects = [...projects.values()].filter(project => Object.keys(project.roomOutboxRetryOperations ?? {}).length >= 256).map(project => project.id);
-    const outboxes = persistence ? committedRoomOutboxes.values() : [...projects.values()].map(project => project.roomEventOutbox ?? []);
+    const retryCapacityProjects = view?.retryCapacityProjects??(view?view.projects:[...projects.values()]).filter(project => Object.keys(project.roomOutboxRetryOperations ?? {}).length >= 256).map(project => project.id);
+    const outboxes = view?view.outboxes:persistence ? committedRoomOutboxes.values() : [...projects.values()].map(project => project.roomEventOutbox ?? []);
     for (const items of outboxes) for (const item of items) {
       if (item.status === 'pending') { pending++; const at = typeof item.createdAt === 'number' ? item.createdAt : Date.parse(item.createdAt ?? ''); if (Number.isFinite(at)) oldestPendingAt = oldestPendingAt === null ? at : Math.min(oldestPendingAt, at); }
       if (item.status === 'parked') parked++;
@@ -1249,9 +1516,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   function invalidateTeamPlansForAgent(agentId) {
     let changed = 0;
     for (const project of projects.values()) {
-      const memberIds = new Set([project.poAgent, ...(project.members || [])]);
-      const referencedByPlan = (project.teamPlan?.roles || []).some(role => role.preferredExistingAgentId === agentId);
-      if (!memberIds.has(agentId) && !referencedByPlan) continue;
+      if (!projectReferencesAgent(project,agentId)) continue;
       if (project.teamPlan && project.teamPlan.status !== 'applied') project.teamPlan = { ...project.teamPlan, status: 'stale' };
       bumpProjectRevision(project, 'agent_team_input');
       changed += 1;
@@ -1278,7 +1543,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     };
   }
 
-  function sendAssignPo(project, effectivePlanningGuidance) {
+  function sendAssignPo(project, effectivePlanningGuidance, emitEvent = true) {
+    const executionAdmission=acceptanceOwner.executionStart(project.id);if(!executionAdmission.ok)return executionAdmission;
+    if(readProjectProtocolBinding(project.id,protocolReceipts).binding?.initialPlanning?.producer==='desktop_main_v1')return;
     if (bridge) {
       bridge.send({
         type: 'intent', kind: 'assign_po',
@@ -1292,7 +1559,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       });
     }
 
-    eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
+    if (emitEvent) eventLog.emit('po.assigned', { projectId: project.id, agent: project.poAgent });
   }
 
   // ─── Human actions ─────────────────────────────────────────────────
@@ -1301,6 +1568,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
    * Human 审批计划 → project becomes active
    */
   function handleApprove(projectId) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
 
@@ -1330,6 +1598,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function activateAndStartProject(projectId, request = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     const board = boards.get(projectId);
@@ -1438,8 +1707,10 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
    * 重新触发 PO 制定计划 — 用于计划卡住或失败后重试
    */
   function handleRetryPlan(projectId) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
+    if(readProjectProtocolBinding(projectId,protocolReceipts).binding?.initialPlanning?.producer==='desktop_main_v1')return {ok:false,error:'INITIAL_PLAN_MAIN_RECOVERY_REQUIRED'};
     if (!bridge) return { ok: false, error: 'no_bridge' };
     const board = boards.get(projectId);
     const normalized = normalizeProjectForPlanRetry(project, board?.getAllTasks() || []);
@@ -1467,34 +1738,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   /**
    * design §7.2：schema v2 的唯一服务入口。requestContext 由 HTTP 层
    * resolveDesktopMutationContext(req) 解析出的可信身份传入，不取自 body。
-   * requestContext 缺失时（向后兼容旧调用点/旧测试）保持原有的宽松行为；
-   * 一旦传入 requestContext，则强制 requestSource==='user'，拒绝非用户来源。
+   * 只能由明确的 user context 添加；缺少来源不能获得用户权限。
    */
   function handleHumanAddTasks(projectId, taskList, requestContext = null) {
-    if (requestContext && requestContext.requestSource !== 'user') {
+    if (requestContext?.requestSource !== 'user') {
       return { ok: false, error: 'human_add_tasks_requires_user' };
     }
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
+    if (['delivered', 'closed'].includes(project.status)) return { ok: false, error: 'PROJECT_TERMINAL_REQUIRES_REOPEN' };
 
     const board = boards.get(projectId);
-    const prepared = prepareTasksForBoard(project, taskList);
-    if (!prepared.ok) return prepared;
-
-    // design §3.3：handleHumanAddTasks 是另一条真实图写入口（Room→已有
-    // Project），必须与 handleCreateTasks 共用同一个 normalizeTaskGraphPolicies
-    // seam，不能让 Room 添加的任务成为唯一无法声明 verified_pass 依赖策略的
-    // 入口。现状核实（2026-09-02）：此前这条入口完全没有接入策略归一化。
-    const identityPreview = normalizeTasksForProject(projectId, prepared.tasks, board.getAllTasks());
-    if (!identityPreview.ok) return identityPreview;
-    const policyResult = normalizeTaskGraphPolicies({ originalTaskList: taskList, identityPreviewTasks: identityPreview.tasks });
-    if (!policyResult.ok) return policyResult;
-
-    const added = board.addTasksChecked(prepared.tasks);
-    if (!added.ok) return added;
-    const ids = added.taskIds;
-
-    applyTaskGraphPolicyWrites(project, policyResult.policyWrites);
+    const addition=prepareTaskAddition(projectId,project,board,taskList);if(!addition.ok)return addition;
+    const {prepared}=addition;
+    const added=commitPreparedTaskAddition(project,board,addition);if(!added.ok)return added;
+    const ids=added.taskIds;
 
     // If project was 'created', move to planning
     if (project.status === 'created') {
@@ -1518,7 +1776,25 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   /**
    * Human 关闭项目（唯一能关闭的角色）
    */
-  function handleCloseProject(projectId, summary) {
+  function authorizeProjectTerminalUser(projectId,requestContext) {
+    const denied={ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'};
+    if(requestContext?.requestSource!=='user')return denied;
+    const binding=readProjectProtocolBinding(projectId,protocolReceipts),ids=projectProtocolIds(projectId);
+    if(binding.classification==='ordinary'){
+      if(binding.binding.scope){
+        const authority=resolveProjectInputAuthority(requestContext.projectInputAuthority);
+        if(authority?.requestSource!=='user'||authority.kind!=='desktop_control'
+          || authority.profileId!==binding.binding.scope.profileId||authority.workspaceId!==binding.binding.scope.workspaceId)return denied;
+      }else if(binding.binding.initialPlanning)return denied;
+    }else if(binding.reasonCode!=='PROTOCOL_BINDING_UNVERIFIED'||protocolReceipts.has(ids.binding)||protocolReceipts.has(ids.receipt)
+      || [...protocolReceipts.values()].some(record=>record.projectId===projectId&&record.kind==='ordinary_input_operation'))return denied;
+    // This compatibility route is the original authenticated local-user action;
+    // it never classifies missing metadata as ordinary or mints new provenance.
+    if(projects.get(projectId)?.requiredProtocol && projects.get(projectId).requiredProtocol!=='room_workspace_v1')return denied;
+    return {ok:true};
+  }
+  function handleCloseProject(projectId, summary,requestContext) {
+    const allowed=authorizeProjectTerminalUser(projectId,requestContext);if(!allowed.ok)return allowed;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     if (project.status === 'closed') return { ok: false, error: 'already_closed' };
@@ -1537,7 +1813,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   /**
    * Human 彻底删除项目（从列表中移除）
    */
-  function deleteProject(projectId) {
+  function deleteProject(projectId,requestContext) {
+    const allowed=authorizeProjectTerminalUser(projectId,requestContext);if(!allowed.ok)return allowed;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
 
@@ -1555,34 +1832,18 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   /**
    * PO 提交分解好的任务列表
    */
-  function handleCreateTasks(projectId, taskList, fromAgent) {
+  function handleCreateTasks(projectId, taskList, fromAgent,initialPlanContext) {
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     if (project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
+    if (['delivered','closed'].includes(project.status))return {ok:false,error:'PROJECT_TERMINAL_REQUIRES_REOPEN'};
+    if (hasUncommittedMainPlan(projectId) && !initialPlanWriteContexts.has(initialPlanContext)) return {ok:false,error:'INITIAL_PLAN_CLAIM_REQUIRED'};
 
     const board = boards.get(projectId);
-    const prepared = prepareTasksForBoard(project, taskList);
-    if (!prepared.ok) return prepared;
-
-    // design §3.3（动态依赖的唯一 policy owner）：PO 可在原始任务输入里对每条
-    // 依赖边声明 dependencyPolicy（key 是提交时的原始 dependency ref，与
-    // task.dependencies 输入同域）。用 normalizeTasksForProject（纯函数，不
-    // 修改 board 状态）预先算出稳定 task ID 归一化结果做校验，通过后再真正
-    // 调用 board.addTasksChecked——避免"格式校验失败但任务已经写入 board"
-    // 这种不可回滚的部分副作用。
-    // 现状核实（2026-09-02）：此前这条链路完全不存在——project.dependencyPolicies
-    // 从未被写入内容，verified_pass 在真实 PO 提交流程中从未真正生效。
-    const identityPreview = normalizeTasksForProject(projectId, prepared.tasks, board.getAllTasks());
-    if (!identityPreview.ok) return identityPreview;
-
-    const policyResult = normalizeTaskGraphPolicies({ originalTaskList: taskList, identityPreviewTasks: identityPreview.tasks });
-    if (!policyResult.ok) return policyResult;
-
-    const added = board.addTasksChecked(prepared.tasks);
-    if (!added.ok) return added;
-    const ids = added.taskIds;
-
-    applyTaskGraphPolicyWrites(project, policyResult.policyWrites);
+    const addition=prepareTaskAddition(projectId,project,board,taskList);if(!addition.ok)return addition;
+    const {prepared}=addition;
+    const added=commitPreparedTaskAddition(project,board,addition);if(!added.ok)return added;
+    const ids=added.taskIds;
 
     if (project.status === 'created') project.status = 'planning';
     eventLog.emit('tasks.created', {
@@ -1659,6 +1920,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function handleRequestDispatch(projectId, fromAgent, options = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     if (project.requiredProtocol === 'room_workspace_v1' && !verifiedWorkspaceCalls.has(options)) return {ok:false,error:'workspace_claim_required'};
@@ -1851,6 +2113,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function startTaskWorkflowFromDispatch({ project, board, task, selection, requestedBy = 'xiaok-po', now = Date.now() } = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(project?.id);if(!executionAdmission.ok)return executionAdmission;
     if (!project || !board || !task?.id) return { ok: false, error: 'task_required' };
     const proposal = createWorkflowProposal(project.id, PO_GENERATED_TASK_WORKFLOW_ID, {
       requestedBy: requestedBy || project.poAgent || 'kswarm',
@@ -1908,6 +2171,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function startProjectWorkflowFromDispatch({ project, board, requestedBy = 'xiaok-po', now = Date.now() } = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(project?.id);if(!executionAdmission.ok)return executionAdmission;
     if (!project || !board) return { ok: false, error: 'project_required' };
     const proposal = createWorkflowProposal(project.id, PO_GENERATED_PROJECT_WORKFLOW_ID, {
       requestedBy: requestedBy || project.poAgent || 'kswarm',
@@ -1976,6 +2240,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   function handleRework(projectId, taskId, reason, fromAgent) {
+    const executionAdmission=acceptanceOwner.executionStart(projectId);if(!executionAdmission.ok)return executionAdmission;
     if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_claim_required'};
     const project = projects.get(projectId);
     if (!project || project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
@@ -2018,6 +2283,9 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       projectId, taskId: task.id, taskTitle: task.title, failureReason: reason,
       errorMessage: errorMessage || '',
     });
+
+    const executionAdmission=acceptanceOwner.executionStart(projectId);
+    if(!executionAdmission.ok)return {ok:true,taskId:task.id,retried:false,failureReason:reason,retryDispatchError:executionAdmission.error};
 
     const replacement = planAgentReplacement({
       task,
@@ -2105,7 +2373,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     if (!silent) console.log('[Retry] task:', JSON.stringify({ id: task.id, attempt: task.attempt, maxAttempts: task.maxAttempts, failureReason: task.failureReason, shouldRetry }));
     if (shouldRetry) {
       const retryTask = createRetryTask(task);
-      const added = board.addTasksChecked([retryTask]);
+      const retryAddition=prepareTaskAddition(projectId,project,board,[retryTask]);if(!retryAddition.ok)return retryAddition;
+      const added = commitPreparedTaskAddition(project,board,retryAddition);
       if (!added.ok) return added;
       const retryTaskId = added.taskIds[0];
       const storedRetryTask = board.getTask(retryTaskId);
@@ -3051,21 +3320,71 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return result;
   }
 
-  function handleResumeTaskForRecovery(projectId, taskId, { leaseTimeoutMs = 600_000 } = {}) {
-    if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_claim_required'};
-    const board = boards.get(projectId);
-    if (!board) return { ok: false, error: 'project_not_found' };
-    const task = board.getTask(taskId);
-    if (!task) return { ok: false, error: 'task_not_found' };
-    const result = board.refreshLeaseForResume(task.id, { leaseTimeoutMs });
-    if (result.ok) {
-      eventLog.emit('task.recovery_resumed', {
-        projectId,
-        taskId: task.id,
-        taskTitle: task.title,
-      });
+  function recoveryExecutionAdmission(projectId,taskId,options={},workspaceDelivery=false) {
+    assertPersistenceHealthy();if(persistenceClosed)return{ok:false,error:'RECOVERY_EXECUTION_UNAVAILABLE'};
+    const admission=acceptanceOwner.executionStart(projectId);if(!admission.ok)return admission;
+    const project=projects.get(projectId),projectSnapshot=captureExecutionData(project);
+    if(Object.hasOwn(projectSnapshot,'requiredProtocol')&&projectSnapshot.requiredProtocol!=='room_workspace_v1')return{ok:false,error:'PROJECT_EXECUTION_PROTOCOL_UNVERIFIED'};
+    const policies=['plan_only','auto_activate_after_plan','activate_and_dispatch_after_plan'],decision=projectSnapshot.startPolicyDecision;
+    if(Object.hasOwn(projectSnapshot,'dispatchPolicy')||Object.hasOwn(projectSnapshot,'requestedStartPolicy')&&!policies.includes(projectSnapshot.requestedStartPolicy)
+      ||decision!==undefined&&decision!==null&&(typeof decision!=='object'||Array.isArray(decision)||!policies.includes(decision.effectiveStartPolicy)))return{ok:false,error:'EXECUTION_POLICY_INVALID'};
+    if(!workspaceDelivery&&projectSnapshot?.requiredProtocol==='room_workspace_v1')return{ok:false,error:'workspace_claim_required'};
+    if(projectSnapshot?.status!=='active')return{ok:false,error:'RECOVERY_PROJECT_NOT_ACTIVE'};
+    if(admission.classification!=='legacy_ordinary'){
+      const binding=readProjectProtocolBinding(projectId,protocolReceipts);
+      if(binding.classification!=='ordinary')return{ok:false,error:'PROJECT_EXECUTION_PROTOCOL_UNVERIFIED'};
+      const ownerPresent=Object.hasOwn(binding.binding,'initialPlanning'),receiptOwnerPresent=Object.hasOwn(binding.createReceipt,'initialPlanning');
+      if(ownerPresent!==receiptOwnerPresent)return{ok:false,error:'EXECUTION_APPROVAL_RECONCILIATION_REQUIRED'};
+      if(ownerPresent){
+        const owner=binding.binding.initialPlanning;
+        if(!owner||typeof owner!=='object'||Array.isArray(owner)||Object.keys(owner).length!==3
+          ||!['producer','canonicalCreateOperationId','planGeneration'].every(key=>Object.hasOwn(owner,key))
+          ||owner.producer!=='desktop_main_v1'||owner.planGeneration!==1||typeof owner.canonicalCreateOperationId!=='string'
+          ||!owner.canonicalCreateOperationId||owner.canonicalCreateOperationId.length>256||owner.canonicalCreateOperationId.trim()!==owner.canonicalCreateOperationId)
+          return{ok:false,error:'EXECUTION_APPROVAL_RECONCILIATION_REQUIRED'};
+      }
     }
-    return result;
+    if(hasUncommittedMainPlan(projectId))return{ok:false,error:'INITIAL_PLAN_CLAIM_REQUIRED'};
+    const board=boards.get(projectId);if(!board)return{ok:false,error:'project_not_found'};
+    const frame=captureOriginalTaskBoardTask(board,taskId);if(!frame)return{ok:false,error:'task_not_found'};
+    const task=frame.task;
+    if(!['dispatched','accepted','in_progress'].includes(task.status)||typeof task.activeRunId!=='string'||!task.activeRunId
+      ||!task.runLease||task.runLease.runId!==task.activeRunId)return{ok:false,error:'RECOVERY_RUN_UNAVAILABLE'};
+    if(Object.hasOwn(options,'expectedRunId')&&(typeof options.expectedRunId!=='string'||options.expectedRunId!==task.activeRunId))return{ok:false,error:'RECOVERY_RUN_STALE'};
+    const revision=getPersistenceHealth().revision,projectDigest=protocolDigest(projectSnapshot),taskDigest=protocolDigest(task);
+    const assertCurrent=()=>{
+      assertPersistenceHealthy();if(persistenceClosed||getPersistenceHealth().revision!==revision||projects.get(projectId)!==project||boards.get(projectId)!==board)throw Error('RECOVERY_TASK_STALE');
+      frame.assertCurrent();if(protocolDigest(captureExecutionData(project))!==projectDigest||protocolDigest(frame.read())!==taskDigest)throw Error('RECOVERY_TASK_STALE');
+      if(getPersistenceHealth().revision!==revision||projects.get(projectId)!==project||boards.get(projectId)!==board)throw Error('RECOVERY_TASK_STALE');frame.assertCurrent();
+    };assertCurrent();
+    return{ok:true,project,projectSnapshot,board,frame,task,revision,assertCurrent};
+  }
+
+  function commitRecoveryResumes(projectId,proofs,{leaseTimeoutMs=600_000}={}) {
+    const board=boards.get(projectId),before=readTaskBoardSnapshot(board),response=captureExecutionData({ok:true,resumed:proofs.length});
+    return withActivityBudget('handleResumeTaskForRecovery',{type:'project',projectId},()=>{
+      const transaction={diagnostics:[]};ordinaryTransactions.set(projectId,transaction);let committed=false;
+      const deliver=()=>{for(const {type,payload}of transaction.diagnostics)try{emitDiagnostic(type,payload);}catch{/* committed diagnostic failure does not revoke the lease */}};
+      try{
+        for(const proof of proofs){
+          if(boards.get(projectId)!==board||projects.get(projectId)!==proof.project)throw Error('RECOVERY_TASK_STALE');
+          proof.assertCurrent();const result=resumeOriginalTaskBoard(board,proof.task.id,{leaseTimeoutMs});
+          if(!result.ok)throw Error(result.error);
+          eventLog.emit('task.recovery_resumed',{projectId,taskId:proof.task.id,taskTitle:proof.task.title});
+        }
+        persistState({type:'project',projectId});committed=true;ordinaryTransactions.delete(projectId);deliver();return response;
+      }catch(error){
+        if(!committed&&!error?.durableCommitted)boards.set(projectId,restoreTaskBoard(before,projectId));
+        else if(error?.durableCommitted){ordinaryTransactions.delete(projectId);deliver();}
+        throw error;
+      }finally{ordinaryTransactions.delete(projectId);}
+    });
+  }
+
+  function handleResumeTaskForRecovery(projectId,taskId,options={}) {
+    const copied=captureExecutionData(options),checked=recoveryExecutionAdmission(projectId,taskId,copied);if(!checked.ok)return checked;
+    const response=captureExecutionData({ok:true,taskId:checked.task.id});
+    migrationBoundary.markExecutionAttempt();commitRecoveryResumes(projectId,[checked],copied);return response;
   }
 
   function handleSuspendActiveRuns(now = Date.now()) {
@@ -3083,18 +3402,21 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return { ok: true, suspended };
   }
 
-  function handleResumeSuspendedRuns({ sleptMs = 0, leaseTimeoutMs = 600_000 } = {}) {
-    let resumed = 0;
-    for (const [projectId,board] of boards.entries()) {
-      if (projects.get(projectId)?.requiredProtocol === 'room_workspace_v1') continue;
-      for (const task of board.getAllTasks()) {
-        if (!task.suspendedAt) continue;
-        const result = board.refreshLeaseForResume(task.id, { leaseTimeoutMs });
-        if (result.ok) resumed++;
+  function handleResumeSuspendedRuns({sleptMs=0,leaseTimeoutMs=600_000}={}) {
+    let resumed=0,response=captureExecutionData({ok:true,resumed:0,sleptMs});
+    for(const [projectId,board]of boards){
+      if(captureExecutionData(projects.get(projectId))?.requiredProtocol==='room_workspace_v1')continue;
+      const proofs=[];
+      for(const task of readTaskBoardSnapshot(board)){
+        if(!task.suspendedAt)continue;
+        const checked=recoveryExecutionAdmission(projectId,task.id,{expectedRunId:task.activeRunId});
+        if(checked.ok)proofs.push(checked);
       }
+      if(!proofs.length)continue;
+      const next=captureExecutionData({ok:true,resumed:resumed+proofs.length,sleptMs});
+      migrationBoundary.markExecutionAttempt();commitRecoveryResumes(projectId,proofs,{leaseTimeoutMs});resumed+=proofs.length;response=next;
     }
-    persistState();
-    return { ok: true, resumed, sleptMs };
+    return response;
   }
 
   // ─── Plan-Do methods ────────────────────────────────────────────────
@@ -3102,16 +3424,19 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   /**
    * PO 提交结构化 Plan
    */
-  function handleSubmitPlan(projectId, plan, fromAgent) {
+  function handleSubmitPlan(projectId, plan, fromAgent,initialPlanContext) {
     const project = projects.get(projectId);
     if (!project) return { ok: false, error: 'project_not_found' };
     if (project.poAgent !== fromAgent) return { ok: false, error: 'not_po' };
+    if (['delivered','closed'].includes(project.status))return {ok:false,error:'PROJECT_TERMINAL_REQUIRES_REOPEN'};
+    if (hasUncommittedMainPlan(projectId) && !initialPlanWriteContexts.has(initialPlanContext)) return {ok:false,error:'INITIAL_PLAN_CLAIM_REQUIRED'};
 
     // Guard: reject if plan already exists (use revise instead)
     if (project.plan) {
       return { ok: false, error: 'plan_already_exists' };
     }
 
+    const dispatchPlanChange=acceptanceOwner.prepareDispatchPlanChange(projectId);
     project.plan = { ...plan, version: 1, createdAt: Date.now(), revisions: [] };
     project.status = 'planning';
 
@@ -3126,6 +3451,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     project.riskProfile = deriveRiskFloor({ plan: project.plan, executionContracts: [], requestedOutput: project.requestedOutput || {} });
 
     eventLog.emit('plan.submitted', { projectId, version: 1, phaseCount: (plan.phases || []).length });
+    acceptanceOwner.commitDispatchPlanChange(dispatchPlanChange);
     return { ok: true, plan: project.plan };
   }
 
@@ -3149,6 +3475,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
 
     const board = boards.get(projectId);
+    const dispatchPlanChange=acceptanceOwner.prepareDispatchPlanChange(projectId);
     const newVersion = project.plan.version + 1;
     let appliedChanges = 0;
 
@@ -3171,7 +3498,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
             acceptanceCriteria: change.item.acceptanceCriteria || '',
           }]);
           if (!prepared.ok) return prepared;
-          const added = board.addTasksChecked(prepared.tasks);
+          const revisionAddition=prepareTaskAddition(projectId,project,board,prepared.tasks);if(!revisionAddition.ok)return revisionAddition;
+          const added = commitPreparedTaskAddition(project,board,revisionAddition);
           if (!added.ok) return added;
           appliedChanges++;
         }
@@ -3224,6 +3552,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
 
     eventLog.emit('plan.revised', { projectId, version: newVersion, reason: revision.reason });
+    acceptanceOwner.commitDispatchPlanChange(dispatchPlanChange);
     return { ok: true, plan: project.plan, version: newVersion, appliedChanges };
   }
 
@@ -3831,6 +4160,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   } = {}) {
     const proposal = workflowProposals.get(workflowProposalId);
     if (!proposal) return { ok: false, error: 'workflow_proposal_not_found' };
+    const executionAdmission=acceptanceOwner.executionStart(proposal.projectId);if(!executionAdmission.ok)return executionAdmission;
     if (proposal.approval?.status !== 'pending') return { ok: false, error: 'workflow_proposal_not_pending' };
     if (projectId && proposal.projectId !== projectId) {
       return { ok: false, error: 'workflow_proposal_project_mismatch' };
@@ -3871,7 +4201,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       const result = startProjectDiagnoseWorkflow(proposal.projectId, { requestedBy: approvedBy, now });
       if (!result.ok) return result;
       const workflowRun = applyProposalMetadataToRun(result.workflowRun, approvedProposal, { now });
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       return { ok: true, workflowRun, workflowProposal: approvedProposal, dispatches: [] };
     }
 
@@ -3892,7 +4222,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         workflowRunId: workflowRun.id,
@@ -3920,7 +4250,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         workflowRunId: workflowRun.id,
@@ -3950,7 +4280,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         now,
       });
       workflowRun = dispatched.workflowRun;
-      workflowRuns.set(workflowRun.id, workflowRun);
+      storeWorkflowRun(workflowRun);
       eventLog.emit('workflow.run.started', {
         projectId: proposal.projectId,
         taskId: sourceTask.task.id,
@@ -3973,6 +4303,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   } = {}) {
     const proposal = workflowProposals.get(workflowProposalId);
     if (!proposal) return { ok: false, error: 'workflow_proposal_not_found' };
+    const executionAdmission=acceptanceOwner.executionStart(proposal.projectId);if(!executionAdmission.ok)return executionAdmission;
     if (proposal.source !== 'script_generated') return { ok: false, error: 'workflow_proposal_not_script_generated' };
     if (proposal.approval?.status !== 'pending') return { ok: false, error: 'workflow_proposal_not_pending' };
     if (projectId && proposal.projectId !== projectId) return { ok: false, error: 'workflow_proposal_project_mismatch' };
@@ -4034,7 +4365,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       now,
     });
     workflowRun = runtimeDispatch.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.started', {
       projectId: proposal.projectId,
       workflowRunId: workflowRun.id,
@@ -4119,7 +4450,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       },
     };
     const refreshed = refreshWorkflowRunState(nextRun);
-    workflowRuns.set(refreshed.id, refreshed);
+    storeWorkflowRun(refreshed);
     eventLog.emit('workflow.script.parallel_group.created', {
       projectId: refreshed.projectId,
       workflowRunId,
@@ -4155,6 +4486,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    const executionAdmission=acceptanceOwner.executionStart(workflowRun.projectId);if(!executionAdmission.ok)return executionAdmission;
     if (projects.get(workflowRun.projectId)?.requiredProtocol === 'room_workspace_v1') return {ok:false,error:'workspace_workflow_protocol_required'};
     if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
     if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
@@ -4255,7 +4587,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         input: node.input,
         now,
       });
-      workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+      storeWorkflowRun(dispatched.workflowRun);
       eventLog.emit('workflow.script.node.created', {
         projectId: dispatched.workflowRun.projectId,
         workflowRunId,
@@ -4269,7 +4601,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       return { ok: true, workflowRun: dispatched.workflowRun, nodeId, dispatches: dispatched.dispatches };
     }
     // Node is pending (has unmet dependsOn) — persist but don't dispatch yet
-    workflowRuns.set(withNode.id, withNode);
+    storeWorkflowRun(withNode);
     eventLog.emit('workflow.script.node.created', {
       projectId: withNode.projectId,
       workflowRunId,
@@ -4285,6 +4617,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   function retryWorkflowScriptAgentNode(workflowRunId, { nodeId, assignedAgent = null, now = Date.now() } = {}) {
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
+    const executionAdmission=acceptanceOwner.executionStart(workflowRun.projectId);if(!executionAdmission.ok)return executionAdmission;
     if (workflowRun.source !== 'script_generated') return { ok: false, error: 'workflow_run_not_script_generated' };
     if (['completed', 'failed', 'cancelled'].includes(workflowRun.status)) return { ok: false, error: 'workflow_run_terminal' };
     const node = workflowRun.nodes.find(item => item.id === nodeId);
@@ -4317,7 +4650,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       input: node.input,
       now,
     });
-    workflowRuns.set(dispatched.workflowRun.id, dispatched.workflowRun);
+    storeWorkflowRun(dispatched.workflowRun);
     eventLog.emit('workflow.script.node.retry_dispatched', {
       projectId: dispatched.workflowRun.projectId,
       workflowRunId,
@@ -4389,7 +4722,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
           ],
         },
       };
-      workflowRuns.set(withResult.id, withResult);
+      storeWorkflowRun(withResult);
       eventLog.emit('workflow.run.blocked', {
         projectId: withResult.projectId,
         workflowRunId,
@@ -4415,7 +4748,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     });
     const projectFinalization = maybeDeliverScriptWorkflowProjectResult(withResult, { now });
     withResult = projectFinalization.workflowRun;
-    workflowRuns.set(withResult.id, withResult);
+    storeWorkflowRun(withResult);
     eventLog.emit('workflow.run.completed', {
       projectId: withResult.projectId,
       workflowRunId,
@@ -4445,7 +4778,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       requestedBy,
       now,
     });
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.completed', {
       projectId,
       workflowRunId: workflowRun.id,
@@ -4477,7 +4810,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       now,
     });
     workflowRun = dispatched.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.started', {
       projectId,
       workflowRunId: workflowRun.id,
@@ -4518,7 +4851,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       dispatches = dispatched.dispatches;
     }
 
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.node.output_received', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4552,7 +4885,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         },
       };
       blocked.summary = { ...blocked.summary, primaryMessage: 'Review gate blocked' };
-      workflowRuns.set(blocked.id, blocked);
+      storeWorkflowRun(blocked);
       eventLog.emit('workflow.node.reviewed', {
         projectId: blocked.projectId,
         workflowRunId,
@@ -4591,7 +4924,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     workflowRun = taskFinalization.workflowRun;
     const projectFinalization = maybeDeliverProjectWorkflowDeliverable(workflowRun, { now });
     workflowRun = projectFinalization.workflowRun;
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.run.gate_completed', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4610,7 +4943,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       nodeId,
       reason,
     }, { now });
-    workflowRuns.set(workflowRun.id, workflowRun);
+    storeWorkflowRun(workflowRun);
     eventLog.emit('workflow.node.blocked', {
       projectId: workflowRun.projectId,
       workflowRunId,
@@ -4623,7 +4956,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     const workflowRun = workflowRuns.get(workflowRunId);
     if (!workflowRun) return { ok: false, error: 'workflow_run_not_found' };
     const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
-    workflowRuns.set(cancelled.id, cancelled);
+    storeWorkflowRun(cancelled);
     const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
     eventLog.emit('workflow.run.cancelled', {
       projectId: cancelled.projectId,
@@ -4641,8 +4974,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return workflowRun.recovery?.nextAction === 'resume_workflow';
   }
 
-  function listResumableScriptWorkflowRuns(projectId = null) {
-    return [...workflowRuns.values()]
+  function listResumableScriptWorkflowRuns(projectId = null,sourceRuns) {
+    return [...(sourceRuns??workflowRuns.values())]
       .filter(run => isScriptWorkflowRunResumable(run))
       .filter(run => (projectId ? run.projectId === projectId : true))
       .filter(run => typeof run.scriptSource === 'string' && run.scriptSource.length > 0)
@@ -4658,8 +4991,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       }));
   }
 
-  function deriveScriptWorkflowIntervention(projectId) {
-    const resumable = listResumableScriptWorkflowRuns(projectId);
+  function deriveScriptWorkflowIntervention(projectId,sourceRuns) {
+    const resumable = listResumableScriptWorkflowRuns(projectId,sourceRuns);
     const candidate = resumable[0];
     if (!candidate) return null;
     return {
@@ -4679,32 +5012,26 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     };
   }
 
-  function recoverInterruptedTaskWorkflows({ reason = 'workflow_runtime_interrupted', now = Date.now() } = {}) {
-    const recovered = [];
-    const skipped = [];
-    const resumableScriptRuns = [];
-    for (const workflowRun of workflowRuns.values()) {
-      if (!workflowRun) continue;
-      // Dynamic (script_generated) runs have no task lease; never cancel them.
-      // Collect resumable ones so the desktop runtime can rebuild their jobs.
-      if (workflowRun.source === 'script_generated') {
-        if (isScriptWorkflowRunResumable(workflowRun)) {
-          resumableScriptRuns.push({
-            projectId: workflowRun.projectId,
-            workflowRunId: workflowRun.id,
-            workflowId: workflowRun.workflowId,
-            scriptHash: workflowRun.scriptHash || null,
-            status: workflowRun.status,
-            hasScriptSource: typeof workflowRun.scriptSource === 'string' && workflowRun.scriptSource.length > 0,
-          });
-        }
-        continue;
-      }
-      if (workflowRun.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID) continue;
-      if (workflowRun.status !== 'running') continue;
+  const serverRecoveryInputs=new WeakSet();
+  function collectInterruptedTaskWorkflows(){
+    const candidates=[],blockedCandidates=[],resumableScriptRuns=[];
+    for(const raw of workflowRuns.values()){
+      if(!raw)continue;const run=captureExecutionData(raw);
+      if(run.source==='script_generated'){
+        if(isScriptWorkflowRunResumable(run))resumableScriptRuns.push({projectId:run.projectId,workflowRunId:run.id,workflowId:run.workflowId,scriptHash:run.scriptHash||null,status:run.status,hasScriptSource:typeof run.scriptSource==='string'&&run.scriptSource.length>0});
+      }else if(run.workflowId===PO_GENERATED_TASK_WORKFLOW_ID){if(run.status==='running')candidates.push(run.id);else if(['blocked','failed'].includes(run.status))blockedCandidates.push(run.id);}
+    }
+    return {candidates,blockedCandidates,resumableScriptRuns};
+  }
+  function recoverInterruptedTaskWorkflows(input={}) {
+    const {reason='workflow_runtime_interrupted',now=Date.now()}=input;
+    const recovered=[],skipped=[],{candidates,blockedCandidates,resumableScriptRuns}=collectInterruptedTaskWorkflows();
+    for(const id of blockedCandidates){const run=workflowRuns.get(id);if(run&&['blocked','failed'].includes(run.status))synchronizeBlockedTaskWorkflowSource(run);}
+    for(const id of candidates){
+      const workflowRun=workflowRuns.get(id);
       const cancelled = applyWorkflowEvent(workflowRun, { type: 'cancelled', reason }, { now });
       const taskReset = maybeReleaseCancelledTaskWorkflow(cancelled, { reason, now });
-      workflowRuns.set(cancelled.id, cancelled);
+      storeWorkflowRun(cancelled);
       if (taskReset?.ok) {
         recovered.push({
           projectId: cancelled.projectId,
@@ -4727,7 +5054,28 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         });
       }
     }
-    return { ok: true, recovered, skipped, resumableScriptRuns };
+    const result={ok:true,recovered,skipped,resumableScriptRuns};
+    return serverRecoveryInputs.has(input)?captureObservationComposite({ok:true,recovered:captureObservationRows(recovered),skipped:captureObservationRows(skipped),resumableScriptRuns:captureObservationRows(resumableScriptRuns)}):result;
+  }
+
+  function storeWorkflowRun(workflowRun) {
+    workflowRuns.set(workflowRun.id, workflowRun);
+    synchronizeBlockedTaskWorkflowSource(workflowRun);
+  }
+
+  function synchronizeBlockedTaskWorkflowSource(workflowRun) {
+    if (workflowRun?.workflowId !== PO_GENERATED_TASK_WORKFLOW_ID || workflowRun.source !== 'po_generated'
+      || !['blocked', 'failed'].includes(workflowRun.status)
+      || workflowRun.scope?.projectId !== workflowRun.projectId) return;
+    const board = boards.get(workflowRun.projectId), task = board?.getTask(workflowRun.scope?.taskId);
+    if (!task || task.id !== workflowRun.scope.taskId || task.projectId !== workflowRun.projectId
+      || !['dispatched', 'accepted', 'in_progress'].includes(task.status)
+      || task.activeRunId !== 'workflow-' + workflowRun.id) return;
+    const reason = readWorkflowString(workflowRun.nodes?.find(node => node.status === 'blocked' || node.status === 'failed')?.error)
+      || readWorkflowString(workflowRun.gateDecision?.reason) || 'workflow_blocked';
+    const blocked = board.blockTask(task.id, { blockKind: 'workflow_blocked', blockedReason: reason, failureClass: 'workflow_runtime_error' });
+    if (!blocked.ok) throw new Error('workflow_source_block_failed:' + blocked.error);
+    // Existing workflow activity and the same durable project snapshot carry this change.
   }
 
   function maybeReleaseCancelledTaskWorkflow(workflowRun, { reason = 'workflow_cancelled' } = {}) {
@@ -4772,7 +5120,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       progressState: applied.snapshot.progressState,
       updatedAt: now,
     };
-    workflowRuns.set(updated.id, updated);
+    storeWorkflowRun(updated);
     eventLog.emit('workflow.progress.batch', {
       projectId: updated.projectId,
       workflowRunId: updated.id,
@@ -4802,6 +5150,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     return workflowRuns.get(workflowRunId) || null;
   }
   function dispatchWorkflowNode(workflowRun, nodeId, { assignedAgent, input = null, now = Date.now() } = {}) {
+    const executionAdmission=acceptanceOwner.executionStart(workflowRun.projectId);if(!executionAdmission.ok)return {workflowRun,dispatches:[],error:executionAdmission.error};
     const node = workflowRun.nodes.find(item => item.id === nodeId);
     if (!node || !['ready', 'pending'].includes(node.status)) return { workflowRun, dispatches: [] };
     const attempt = (node.attempt || 0) + 1;
@@ -4890,6 +5239,28 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     }
   }
 
+  function workflowDependencyOutputs(workflowRun) {
+    const taskScope = workflowRun.workflowId === PO_GENERATED_TASK_WORKFLOW_ID;
+    if (!taskScope && workflowRun.workflowId !== PO_GENERATED_PROJECT_WORKFLOW_ID) return null;
+    const board = boards.get(workflowRun.projectId);
+    const source = taskScope ? board?.getTask(workflowRun.scope?.taskId) : null;
+    if (!board || taskScope && !source) return null;
+    const dependencies = taskScope ? new Set(source.dependencies || []) : null;
+    const outputs = {};
+    for (const task of board.getAllTasks()) {
+      if (task.status !== 'done' || dependencies && !dependencies.has(task.id)) continue;
+      const compact = compactNodeOutput({ id: task.id, title: task.title, output: task.result });
+      const artifactPaths = compact?.artifactPaths?.filter(path => typeof path === 'string' && path.length > 0);
+      if (!artifactPaths?.length) continue;
+      const workFolder = readWorkflowString(task.result?.workFolder) || readWorkflowString(task.result?.workspacePath);
+      outputs[task.id] = { taskId: task.id, title: task.title, artifactPaths,
+        ...(compact.summary ? { summary: compact.summary.slice(0, INLINE_MAX_CHARS) } : {}),
+        ...(workFolder ? { workFolder } : {}),
+      };
+    }
+    return outputs;
+  }
+
   function enrichWorkflowNodeInput(workflowRun, input = null, { nodeId = null } = {}) {
     const base = input && typeof input === 'object' && !Array.isArray(input) ? { ...input } : { value: input };
 
@@ -4934,6 +5305,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       upstreamOutputs = null;
     }
 
+    const dependencyOutputs = workflowDependencyOutputs(workflowRun);
     return {
       ...base,
       workflowRunId: workflowRun.id,
@@ -4944,6 +5316,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
         taskId: workflowRun.scope?.taskId || null,
       },
       sourceTask: base.sourceTask || workflowRun.sourceTask || null,
+      ...(dependencyOutputs ? { dependencyOutputs } : {}),
       ...(upstreamOutputs ? { upstreamOutputs } : {}),
     };
   }
@@ -5519,7 +5892,7 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       if (projectId && workflowRun.projectId !== projectId) continue;
       const result = maybeDeliverScriptWorkflowProjectResult(workflowRun, { now });
       if (result.workflowRun !== workflowRun) {
-        workflowRuns.set(result.workflowRun.id, result.workflowRun);
+        storeWorkflowRun(result.workflowRun);
       }
       if (result.delivery?.ok) {
         delivered.push({ projectId: workflowRun.projectId, workflowRunId: workflowRun.id });
@@ -6258,6 +6631,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
   }
 
   const persisted = {};
+  function hasUncommittedMainPlan(projectId) {
+    const binding=readProjectProtocolBinding(projectId,protocolReceipts);
+    if(binding.binding?.initialPlanning?.producer!=='desktop_main_v1')return false;
+    const reservation=protocolReceipts.get(initialPlanReservationId(projectId));
+    const receipt=reservation && protocolReceipts.get(reservation.commitCommandId);
+    return !(receipt?.kind==='initial_plan_commit_receipt' && receipt.projectId===projectId
+      && receipt.reservationId===reservation.id && receipt.planRunId===reservation.planRunId && receipt.outcome==='applied');
+  }
   const teamInputMutations = new Set([
     'updateProjectExecutionMode',
     'handleHumanAddTasks',
@@ -6267,10 +6648,65 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     'handleSubmitPlan',
     'handleRevisePlan',
   ]);
+  const initialPlanWindowMutations=new Set([...teamInputMutations,'setProjectTeamPlan','attachTeamOperationMembers']);
+  const executionStartMutations=new IntrinsicSet();
+  for(let i=0;i<HUB_PRODUCER_REGISTRATION.executionStart.length;i++)executionStartMutations.add(HUB_PRODUCER_REGISTRATION.executionStart[i]);
+
   for (const [name, fn] of Object.entries(mutations)) {
     persisted[name] = (...args) => {
       assertPersistenceHealthy();
-      if (name === 'createProject' && args[0] && !args[0].id) args[0] = { ...args[0], id: createProjectInstanceId() };
+      if(ordinaryTransactions.size)return {ok:false,error:'ORDINARY_PROJECT_TRANSACTION_ACTIVE'};
+      if(name==='handleResumeTaskForRecovery')return handleResumeTaskForRecovery(...args);
+      if(name==='handleResumeSuspendedRuns')return handleResumeSuspendedRuns(...args);
+      if(executionStartMutations.has(name))migrationBoundary.markExecutionAttempt();
+      if(executionStartMutations.has(name)){const scope=resolveMutationScope(name,args,persistenceLookups);if(scope.type==='project'){const admission=acceptanceOwner.executionStart(scope.projectId);if(!admission.ok)return admission;}}
+      if(name==='handleCloseProject'||name==='deleteProject'){
+        const allowed=authorizeProjectTerminalUser(args[0],args[name==='handleCloseProject'?2:1]);if(!allowed.ok)return allowed;
+      }
+      if(name==='handleHumanAddTasks' && args[2]?.requestSource!=='user')return {ok:false,error:'human_add_tasks_requires_user'};
+      if(initialPlanWindowMutations.has(name) && ['delivered','closed'].includes(projects.get(args[0])?.status))return {ok:false,error:'PROJECT_TERMINAL_REQUIRES_REOPEN'};
+      if(initialPlanWindowMutations.has(name) && hasUncommittedMainPlan(args[0]))return {ok:false,error:'INITIAL_PLAN_CLAIM_REQUIRED'};
+      // Do not put historical final-approval replays behind the terminal gate.
+      // Only an uncommitted Main initial plan lacks authority to create a new
+      // delivered fact; existing post-commit approval/review replay stays intact.
+      if(name==='approveFinalDeliverable'&&hasUncommittedMainPlan(args[0]))return {ok:false,error:'INITIAL_PLAN_CLAIM_REQUIRED'};
+      if (name === 'createProject' && args[0] && !args[0].id) {
+        const original=args[0];args[0]={...original,id:createProjectInstanceId()};if(isPlanningResponseInput(original))notePlanningResponseInput(args[0]);
+      }
+      const createId=name==='createProject' ? args[0]?.id : null;
+      const priorProject=createId ? projects.get(createId) : undefined;
+      const actionWatermark=humanActions.length;
+      const terminalId=['handleCloseProject','deleteProject'].includes(name)?args[0]:null;
+      const terminalSnapshot=terminalId&&projects.has(terminalId)?{
+        project:structuredClone(projects.get(terminalId)),tasks:structuredClone(boards.get(terminalId)?.getAllTasks()),
+        receipts:[...protocolReceipts].filter(([,value])=>value.projectId===terminalId),heads:[...protocolHeads].filter(([,value])=>value.projectId===terminalId),
+        humanActionSeq,persistedHumanActionCount,
+      }:null;
+      let terminalCommitted=false;
+      const rollbackTerminal=error=>{
+        if(!terminalSnapshot || terminalCommitted || error?.durableCommitted)return;
+        projects.set(terminalId,terminalSnapshot.project);
+        if(terminalSnapshot.tasks)boards.set(terminalId,restoreTaskBoard(terminalSnapshot.tasks,terminalId));
+        for(const [key,value] of protocolReceipts)if(value.projectId===terminalId)protocolReceipts.delete(key);
+        for(const [key,value] of protocolHeads)if(value.projectId===terminalId)protocolHeads.delete(key);
+        for(const [key,value] of terminalSnapshot.receipts)protocolReceipts.set(key,value);
+        for(const [key,value] of terminalSnapshot.heads)protocolHeads.set(key,value);
+        for(let i=humanActions.length-1;i>=actionWatermark;i--)if(humanActions[i].projectId===terminalId)humanActions.splice(i,1);
+        humanActionSeq=humanActions.reduce((next,action)=>Number.isSafeInteger(action.seq)?Math.max(next,action.seq+1):next,terminalSnapshot.humanActionSeq);
+        persistedHumanActionCount=Math.min(terminalSnapshot.persistedHumanActionCount,humanActions.length);
+      };
+      let createCommitted=false;
+      const rollbackCreate=()=>{
+        if (!createId || priorProject || createCommitted || context.createDurableCommitted || context.stagedCreate!==projects.get(createId) || !context.stagedCreate) return;
+        const staged=projects.get(createId);
+        if (staged) dropPendingCreateAssignment(staged);
+        acceptanceOwner.abort(createId);
+        projects.delete(createId);boards.delete(createId);
+        const ids=projectProtocolIds(createId);
+        protocolReceipts.delete(ids.binding);protocolReceipts.delete(ids.receipt);
+        for (let i=humanActions.length-1;i>=actionWatermark;i--) if (humanActions[i].projectId===createId) humanActions.splice(i,1);
+        persistedHumanActionCount=Math.min(persistedHumanActionCount,humanActions.length);
+      };
       const admittedScope = resolveMutationScope(name, args, persistenceLookups);
       const context = { events: [], consumed: new Map(), active: true, reservations: new Map() };
       const release = () => { context.active = false; for (const reservation of context.reservations.values()) reservation.release(); };
@@ -6283,9 +6719,14 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
       }
       return activityContext.run(context, () => {
         const commit = result => {
+          let responseFrame,responseRecord;
           try {
             assertPersistenceHealthy();
-            if (teamInputMutations.has(name)) {
+            // Room validation may await, but staging and durable commit must
+            // share this synchronous continuation. No FULL writer can observe
+            // a half-created project between two promise callbacks.
+            if(name==='createProject' && result?.[validatedCreate])result=result[validatedCreate]();
+            if (teamInputMutations.has(name) && result?.ok !== false) {
               const projectId = typeof args[0] === 'string' ? args[0] : args[0]?.id;
               const project = projects.get(projectId);
               if (project) {
@@ -6293,29 +6734,307 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
                 bumpProjectRevision(project, name);
               }
             }
-            persistState(resolveMutationScope(name, args, persistenceLookups));
-            return result;
-          } finally { context.active = false; }
+            if(terminalSnapshot && result?.ok===true)terminalReaction(terminalId,name==='deleteProject'?'deleted':'closed',terminalSnapshot.project,{requestSource:'scheduler',authority:ordinaryTerminalAuthority});
+            if(name==='createProject'&&isPlanningResponseInput(args[0])){
+              if(!result||projects.get(result.id)!==result)throw Error('PLANNING_RESPONSE_UNAVAILABLE');
+              if(context.stagedCreate!==result)return closePlanningResponse(result);
+              responseFrame=Object.freeze(Object.create(null));responseRecord={projectId:result.id,original:result};storePlanningResponseFrame(responseFrame,responseRecord);
+            }
+            persistState(resolveMutationScope(name, args, persistenceLookups),responseFrame);terminalCommitted=true;
+            createCommitted=true;
+            if (name==='createProject' && result && hasPendingCreateAssignment(result)) {
+              const assign=readPendingCreateAssignment(result);dropPendingCreateAssignment(result);
+              try {assign();}catch(error){emitDiagnostic('po.assignment_delivery_unknown',{projectId:result.id,error:String(error?.message ?? error)});}
+            }
+            return responseRecord?responseRecord.closed:result;
+          } catch(error){rollbackCreate();rollbackTerminal(error);throw error;} finally { if(responseFrame)dropPlanningResponseFrame(responseFrame);context.active = false; }
         };
         try {
           const result = fn(...args);
           // Room-first creation validates asynchronously; persist after it settles.
-          if (result && typeof result.then === 'function') return result.then(commit).finally(release);
+          if (result && typeof result.then === 'function') return result.then(commit,error=>{rollbackCreate();rollbackTerminal(error);throw error;}).finally(release);
           try { return commit(result); } finally { release(); }
-        } catch (error) { release(); throw error; }
+        } catch (error) { rollbackCreate();rollbackTerminal(error);release(); throw error; }
       });
     };
   }
 
-  return {
+  function transactOrdinaryProject(projectId,action,input,reserved,persistenceScope={type:'project',projectId}){
+      return withActivityBudget('ordinaryProjectInput',{type:'project',projectId},()=>{
+        const previousProject=structuredClone(projects.get(projectId));
+        const previousTasks=structuredClone(boards.get(projectId)?.getAllTasks());
+        const savedReceipts=[...protocolReceipts].filter(([,value])=>value.projectId===projectId);
+        const savedHeads=[...protocolHeads].filter(([,value])=>value.projectId===projectId);
+        const context=activityContext.getStore();
+        if(ordinaryTransactions.has(projectId)&&ordinaryTransactions.get(projectId)!==reserved)throw Error('ordinary_project_transaction_reentry');
+        const transaction=reserved??{diagnostics:[]};ordinaryTransactions.set(projectId,transaction);
+        const auditWatermark=humanActions.length,previousActionSeq=humanActionSeq,previousPersistedActions=persistedHumanActionCount;
+        const eventWatermark=context.events.length,previousConsumed=new Map(context.consumed);
+        let committed=false;
+        const deliverDiagnostics=()=>{
+          for(const {type,payload} of transaction.diagnostics){
+            // Diagnostic IO cannot revoke an already durable semantic receipt.
+            try{emitDiagnostic(type,payload);}catch(error){if(!silent)try{console.warn('[hub] committed diagnostic delivery failed',error);}catch{/* diagnostic sink itself unavailable */}}
+          }
+        };
+        try {
+          const raw=action(),result=isPlanningResponseInput(input)?closePlanningResponse(raw):raw;
+          persistState(persistenceScope);committed=true;
+          ordinaryTransactions.delete(projectId);deliverDiagnostics();
+          return result;
+        } catch(error) {
+          if (!committed && !error?.durableCommitted) {
+            if(previousProject===undefined)projects.delete(projectId);else projects.set(projectId,previousProject);
+            if(previousTasks)boards.set(projectId,restoreTaskBoard(previousTasks,projectId));else boards.delete(projectId);
+            for (const [key,value] of protocolReceipts) if (value.projectId===projectId) protocolReceipts.delete(key);
+            for (const [key,value] of protocolHeads) if (value.projectId===projectId) protocolHeads.delete(key);
+            for (const [key,value] of savedReceipts) protocolReceipts.set(key,value);
+            for (const [key,value] of savedHeads) protocolHeads.set(key,value);
+            for(let i=humanActions.length-1;i>=auditWatermark;i--)if(humanActions[i].projectId===projectId)humanActions.splice(i,1);
+            humanActionSeq=humanActions.reduce((next,entry)=>Number.isSafeInteger(entry.seq)?Math.max(next,entry.seq+1):next,previousActionSeq);
+            persistedHumanActionCount=Math.min(previousPersistedActions,humanActions.length);
+            // This synchronous original-owner transaction has no detached tail.
+            // Preserve any other project's already committed nested observations.
+            const tail=context.events.slice(eventWatermark).filter(item=>item.payload.projectId!==projectId);
+            context.events.splice(eventWatermark,context.events.length-eventWatermark,...tail);
+            if(previousConsumed.has(projectId))context.consumed.set(projectId,previousConsumed.get(projectId));else context.consumed.delete(projectId);
+            acceptanceOwner.abort(projectId);
+          }else if(error?.durableCommitted){ordinaryTransactions.delete(projectId);deliverDiagnostics();}
+          throw error;
+        }finally{ordinaryTransactions.delete(projectId);}
+      });
+    }
+  const {terminalReaction,...ordinaryProjectInputs}=createOrdinaryProjectInputs({
+    projects,receipts:protocolReceipts,heads:protocolHeads,
+    terminalAuthority:ordinaryTerminalAuthority,acceptanceOwner,transactionActive:projectId=>ordinaryTransactions.has(projectId),
+    readBinding:projectId=>readProjectProtocolBinding(projectId,protocolReceipts),
+    storageReady:()=>{const health=getPersistenceHealth();return !persistenceClosed && health.backend==='sqlite' && health.status!=='failed';},
+    recordTaskAddition(projectId,operationId,taskIds){recordHumanAction('add_tasks',{projectId,operationId,taskIds:[...taskIds],requestSource:'user'});eventLog.emit('tasks.added_by_human',{projectId,operationId,count:taskIds.length,taskIds:[...taskIds]});},
+    applyPlan(projectId,plan,tasks,fromAgent) {
+      const context=Object.freeze(Object.create(null));initialPlanWriteContexts.add(context);
+      try {
+        const planResult=handleSubmitPlan(projectId,plan,fromAgent,context);
+        if(!planResult.ok)return planResult;
+        return handleCreateTasks(projectId,tasks,fromAgent,context);
+      } finally {initialPlanWriteContexts.delete(context);}
+    },
+    transact:transactOrdinaryProject,
+  });
+  const planningMigration=Object.freeze({
+    createProject(input,context){
+      const actor=migrationActor(context,['main_bootstrap_create']),authority=resolveProjectInputAuthority(actor.projectInputAuthority);
+      if(authority.creation?.contract?.protocol!==ADDITIVE_INITIAL_PLAN)throw Error('DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED');
+      const copied=structuredClone(captureExecutionData(input));if(copied.requestedStartPolicy!=='plan_only')throw Error('DEFAULT_DISPATCH_MIGRATION_RECONCILIATION_REQUIRED');
+      notePlanningResponseInput(copied);return migrationBoundary.runPublic('planning.create',()=>Promise.resolve(persisted.createProject(copied,actor)).then(value=>closePlanningResponse(value)),true);
+    },
+    readInputs(projectId,token){migrationActor({requestSource:'user',projectInputAuthority:token},['desktop_control','initial_planner']);return migrationBoundary.runPublic('planning.read',()=>captureExecutionData(ordinaryProjectInputs.readInitialPlanInputs(projectId,token)),true);},
+    claim(projectId,input,context){const actor=migrationActor(context,['initial_planner']),token=actor.projectInputAuthority;const copied=structuredClone(captureExecutionData(input));notePlanningResponseInput(copied);return migrationBoundary.runPublic('planning.claim',()=>closePlanningResponse(ordinaryProjectInputs.claimInitialPlanInputs(projectId,copied,token)),true);},
+    commit(projectId,input,context){const actor=migrationActor(context,['initial_planner']),token=actor.projectInputAuthority;const copied=structuredClone(captureExecutionData(input));notePlanningResponseInput(copied);return migrationBoundary.runPublic('planning.commit',()=>closePlanningResponse(ordinaryProjectInputs.commitInitialPlan(projectId,copied,token)),true);},
+  });
+  const serverTaskObservations=new WeakMap();
+  const serverRead=(name,read,afterCapture)=>migrationBoundary.runPublic('server.observe.'+name,()=>{
+    const revision=getPersistenceHealth().revision,state=migrationBoundary.inspectState();
+    const current=()=>{const health=getPersistenceHealth(),now=migrationBoundary.inspectState();if(persistenceClosed||health.status==='failed'||health.status==='closed'||health.revision!==revision||ordinaryTransactions.size||now.phase!=='open'||now.activeRoots!==state.activeRoots||now.provenanceUnknown!==state.provenanceUnknown)throw Error('SERVER_OBSERVATION_UNAVAILABLE');};
+    current();const result=read(current);current();const captured=captureObservationComposite(result),issue=afterCapture?afterCapture(captured):null;current();if(issue)issue();return captured;
+  },true);
+  function serverOwnedRows(rows,projectId,allowGlobal=false){
+    const result=[];for(const raw of rows.values()){
+      if(!raw||typeof raw!=='object'||utilTypes.isProxy(raw))throw Error('SERVER_OBSERVATION_UNAVAILABLE');
+      const field=Object.getOwnPropertyDescriptor(raw,'projectId');if(!field&&allowGlobal)continue;if(!field||!Object.hasOwn(field,'value'))throw Error('SERVER_OBSERVATION_UNAVAILABLE');
+      if(field.value===projectId)result.push(captureObservationRow(raw));
+    }return result;
+  }
+  const serverReadAgents=typeof getAgentProfiles==='function'?getAgentProfiles:()=>null;
+  const serverReadConcurrency=typeof runtimeInstanceAllocator?.getAgentConcurrency==='function'?runtimeInstanceAllocator.getAgentConcurrency.bind(runtimeInstanceAllocator):()=>({});
+  function serverSyncSource(read,current){current();const value=read();if(utilTypes.isPromise(value)){migrationBoundary.retainDetached(value);throw Error('SERVER_OBSERVATION_UNAVAILABLE');}current();return value;}
+  function serverView(projectId,detail=false,current){
+    const project=captureObservationRow(projects.get(projectId)??null),board=boards.get(projectId);if(!project)return null;
+    const tasks=board?readTaskBoardSnapshot(board):[],runs=serverOwnedRows(workflowRuns,projectId).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)),deliverables=serverOwnedRows(finalDeliverables,projectId).sort((a,b)=>String(b.updatedAt||b.createdAt||'').localeCompare(String(a.updatedAt||a.createdAt||''))),decisions=serverOwnedRows(reviewGateDecisions,projectId).sort((a,b)=>String(b.decidedAt||'').localeCompare(String(a.decidedAt||''))),conditions=serverOwnedRows(reviewConditions,projectId).sort((a,b)=>String(a.conditionId).localeCompare(String(b.conditionId)));
+    const activity=detail?serverOwnedRows(readOriginalEventData(),projectId,true):[],actions=detail?serverOwnedRows(humanActions,projectId,true):[];
+    const liveBoards=new Map();for(const [id,raw] of projects){const p=captureObservationRow(raw),b=boards.get(id);if(b&&isLiveProject(p)){const snapshot=readTaskBoardSnapshot(b);liveBoards.set(id,{getAllTasks:()=>snapshot});}}
+    const allActiveTasks=getActiveTasksAcrossBoards(liveBoards),rawAgents=serverSyncSource(serverReadAgents,current);
+    if(rawAgents&&typeof rawAgents==='object'&&utilTypes.isProxy(rawAgents))throw Error('SERVER_OBSERVATION_UNAVAILABLE');
+    const profileRows=rawAgents&&Object.getPrototypeOf(rawAgents)===Map.prototype?[...Map.prototype.values.call(rawAgents)]:Array.isArray(rawAgents)?rawAgents:rawAgents?Object.values(captureObservationRow(rawAgents)):[];
+    const profiles=captureObservationRows(profileRows),concurrency=captureExecutionData(serverSyncSource(serverReadConcurrency,current));
+    const allowed=new Set([project.poAgent,...(Array.isArray(project.members)?project.members:[])].map(normalizeAgentId).filter(Boolean));
+    const agents=listAgentProfiles(profiles).filter(agent=>allowed.size===0||allowed.has(normalizeAgentId(agent?.id))),view={project,tasks,agents,concurrency,allActiveTasks,board:!!board};
+    const dispatchPlan=board?buildDispatchPlan(projectId,view):null;
+    const projectLifecycle=board?deriveProjectLifecycle({project,tasks,workflowRuns:runs,finalDeliverables:deliverables,reviewGateDecisions:decisions,reviewConditions:conditions}):null;
+    const taskIntervention=board?deriveProjectIntervention({project,tasks,agents,dispatchPlan}):null;
+    const projectIntervention=board?(taskIntervention?.required?taskIntervention:deriveScriptWorkflowIntervention(projectId,runs)??taskIntervention):null;
+    return {project,tasks,activities:activity.filter(event=>event.projectId===projectId),humanActions:actions.filter(action=>action.projectId===projectId),plan:project.plan??null,
+      planProgress:board?taskBoardPlanProgress(tasks):null,dispatchPlan,projectHealth:board?deriveProjectHealth({project,tasks,dispatchPlan}):null,projectIntervention,
+      workflowRuns:runs.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)),projectLifecycle,executionGraph:board?deriveExecutionGraph({project,tasks,workflowRuns:runs,finalDeliverables:deliverables}):null,deliverables,reviewGateDecisions:decisions};
+  }
+  function serverOwnField(raw,key){
+    if(!raw||typeof raw!=='object'||utilTypes.isProxy(raw)||![Object.prototype,null].includes(Object.getPrototypeOf(raw)))throw Error('SERVER_OBSERVATION_UNAVAILABLE');
+    const field=Object.getOwnPropertyDescriptor(raw,key);if(field&&!Object.hasOwn(field,'value'))throw Error('SERVER_OBSERVATION_UNAVAILABLE');return field?.value;
+  }
+  function serverHealth(){
+    const health=captureExecutionData(getPersistenceHealth()),rows=[],retryCapacityProjects=[],outboxes=[];
+    for(const [id,raw] of projects){
+      const requiredProtocol=serverOwnField(raw,'requiredProtocol'),retries=serverOwnField(raw,'roomOutboxRetryOperations');
+      if(requiredProtocol!=null&&(typeof requiredProtocol!=='string'||requiredProtocol.length>256))throw Error('SERVER_OBSERVATION_UNAVAILABLE');
+      rows.push({id,requiredProtocol});if(retries!=null){if(typeof retries!=='object'||utilTypes.isProxy(retries))throw Error('SERVER_OBSERVATION_UNAVAILABLE');if(Object.keys(retries).length>=256)retryCapacityProjects.push(id);}
+    }
+    const originalOutboxes=persistence?committedRoomOutboxes.values():[...projects.values()].map(raw=>serverOwnField(raw,'roomEventOutbox')??[]);
+    for(const raw of originalOutboxes){
+      if(!Array.isArray(raw)||utilTypes.isProxy(raw))throw Error('SERVER_OBSERVATION_UNAVAILABLE');const fields=Object.getOwnPropertyDescriptors(raw),length=fields.length?.value;if(!Number.isSafeInteger(length)||length>100000)throw Error('SERVER_OBSERVATION_UNAVAILABLE');const items=[];
+      for(let i=0;i<length;i++){const row=fields[i];if(!row||!Object.hasOwn(row,'value'))throw Error('SERVER_OBSERVATION_UNAVAILABLE');items.push(captureExecutionData({status:serverOwnField(row.value,'status'),createdAt:serverOwnField(row.value,'createdAt')}));}outboxes.push(items);
+    }
+    return captureExecutionData({ok:!persistenceClosed&&health.status!=='failed',projects:projects.size,persistence:health,migrationPhase:migrationBoundary.inspectState().phase,roomEventOutbox:getRoomEventOutboxHealth({projects:rows,outboxes,retryCapacityProjects}),...getWorkspaceProtocolBaseline(rows)});
+  }
+  const serverObservation=Object.freeze({
+    health:serverHealth,
+    projects:()=>serverRead('projects',()=>captureObservationRows([...projects.values()])),
+    project:projectId=>serverRead('project',()=>captureObservationRow(projects.get(projectId)??null)),
+    tasks(projectId){let proof;return serverRead('tasks',()=>{const board=boards.get(projectId),project=captureExecutionData(projects.get(projectId)??null);proof={board,projectId,revision:getPersistenceHealth().revision,projectDigest:protocolDigest(project)};return board?readTaskBoardSnapshot(board):[];},tasks=>{const entries=tasks.map(task=>[task,Object.freeze({...proof,taskDigest:protocolDigest(task)})]);return()=>{for(const [task,entry] of entries)serverTaskObservations.set(task,entry);};});},
+    projectListView:()=>serverRead('projectListView',current=>[...projects.keys()].map(id=>{
+      const view=serverView(id,false,current),{project,tasks}=view;
+      return captureObservationComposite({...project,taskCount:tasks.length,doneCount:tasks.filter(task=>task.status==='done').length,stoppedCount:tasks.filter(task=>['failed','blocked','cancelled'].includes(task.status)).length,
+        updatedAt:project.updatedAt||project.createdAt||0,projectLifecycle:view.projectLifecycle,projectIntervention:view.projectIntervention,latestWorkflowRun:view.workflowRuns[0]??null});
+    }).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0))),
+    projectDetailView:projectId=>serverRead('projectDetailView',current=>serverView(projectId,true,current)),
+    subscribe(listener){
+      if(typeof listener!=='function'||utilTypes.isProxy(listener))throw Error('SERVER_ACTIVITY_SINK_INVALID');
+      return migrationBoundary.runPublic('server.observe.subscribe',()=>{
+        const wrapped=notice=>{try{const result=listener(captureExecutionData(notice));if(result!==undefined)migrationBoundary.retainDetached(result);}catch(error){migrationBoundary.markUnknown('server_activity_sink',error);}};
+        activitySubscribers.add(wrapped);let active=true;return()=>{if(active){active=false;activitySubscribers.delete(wrapped);}};
+      },true);
+    },
+  });
+  function transactDsh(frame,context,purpose){
+    return migrationBoundary.runAdmissionGuard(()=>{
+      if(ordinaryTransactions.size||activityReadCommitFrame)return {ok:false,error:'DSH_READ_BUSY'};
+      const holder={diagnostics:[]},reservation='dsh-owner-transaction';let key=reservation;
+      ordinaryTransactions.set(key,holder);
+      try{
+        const prepared=purpose==='control'?acceptanceOwner.dsh.prepareControl(frame,context):purpose==='work_control'?acceptanceOwner.dsh.prepareWorkMode(frame,context):(purpose==='draft_stage'||purpose==='draft_commit')?acceptanceOwner.dsh.prepareDraft(frame,purpose,context):acceptanceOwner.dsh.prepare(frame,purpose,context);
+        if(!prepared.needsWrite)return prepared.response??prepared;
+        ordinaryTransactions.delete(key);key=prepared.projectId;ordinaryTransactions.set(key,holder);
+        const response=transactOrdinaryProject(key,()=>acceptanceOwner.dsh.accept(prepared.token),undefined,holder,key===null?FULL_SCOPE:{type:'project',projectId:key});
+        return purpose==='draft_stage'||purpose==='draft_commit'?acceptanceOwner.dsh.afterDraft(prepared.token,response):response;
+      }finally{if(ordinaryTransactions.get(key)===holder)ordinaryTransactions.delete(key);}
+    });
+  }
+  const publicApi={
+    serverObservation,
+    planningMigration,
+    migrateDefaultDispatchWriter(context){
+      if(preparationSendRows.size||preparationHostRows.size||hasUnresolvedPreparationHost())return new TransportPromise(yes=>yes({ok:false,error:'DEFAULT_DISPATCH_MIGRATION_BUSY'}));
+      let actor;try{actor=migrationActor(context);}catch{return Promise.resolve({ok:false,error:'DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED'});}
+      if(migrationBoundary.inspectState().phase==='open'){
+        const profile=persistence?.getWriterProfile?.(),domain=resolveProjectInputAuthority(actor.projectInputAuthority);
+        if(profile?.transition){if(profile.floor.scope.profileId!==domain.profileId||profile.floor.scope.workspaceId!==domain.workspaceId)return Promise.resolve({ok:false,error:'DEFAULT_DISPATCH_MIGRATION_AUTHORITY_REQUIRED'});return Promise.resolve(captureExecutionData({ok:true,reused:true,transition:profile.transition}));}
+      }
+      return migrationBoundary.migrate(actor);
+    },
     ...persisted,
+    ...ordinaryProjectInputs,
+    inspectDefaultDispatchWriter(context){
+      const actor=migrationActor(context),domain=resolveProjectInputAuthority(actor.projectInputAuthority);
+      const health=getPersistenceHealth();if(persistenceClosed||health.backend!=='sqlite'||health.status==='failed')return {ok:false,error:'PROTECTED_PROTOCOL_STORAGE_REQUIRED'};
+      const profile=persistence.getWriterProfile();
+      if(profile.floor?.scope&&(profile.floor.scope.profileId!==domain.profileId||profile.floor.scope.workspaceId!==domain.workspaceId))return {ok:false,error:'PROJECT_SCOPE_MISMATCH'};
+      return captureExecutionData({ok:true,profile});
+    },
+    prepareDshAdmissionOwnerWriter:context=>acceptanceOwner.prepare(context,'dsh_admission_owner_writer_v1'),
+    applyDshWorkModeFence:(frame,context)=>transactDsh(frame,context,'work_control'),
+    readDshAdmissionReceiptBasis:frame=>acceptanceOwner.dsh.read(frame,'admission_basis'),
+    readDshDomain:frame=>acceptanceOwner.dsh.read(frame,'domain'),
+    prepareDshOwnerWriter:context=>acceptanceOwner.prepare(context,'dsh_owner_writer_v1'),
+    applyDshScopeFence:(frame,context)=>transactDsh(frame,context,'control'),
+    applyDshOwnerCommand:(frame,context)=>transactDsh(frame,context,'effect'),
+    applyDshNarrowingCommand:(frame,context)=>transactDsh(frame,context,'narrow'),
+    stageDshDraft:(frame,context)=>transactDsh(frame,context,'draft_stage'),
+    commitDshDraft:(frame,context)=>transactDsh(frame,context,'draft_commit'),
+    readDshDraft:frame=>acceptanceOwner.dsh.read(frame,'draft'),
+    prepareDshDraftSlot:(frame,context)=>transactDsh(frame,context,'slot'),
+    readDshOperation:frame=>acceptanceOwner.dsh.read(frame,'operation'),
+    readDshDraftSlot:frame=>acceptanceOwner.dsh.read(frame,'slot'),
+    readDshWork:frame=>acceptanceOwner.dsh.read(frame,'work'),
+    prepareInitialPlanAcceptanceWriter:context=>acceptanceOwner.prepare(context),
+    prepareFreshInitialPlanAcceptanceWriter:context=>acceptanceOwner.prepareFresh(context),
+    prepareDefaultDispatchWriter:context=>acceptanceOwner.prepare(context,'ordinary_default_dispatch_writer_v1'),
+    prepareDurableDispatchWriter:context=>acceptanceOwner.prepare(context,'ordinary_durable_dispatch_writer_v1'),
+    // WIP foundation only; no Main/HTTP/tool producer enables this profile.
+    prepareDurableDispatchRuntimeWriter:context=>acceptanceOwner.prepare(context,'ordinary_durable_dispatch_runtime_writer_v1'),
+    readDefaultDispatchBirths(projectId,token){
+      const authority=resolveProjectInputAuthority(token);
+      if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return transportFreeze({__proto__:null,ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'});
+      if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+      return acceptanceOwner.readDispatchBirths(projectId,token);
+    },
+    readDefaultDispatchPlan(projectId,token){
+      const authority=resolveProjectInputAuthority(token);
+      if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return transportFreeze({__proto__:null,ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'});
+      if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+      return acceptanceOwner.readDispatchPlan(projectId,token);
+    },
+    captureDefaultDispatchOperation(projectId,frame,context){
+      return migrationBoundary.runAdmissionGuard(()=>withActivityBudget('ordinaryProjectInput',{type:'project',projectId},()=>{
+        if(ordinaryTransactions.size)return Object.freeze(Object.assign(Object.create(null),{ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'}));
+        const transaction={diagnostics:[]};ordinaryTransactions.set(projectId,transaction);
+        try{const prepared=acceptanceOwner.prepareDispatchOperation(projectId,frame,context);if(!prepared.ok)return prepared;if(!prepared.needsWrite)return prepared.response;return transactOrdinaryProject(projectId,()=>acceptanceOwner.acceptDispatchOperation(prepared.token),undefined,transaction);}
+        finally{if(ordinaryTransactions.get(projectId)===transaction)ordinaryTransactions.delete(projectId);}
+      }));
+    },
+    readDefaultDispatchOperation(projectId,lookup,token){
+      const authority=resolveProjectInputAuthority(token);
+      if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return transportFreeze({__proto__:null,ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'});
+      if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+      return acceptanceOwner.readDispatchOperation(projectId,lookup,token);
+    },
+    readDefaultDispatchChild(projectId,lookup,token){
+      const authority=resolveProjectInputAuthority(token);
+      if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return transportFreeze({__proto__:null,ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'});
+      // Same-connection policy reads can see staged SQL before COMMIT. Never
+      // publish those rows as original immutable B facts to a mapper/source.
+      if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+      return acceptanceOwner.readDispatchChild(projectId,lookup,token);
+    },
+    prepareOrdinaryTaskInputWriter:context=>acceptanceOwner.prepare(context,'ordinary_task_addition_writer_v2'),
+    getProjectProtocolBinding: projectId => readProjectProtocolBinding(projectId,protocolReceipts),
+    checkProjectExecutionStart:projectId=>ordinaryTransactions.size?{ok:false,error:'ORDINARY_PROJECT_TRANSACTION_ACTIVE'}:acceptanceOwner.executionStart(projectId),
+    readProjectExecutionStart(projectId,token){
+      const authority=resolveProjectInputAuthority(token);
+      if(authority?.requestSource!=='user'||authority.kind!=='desktop_control')return {ok:false,error:'PROJECT_INPUT_AUTHORITY_REQUIRED'};
+      const health=getPersistenceHealth();if(persistenceClosed||health.backend!=='sqlite'||health.status==='failed')return {ok:false,error:'PROTECTED_PROTOCOL_STORAGE_REQUIRED'};
+      const binding=readProjectProtocolBinding(projectId,protocolReceipts);
+      if(binding.binding&&Object.hasOwn(binding.binding,'scope')&&!isProjectProtocolScope(binding.binding.scope))return {ok:false,error:'PROJECT_SCOPE_UNVERIFIED'};
+      if(binding.binding?.scope&&(binding.binding.scope.profileId!==authority.profileId||binding.binding.scope.workspaceId!==authority.workspaceId))return {ok:false,error:'PROJECT_SCOPE_MISMATCH'};
+      if(ordinaryTransactions.size)return {ok:false,error:'ORDINARY_PROJECT_TRANSACTION_ACTIVE'};
+      const admission=acceptanceOwner.executionStart(projectId);if(!admission.ok)return admission;
+      return {ok:true,protocol:'ordinary_project_execution_start_read_v1',projectId,classification:admission.classification,
+        bindingDigest:binding.classification==='ordinary'?protocolDigest(binding.binding):null,scope:{profileId:authority.profileId,workspaceId:authority.workspaceId}};
+    },
     getProject,
     mutateProjectState(projectId, action) {
+      if(ordinaryTransactions.size)throw Error('ORDINARY_PROJECT_TRANSACTION_ACTIVE');
       if (!projects.has(projectId)) throw new Error('project_not_found');
       if (typeof action !== 'function') throw new Error('project_mutation_callback_required');
       return withActivityBudget('serverProjectState', { type: 'project', projectId }, () => {
-        const commit = result => { persistState({ type: 'project', projectId }); return result; };
-        const result = action(); return result && typeof result.then === 'function' ? result.then(commit) : commit(result);
+        const hasPending=()=>[...protocolReceipts.values()].some(receipt=>receipt.projectId===projectId&&receipt.kind==='ordinary_input_operation'
+          &&receipt.action==='add_plan_input'&&protocolHeads.get(receipt.id+':lifecycle')?.status==='accepted_pending');
+        const protectedPending=hasPending(),previous=protectedPending?structuredClone(projects.get(projectId)):null;
+        // All current server callbacks are synchronous metadata updates. A
+        // pending input's terminal transition belongs to its original semantic
+        // owner, not this generic callback (nor an asynchronous callback tail).
+        if(protectedPending&&action.constructor?.name==='AsyncFunction')throw Error('INITIAL_PLAN_CLAIM_REQUIRED');
+        const commit = result => {
+          if(hasPending()&&['closed','delivered'].includes(projects.get(projectId)?.status)){
+            if(previous)projects.set(projectId,previous);
+            throw Error('INITIAL_PLAN_CLAIM_REQUIRED');
+          }
+          persistState({ type: 'project', projectId }); return result;
+        };
+        const result = action();
+        if(utilTypes.isPromise(result))migrationBoundary.retainDetached(result);
+        if(protectedPending&&result&&typeof result.then==='function'){
+          projects.set(projectId,previous);const error=Error('INITIAL_PLAN_CLAIM_REQUIRED');activityCommitError=error;
+          void Promise.resolve(result).catch(()=>{});throw error;
+        }
+        return result && typeof result.then === 'function' ? result.then(commit) : commit(result);
       });
     },
     getProjectActivityIdentity,
@@ -6330,6 +7049,8 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     listProjects,
     findReusableProjectForCreateRequest,
     getProjectActivity,
+    readScopedProjectActivity,
+    readProjectSourceActivity,
     subscribeProjectActivity,
     getRoomEventOutbox,
     flushRoomEventOutbox,
@@ -6370,8 +7091,412 @@ export function createHub({ bridge, eventLogDir, silent = false, dataDir, projec
     setProjectTeamPlan: persisted.setProjectTeamPlan,
     attachTeamOperationMembers: persisted.attachTeamOperationMembers,
     invalidateTeamPlansForAgent: persisted.invalidateTeamPlansForAgent,
-    persistState,
+    persistState(scope){if(ordinaryTransactions.size)throw Error('ORDINARY_PROJECT_TRANSACTION_ACTIVE');return persistState(scope);},
     getPersistenceHealth,
     closePersistence,
   };
+  const migrationSafe=new IntrinsicSet();for(let i=0;i<HUB_PRODUCER_REGISTRATION.migrationSafe.length;i++)migrationSafe.add(HUB_PRODUCER_REGISTRATION.migrationSafe[i]);
+  const hasManagedDshDomain=()=>{if(acceptanceOwner.dsh.active())return true;for(const row of protocolReceipts.values())if(row?.kind==='dsh_binding')return true;return false;};
+  const targetField=(value,key)=>{if(!value||typeof value!=='object'||utilTypes.isProxy(value))return;const d=dshDescriptor(value,key);return d&&dshOwn(d,'value')?d.value:undefined;};
+  const mappedTarget=(map,key)=>{const row=dshMapGet(map,key);if(row===undefined)return;const target=targetField(row,'projectId');if(typeof target!=='string'||!target)throw Error('HUB_PRODUCER_TARGET_UNVERIFIED');return target;};
+  const registeredTarget=(registration,args)=>{
+   const first=args[0];
+   switch(registration.target){
+    case 'project_arg0':return typeof first==='string'?first:targetField(first,'projectId');
+    case 'workflow_proposal_arg0':return mappedTarget(workflowProposals,first);
+    case 'workflow_run_arg0':return mappedTarget(workflowRuns,first);
+    case 'object_workflow_run_id':return mappedTarget(workflowRuns,targetField(first,'workflowRunId'));
+    case 'none':case 'domain':return undefined;
+    default:throw Error('HUB_PRODUCER_TARGET_UNREGISTERED');
+   }
+  };
+  const producerDenied=(registration,args)=>{
+   if(!registration)return hasManagedDshDomain()?{ok:false,error:'DSH_PRODUCER_UNREGISTERED'}:null;
+   if(registration.dsh!=='deny'&&registration.dsh!=='original_owner'&&registration.dsh!=='original_reader')throw Error('HUB_PRODUCER_POLICY_UNREGISTERED');
+   return registration.dsh==='deny'&&acceptanceOwner.dsh.isProject(registeredTarget(registration,args))?{ok:false,error:'DSH_OWNER_REQUIRED'}:null;
+  };
+  const originalPublicKeys=transportKeys(publicApi),publicRows=[],portRows=transportCreate(null),mutationRows=transportKeys(mutations);
+  for(let i=0;i<originalPublicKeys.length;i++){
+   const name=originalPublicKeys[i],slot=transportDescriptor(publicApi,name);if(typeof name!=='string'||!slot||!transportOwn(slot,'value'))throw Error('HUB_PUBLIC_PRODUCER_DESCRIPTOR_REQUIRED');
+   transportDefine(publicRows,publicRows.length,{__proto__:null,value:name,enumerable:true});
+   if(slot.value&&typeof slot.value==='object'){
+    const originalPort=slot.value,names=transportKeys(originalPort),list=[],projection=transportCreate(null);
+    for(let j=0;j<names.length;j++){
+     const key=names[j],d=transportDescriptor(originalPort,key);if(typeof key!=='string'||!d||!transportOwn(d,'value')||typeof d.value!=='function')throw Error('HUB_PUBLIC_PRODUCER_DESCRIPTOR_REQUIRED');
+     const method=d.value,registration=readHubProducerDescriptor(name+'.'+key);
+     transportDefine(projection,key,{__proto__:null,value:(...args)=>producerDenied(registration,args)??transportApply(method,originalPort,args),enumerable:true});
+     transportDefine(list,list.length,{__proto__:null,value:key,enumerable:true});
+    }
+    publicApi[name]=transportFreeze(projection);
+    transportDefine(portRows,name,{__proto__:null,value:transportFreeze(list),enumerable:true});
+   }
+  }
+  hubProducerSurfaces.set(publicApi,transportFreeze({__proto__:null,publicKeys:transportFreeze(publicRows),ports:transportFreeze(portRows),mutations:transportFreeze(mutationRows)}));
+  for(let i=0;i<originalPublicKeys.length;i++){const name=originalPublicKeys[i],method=transportDescriptor(publicApi,name).value;if(typeof method==='function'&&!['getPersistenceHealth','closePersistence','migrateDefaultDispatchWriter'].includes(name))publicApi[name]=(...args)=>migrationBoundary.runPublic(name,()=>{
+    const registration=readHubProducerDescriptor(name);
+    // Unknown targets cannot borrow an ordinary-looking arg0 or caller flag.
+    // The original ordinary-only domain keeps its existing compatibility path.
+    const denied=producerDenied(registration,args);if(denied)return denied;
+    const first=args[0];
+    if(name==='createProject'){const id=targetField(first,'id');if(typeof id==='string'&&dshStartsWith(id,'dsh-work:'))return {ok:false,error:'DSH_NAMESPACE_RESERVED'};}
+    // Registration only narrows the original mutation guard, never replaces it.
+    const mutation=dshOwn(mutations,name)||name==='mutateProjectState'||name==='dispatchWorkspaceTask'||name==='applyWorkspaceMapping'||name==='submitWorkspaceTaskResult'||registration?.dsh==='deny';
+    const target=registration?registeredTarget(registration,args):undefined;
+    if(mutation&&acceptanceOwner.dsh.isProject(target))return {ok:false,error:'DSH_OWNER_REQUIRED'};
+    return method(...args);
+  },migrationSafe.has(name));}
+  function transactDefaultDispatchPreparation(projectId,frame,context,purpose,afterNormalReturn,beforeWrite){
+    return migrationBoundary.runAdmissionGuard(()=>withActivityBudget('ordinaryProjectInput',{type:'project',projectId},()=>{
+      if(ordinaryTransactions.size)return Object.freeze(Object.assign(Object.create(null),{ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'}));
+      const transaction={diagnostics:[]};ordinaryTransactions.set(projectId,transaction);
+      try{
+        const prepared=(purpose==='finish_host_no_effect'?acceptanceOwner.prepareDispatchHostNoEffectFinish:purpose==='register_host'?acceptanceOwner.prepareDispatchHostRegistration:purpose==='prepare'?acceptanceOwner.prepareDispatchChild:purpose==='admit'?acceptanceOwner.admitDispatchChildPreparation:purpose==='observe'?acceptanceOwner.readDispatchChildPreparation:acceptanceOwner.acknowledgeDispatchChild)(projectId,frame,context);
+        if(!prepared.ok)return afterNormalReturn&&purpose!=='register_host'&&purpose!=='finish_host_no_effect'?transportFreeze({__proto__:null,result:prepared,proof:null}):prepared;
+        if(prepared.needsWrite&&beforeWrite)beforeWrite(prepared);
+        const result=prepared.needsWrite?transactOrdinaryProject(projectId,()=>acceptanceOwner.acceptDispatchOperation(prepared.token),undefined,transaction):prepared.response;
+        // This is outside transactOrdinaryProject's rollback catch. An
+        // already-committed graph survives every subsequent mint failure.
+        return afterNormalReturn?afterNormalReturn(prepared,result):result;
+      }
+      finally{if(ordinaryTransactions.get(projectId)===transaction)ordinaryTransactions.delete(projectId);}
+    }));
+  }
+  let serverSchedulerBound=false;
+  const schedulerActor=context=>{
+    if(!context||typeof context!=='object'||utilTypes.isProxy(context))throw Error('SERVER_SCHEDULER_AUTHORITY_REQUIRED');
+    const fields=Object.getOwnPropertyDescriptors(context);if(Reflect.ownKeys(fields).length!==1||fields.requestSource?.value!=='scheduler'||!Object.hasOwn(fields.requestSource,'value'))throw Error('SERVER_SCHEDULER_AUTHORITY_REQUIRED');
+    const health=getPersistenceHealth();if(persistenceClosed||health.backend!=='sqlite'||health.status==='failed'||health.status==='closed')throw Error('SERVER_SCHEDULER_UNAVAILABLE');
+  };
+  serverSchedulerOwners.set(publicApi,()=>{
+    if(serverSchedulerBound)throw Error('SERVER_SCHEDULER_BOUND');serverSchedulerBound=true;
+    let watchdogBound=false,deliveryConstructionTaken=false,deliveryConstructionActor,pinnedDeliveryOwner;
+    const deliveryConstructionBinding=Object.freeze(Object.create(null));
+    let preparationSourceTaken=false,preparationClient=null,preparationSend,preparationSealed=false,transportSequence=0;
+    const preparationSendRecords=new IntrinsicWeakMap(),hostRegistrations=new IntrinsicMap();
+    const preparationEpoch=transportFreeze(transportCreate(null)),preparationProofs=new IntrinsicWeakMap(),preparationAdmissions=new IntrinsicMap();
+    function assertTransportLocal(owner,actor,client=preparationClient){
+      if(preparationSealed||persistenceClosed||!preparationSourceTaken||!preparationClient||client!==preparationClient||owner!==pinnedDeliveryOwner||actor!==deliveryConstructionActor)throw Error('DEFAULT_DISPATCH_TRANSPORT_OWNER_UNAVAILABLE');
+      // Historical migration provenance describes migration eligibility, not
+      // this prepare-only source. Its original B guard and physical graph
+      // qualify the candidate independently; no execution grant is issued.
+      if(migrationBoundary.inspectState().phase!=='open')throw Error('DEFAULT_DISPATCH_TRANSPORT_OWNER_UNAVAILABLE');
+    }
+    const preparationTransportSource=transportFreeze({__proto__:null,resolve(proof,actualClient){
+      const entry=preparationProofs.get(proof);if(!entry||entry.used||entry.epoch!==preparationEpoch)throw Error('DEFAULT_DISPATCH_TRANSPORT_PROOF_REQUIRED');
+      assertTransportLocal(entry.owner,entry.actor,actualClient);
+      return transportFreeze({__proto__:null,data:entry.data,
+        assertCurrent(){
+          assertTransportLocal(entry.owner,entry.actor,actualClient);schedulerActor(entry.actor);
+          migrationBoundary.runAdmissionGuard(()=>entry.candidate.assertCurrent());
+          schedulerActor(entry.actor);assertTransportLocal(entry.owner,entry.actor,actualClient);entry.currentChecked=true;
+        },
+        consume(){
+          assertTransportLocal(entry.owner,entry.actor,actualClient);
+          if(entry.used||!entry.currentChecked)throw Error('DEFAULT_DISPATCH_TRANSPORT_PROOF_REQUIRED');entry.used=true;
+        },
+      });
+    }});
+    function mintPreparationProof(prepared,result,owner,actor){
+      // Only the original private prepared candidate reaches this function;
+      // serialized operation labels are never authority to send.
+      try{
+        const candidate=prepared.transportCandidate;
+        if(!candidate)throw Error('DURABLE_DISPATCH_PREPARATION_ADMISSION_REQUIRED');
+        if(candidate.purpose==='prepare'&&(!prepared.needsWrite||!prepared.token||!candidate.admissionId))throw Error('DEFAULT_DISPATCH_TRANSPORT_PROVENANCE_REQUIRED');
+        const p=candidate.preparation;
+        const hint={protocol:'ordinary_default_dispatch_runtime_v1',version:1,purpose:candidate.purpose,scope:p.scope,projectId:p.projectId,childKey:p.childKey,payloadHash:p.payloadHash,runId:p.runId,preparationClaimId:p.preparationClaimId,intentDigest:p.intentDigest,admissionId:p.admissionId,bindingDigest:p.bindingDigest,hostId:p.hostId,targetParticipantId:p.targetParticipantId,targetIncarnation:p.targetIncarnation,inputMapperVersion:p.inputMapperVersion,inputDigest:p.inputDigest};
+        const data=freezeTransportData(captureDispatchBusinessData({purpose:candidate.purpose,messageId:'default-dispatch-'+candidate.purpose+':'+p.intentDigest+':'+(++transportSequence),targetParticipantId:p.targetParticipantId,taskId:p.kswarmTaskId,threadId:'default-dispatch:'+p.childKey,payload:hint},raw=>migrationBoundary.retainGuardTail(raw)));
+        schedulerActor(actor);migrationBoundary.runAdmissionGuard(()=>candidate.assertCurrent());schedulerActor(actor);assertTransportLocal(owner,actor);
+        if(candidate.purpose==='prepare'&&preparationAdmissions.has(candidate.admissionId))throw Error('DEFAULT_DISPATCH_TRANSPORT_PROVENANCE_REQUIRED');
+        const proof=transportFreeze(transportCreate(null)),entry={__proto__:null,owner,actor,client:preparationClient,epoch:preparationEpoch,candidate,data,proof,used:false,currentChecked:false,readingCut:false};
+        preparationProofs.set(proof,entry);
+        // Preserve first-prepare custody for the complete original owner
+        // lifetime. Proof/Net Promise GC must not erase consumed provenance.
+        if(candidate.purpose==='prepare')preparationAdmissions.set(candidate.admissionId,entry);
+        return transportFreeze({__proto__:null,result,proof});
+      }catch(error){
+        if(getPersistenceHealth().status==='failed')throw error;
+        // The normal COMMIT result remains authoritative. No retry, rollback,
+        // new run, or proof is created when post-COMMIT admission fails.
+        return transportFreeze({__proto__:null,result,proof:null,transportError:error});
+      }
+    }
+    const schedulerPorts=Object.freeze({
+      takeTaskDeliveryOwnerConstructionBinding(context){return migrationBoundary.runPublic('server.takeDeliveryOwnerBinding',()=>{
+        schedulerActor(context);if(deliveryConstructionTaken)throw Error('ORIGINAL_TASK_DELIVERY_BINDING_TAKEN');
+        deliveryConstructionTaken=true;deliveryConstructionActor=context;return deliveryConstructionBinding;
+      },true);},
+      bindTaskDeliveryOwner(owner,context){return migrationBoundary.runPublic('server.bindDeliveryOwner',()=>{
+        const birth=readOriginalTaskDeliveryOwnerBirth(owner);if(!birth)throw Error('ORIGINAL_TASK_DELIVERY_OWNER_REQUIRED');
+        schedulerActor(context);if(pinnedDeliveryOwner)throw Error('ORIGINAL_TASK_DELIVERY_OWNER_BOUND');
+        if(!deliveryConstructionTaken||context!==deliveryConstructionActor||!originalTaskDeliveryOwnerMatchesBinding(owner,deliveryConstructionBinding))throw Error('ORIGINAL_TASK_DELIVERY_BINDING_REQUIRED');
+        pinnedDeliveryOwner=owner;
+      },true);},
+      takeDefaultDispatchPreparationTransportSource(owner,context){return migrationBoundary.runPublic('server.takePreparationTransportSource',()=>{
+        schedulerActor(context);if(owner!==pinnedDeliveryOwner||context!==deliveryConstructionActor||!owner)throw Error('ORIGINAL_TASK_DELIVERY_OWNER_REQUIRED');
+        if(preparationSourceTaken)throw Error('DEFAULT_DISPATCH_TRANSPORT_SOURCE_TAKEN');preparationSourceTaken=true;return preparationTransportSource;
+      },true);},
+      bindDefaultDispatchPreparationClient(owner,client,context){return migrationBoundary.runPublic('server.bindPreparationClient',()=>{
+        if(!originalPreparationClientMatchesSource(client,preparationTransportSource))throw Error('ORIGINAL_PREPARATION_CLIENT_REQUIRED');
+        schedulerActor(context);if(owner!==pinnedDeliveryOwner||context!==deliveryConstructionActor||!owner||!preparationSourceTaken||preparationSealed)throw Error('DEFAULT_DISPATCH_TRANSPORT_OWNER_UNAVAILABLE');
+        if(preparationClient)throw Error('DEFAULT_DISPATCH_TRANSPORT_CLIENT_BOUND');
+        preparationSend=transportDescriptor(client,'sendDefaultDispatchPreparation').value;preparationClient=client;
+      },true);},
+      startDefaultDispatchPreparationTransport(projectId,frame,owner,context){
+        assertTransportLocal(owner,context);
+        if(typeof projectId!=='string'||!projectId||projectId.length>256||transportExec(/[\x00-\x1f\x7f]/,projectId)!==null)throw Error('DEFAULT_DISPATCH_PREPARATION_PROJECT_INVALID');
+        const record=transportFreeze(transportCreate(null)),row={__proto__:null,record,owner,actor:context,client:preparationClient,source:preparationTransportSource,proof:null,raw:null,result:undefined,view:undefined,completion:undefined,entered:false,settled:false,failed:false,failure:undefined,transportError:undefined,sendStatus:'not_invoked'};
+        preparationSendRecords.set(record,row);preparationSendRows.add(row);
+        const view=()=>{row.view=transportFreeze({__proto__:null,result:row.result,raw:row.raw,sendStatus:row.sendStatus,transportError:row.transportError});return record;};
+        try{
+          schedulerActor(context);
+          const admitted=ordinaryTransactions.size||activityReadCommitFrame
+            ?transportFreeze({__proto__:null,result:transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'}),proof:null})
+            :migrationBoundary.runPublic('server.startDefaultDispatchPreparationTransport',()=>transactDefaultDispatchPreparation(projectId,frame,context,'admit',(prepared,result)=>mintPreparationProof(prepared,result,owner,context)),true);
+          row.result=admitted.result;row.proof=admitted.proof;
+          if(!row.proof){row.transportError=admitted.transportError;row.completion=new TransportPromise(yes=>yes());row.settled=true;preparationSendRows.delete(row);return view();}
+          // This original SDK caller owns its strong reservation before Net
+          // invocation; retain the exact returned raw before bridge creation.
+          row.entered=true;row.raw=undefined;row.sendStatus='unconfirmed';
+          row.raw=transportApply(preparationSend,row.client,[row.proof,'scheduler']);
+          try{
+            if(row.result.preparation.operation==='admit'){assertOriginalPreparationTransportCurrent(row.client,row.source,row.proof);row.sendStatus='send_started';}
+            else row.sendStatus='observe_requested';
+          }catch(error){row.transportError=error;}
+          // Fail before constructing a possibly rejected bridge if its native
+          // Promise environment is already unobservable. Keep raw/row strong.
+          if(!transportPromiseEnvironment())throw Error('DEFAULT_DISPATCH_PREPARATION_COMPLETION_UNCONFIRMED');
+          const completion=readOriginalPreparationTransportCompletion(row.client,row.source,row.proof,row.raw);row.completion=completion;
+          if(!transportStandardCompletion(completion))throw Error('DEFAULT_DISPATCH_PREPARATION_COMPLETION_UNCONFIRMED');
+          transportApply(transportThen,completion,[()=>{row.settled=true;preparationSendRows.delete(row);},error=>{row.failed=true;row.failure=error;row.settled=true;preparationSendRows.delete(row);}]);
+          return view();
+        }catch(error){
+          if(!row.entered){preparationSendRows.delete(row);throw error;}
+          row.transportError=error;row.sendStatus='unconfirmed';return view();
+        }
+      },
+      readDefaultDispatchPreparationSend(record,owner,context){
+        const row=record&&typeof record==='object'?preparationSendRecords.get(record):undefined;
+        if(!row||row.owner!==owner||row.actor!==context)throw Error('DEFAULT_DISPATCH_PREPARATION_SEND_RECORD_REQUIRED');
+        return row.view;
+      },
+      readDefaultDispatchPreparationSendCompletion(record,owner,context){
+        const row=record&&typeof record==='object'?preparationSendRecords.get(record):undefined;
+        if(!row||row.owner!==owner||row.actor!==context)throw Error('DEFAULT_DISPATCH_PREPARATION_SEND_RECORD_REQUIRED');
+        if(!row.completion)throw Error('DEFAULT_DISPATCH_PREPARATION_COMPLETION_UNCONFIRMED',{cause:row.transportError});
+        return row.completion;
+      },
+      sealDefaultDispatchPreparationTransport(owner,context){
+        if(owner!==pinnedDeliveryOwner||context!==deliveryConstructionActor||!owner)throw Error('ORIGINAL_TASK_DELIVERY_OWNER_REQUIRED');preparationSealed=true;
+      },
+      finishDefaultDispatchHostNoEffect(projectId,frame,owner,context){
+        schedulerActor(context);
+        if(!owner||owner!==pinnedDeliveryOwner||context!==deliveryConstructionActor||!preparationClient||!preparationSourceTaken||persistenceClosed||migrationBoundary.inspectState().phase!=='open')throw Error('DEFAULT_DISPATCH_TRANSPORT_OWNER_UNAVAILABLE');
+        let settlementRow;
+        try{return migrationBoundary.runPublic('server.finishDefaultDispatchHostNoEffect',()=>transactDefaultDispatchPreparation(projectId,frame,context,'finish_host_no_effect',(prepared,result)=>{
+          if(!prepared.needsWrite)return result;
+          const token=acceptanceOwner.advanceHostNoEffectFinish(prepared.finishAdvanceToken);
+          const row=hostRegistrations.get(result.hostEffect.noEffectFinish.registrationDigest);
+          if(!row||row.unknown||row.registrationToken!==token||row.owner!==owner||row.context!==context||row.client!==preparationClient||row.epoch!==preparationEpoch)throw Error('DURABLE_DISPATCH_HOST_SETTLEMENT_REQUIRED');
+          row.finished=true;preparationHostRows.delete(row);return result;
+        },prepared=>{
+          const row=hostRegistrations.get(prepared.response.hostEffect.noEffectFinish.registrationDigest);
+          if(!row||row.unknown||row.registrationToken!==prepared.registrationToken)throw Error('DURABLE_DISPATCH_HOST_SETTLEMENT_REQUIRED');
+          settlementRow=row;
+        }),true);}catch(error){if(settlementRow){settlementRow.unknown=true;settlementRow.failure=error;}throw error;}
+      },
+      registerDefaultDispatchHostEffect(projectId,frame,owner,context){
+        schedulerActor(context);assertTransportLocal(owner,context);
+        // Reserve before any Source/Native SDK. Normal COMMIT keeps this actual
+        // effect-domain inventory until a future authenticated finish; Net EOF
+        // or a failure response cannot release it.
+        const row={__proto__:null,owner,context,projectId,committed:false,unknown:false};preparationHostRows.add(row);
+        try{return migrationBoundary.runPublic('server.registerDefaultDispatchHostEffect',()=>transactDefaultDispatchPreparation(projectId,frame,context,'register_host',(prepared,result)=>{
+          if(!prepared.needsWrite)return result;
+          row.committed=true;row.registration=result.hostEffect.registration;row.registrationToken=prepared.hostAdvanceToken;row.client=preparationClient;row.epoch=preparationEpoch;hostRegistrations.set(protocolDigest(row.registration),row);
+          acceptanceOwner.advanceRegisteredHost(prepared.hostAdvanceToken);return result;
+        }),true);}catch(error){row.failure=error;try{if(getPersistenceHealth().status==='failed')row.unknown=true;}catch(cause){row.healthFailure=cause;row.unknown=true;}throw error;}finally{if(!row.committed&&!row.unknown)preparationHostRows.delete(row);}
+      },
+      prepareDefaultDispatchChildTransport(projectId,frame,owner,context){
+        schedulerActor(context);assertTransportLocal(owner,context);
+        return migrationBoundary.runPublic('server.prepareDefaultDispatchChildTransport',()=>transactDefaultDispatchPreparation(projectId,frame,context,'prepare',(prepared,result)=>mintPreparationProof(prepared,result,owner,context)),true);
+      },
+      admitDefaultDispatchChildPreparationTransport(projectId,frame,owner,context){
+        schedulerActor(context);assertTransportLocal(owner,context);
+        return migrationBoundary.runPublic('server.admitDefaultDispatchChildPreparationTransport',()=>transactDefaultDispatchPreparation(projectId,frame,context,'admit',(prepared,result)=>mintPreparationProof(prepared,result,owner,context)),true);
+      },
+      /** Private prepare-only read cut, not an authenticated Host grant/RPC. */
+      assertDefaultDispatchPreparationTransportCurrent(admissionId,owner,context){
+        schedulerActor(context);assertTransportLocal(owner,context);
+        return migrationBoundary.runPublic('server.assertDefaultDispatchPreparationTransportCurrent',()=>{
+          const entry=typeof admissionId==='string'?preparationAdmissions.get(admissionId):undefined;
+          if(!entry||entry.readingCut||!entry.used||entry.epoch!==preparationEpoch||entry.owner!==owner||entry.actor!==context||entry.client!==preparationClient||entry.candidate.purpose!=='prepare')throw Error('DEFAULT_DISPATCH_PREPARATION_CALL_UNAVAILABLE');
+          assertOriginalPreparationTransportCurrent(preparationClient,preparationTransportSource,entry.proof);
+          entry.readingCut=true;
+          try{
+            migrationBoundary.runAdmissionGuard(()=>entry.candidate.assertCurrent());
+            schedulerActor(context);assertTransportLocal(owner,context);
+            assertOriginalPreparationTransportCurrent(preparationClient,preparationTransportSource,entry.proof);
+          }finally{entry.readingCut=false;}
+        },true);
+      },
+      readDefaultDispatchChildPreparationTransport(projectId,frame,owner,context){
+        schedulerActor(context);assertTransportLocal(owner,context);
+        return migrationBoundary.runPublic('server.readDefaultDispatchChildPreparationTransport',()=>transactDefaultDispatchPreparation(projectId,frame,context,'observe',(prepared,result)=>mintPreparationProof(prepared,result,owner,context)),true);
+      },
+      invalidateAgentTeamPlans(agentId,context){
+        schedulerActor(context);
+        if(typeof agentId!=='string'||!agentId||agentId.length>2048||agentId.includes('\0'))throw Error('SERVER_AGENT_INPUT_INVALID');
+        // AgentStore saves before invoking its observer. Closing must retain
+        // that already-happened source change even though runPublic denies it.
+        if(migrationBoundary.inspectState().phase!=='open'){
+          const error=Error('SERVER_AGENT_INPUT_UNVERIFIED');migrationBoundary.markUnknown('server.agentTeamChange',error);throw error;
+        }
+        return migrationBoundary.runPublic('server.agentTeamChange',()=>{
+          try{
+            const revision=getPersistenceHealth().revision,state=migrationBoundary.inspectState(),guards=migrationBoundary.inspectGuardTails(),rows=[];
+            if(state.activeRoots!==1||state.rawTails||guards.pending||guards.unknown)throw Error('SERVER_AGENT_INPUT_UNVERIFIED');
+            let count=0;
+            const iterator=agentReferenceMapEntries(projects);
+            for(let next=agentReferenceMapNext(iterator);!next.done;next=agentReferenceMapNext(iterator)){
+              const [key,project]=next.value;
+              const data=captureExecutionData(project);assertClosedProjectAgentReferences(data);
+              rows.push({key,project,digest:protocolDigest(data)});if(projectReferencesAgent(data,agentId))count++;
+            }
+            const final=migrationBoundary.inspectState(),tail=migrationBoundary.inspectGuardTails();
+            if(final.phase!=='open'||final.activeRoots!==state.activeRoots||final.rawTails!==state.rawTails||final.provenanceUnknown!==state.provenanceUnknown||final.executionAttempt!==state.executionAttempt
+              ||tail.pending||tail.unknown||getPersistenceHealth().revision!==revision||agentReferenceMapSize(projects)!==rows.length)throw Error('SERVER_AGENT_INPUT_UNVERIFIED');
+            for(const row of rows)if(agentReferenceMapGet(projects,row.key)!==row.project||protocolDigest(captureExecutionData(row.project))!==row.digest)throw Error('SERVER_AGENT_INPUT_UNVERIFIED');
+            if(!count)return 0;
+            migrationBoundary.markUnknown('server.agentTeamChange');return persisted.invalidateTeamPlansForAgent(agentId);
+          }catch(error){migrationBoundary.markUnknown('server.agentTeamChange',error);throw error;}
+        },true);
+      },
+      readDefaultDispatchPreparationBasis(projectId,frame,context){
+        schedulerActor(context);
+        if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+        return migrationBoundary.runPublic('server.readDefaultDispatchPreparationBasis',()=>migrationBoundary.runAdmissionGuard(()=>acceptanceOwner.readDispatchPreparationBasis(projectId,frame,context)),true);
+      },
+      readDefaultDispatchPreparationCall(projectId,frame,context){
+        schedulerActor(context);
+        if(ordinaryTransactions.size||activityReadCommitFrame)return transportFreeze({__proto__:null,ok:false,error:'DURABLE_DISPATCH_OPERATION_BUSY'});
+        return migrationBoundary.runPublic('server.readDefaultDispatchPreparationCall',()=>migrationBoundary.runAdmissionGuard(()=>acceptanceOwner.readDispatchPreparationCall(projectId,frame,context)),true);
+      },
+      readDefaultDispatchChildPreparation(projectId,frame,context){schedulerActor(context);return migrationBoundary.runPublic('server.readDefaultDispatchChildPreparation',()=>transactDefaultDispatchPreparation(projectId,frame,context,'observe'),true);},
+      prepareDefaultDispatchChild(projectId,frame,context){schedulerActor(context);return migrationBoundary.runPublic('server.prepareDefaultDispatchChild',()=>transactDefaultDispatchPreparation(projectId,frame,context,'prepare'),true);},
+      admitDefaultDispatchChildPreparation(projectId,frame,context){schedulerActor(context);return migrationBoundary.runPublic('server.admitDefaultDispatchChildPreparation',()=>transactDefaultDispatchPreparation(projectId,frame,context,'admit'),true);},
+      acknowledgeDefaultDispatchChild(projectId,frame,context){schedulerActor(context);return migrationBoundary.runPublic('server.acknowledgeDefaultDispatchChild',()=>transactDefaultDispatchPreparation(projectId,frame,context,'acknowledge'),true);},
+      prepareDelivery(projectId,taskId,context){schedulerActor(context);return migrationBoundary.runPublic('server.prepareDelivery',()=>prepareServerTaskDelivery(projectId,taskId),true);},
+      isDeliveryAdmissionFailure,
+      retainDeliveryGuardTail(value,context,error){migrationBoundary.retainGuardTail(value,error);schedulerActor(context);},
+      inspectDeliveryGuardTails(context){schedulerActor(context);return Object.freeze(migrationBoundary.inspectGuardTails());},
+      bindWatchdog(watchdog){
+        if(watchdogBound||!isOriginalWatchdog(watchdog))throw Error('SERVER_WATCHDOG_OWNER_REQUIRED');watchdogBound=true;
+        return Object.freeze({applyTimeout(frame,context){
+          schedulerActor(context);return migrationBoundary.runPublic('server.watchdog.timeout',()=>{
+            let decision;try{decision=consumeWatchdogDecision(watchdog,frame);}catch{return {ok:false,error:'WATCHDOG_DECISION_UNAVAILABLE'};}
+            const proof=serverTaskObservations.get(decision.task),project=proof&&captureExecutionData(projects.get(proof.projectId)??null),board=proof&&boards.get(proof.projectId);
+            if(!proof||!project||proof.projectId!==decision.projectId||board!==proof.board||getPersistenceHealth().revision!==proof.revision||protocolDigest(project)!==proof.projectDigest||['closed','delivered'].includes(project.status))return {ok:false,error:'WATCHDOG_OBSERVATION_STALE'};
+            const before=readTaskBoardSnapshot(board),task=before.find(row=>row.id===decision.task.id);
+            if(!task||protocolDigest(task)!==proof.taskDigest||!['dispatched','accepted','in_progress'].includes(task.status)||decision.now-(task.updatedAt||task.createdAt||decision.now)<decision.timeoutMs)return {ok:false,error:'WATCHDOG_OBSERVATION_STALE'};
+            migrationBoundary.markExecutionAttempt();migrationBoundary.markUnknown('server_watchdog_timeout');
+            const scope={type:'project',projectId:proof.projectId};return withActivityBudget('serverWatchdogTimeout',scope,()=>{
+              const action=applyWatchdogTimeout({transition:(id,status)=>transitionOriginalTaskBoard(board,id,status)},task,decision.retries,decision.maxRetries);
+              if(!action){boards.set(proof.projectId,restoreTaskBoard(before,proof.projectId));return {ok:false,error:'WATCHDOG_TRANSITION_REJECTED'};}
+              const response=captureExecutionData({ok:true,action});persistState(scope);return response;
+            });
+          },true);
+        }});
+      },
+      markStalledRunEffect(context){schedulerActor(context);return migrationBoundary.runPublic('server.stalled.effect',()=>{migrationBoundary.markUnknown('server_stalled_watchdog');migrationBoundary.markExecutionAttempt();},true);},
+      retainStalledTail(value,context){migrationBoundary.retainDetached(value);schedulerActor(context);},
+      recoverStartup(context){schedulerActor(context);return migrationBoundary.runPublic('server.startup.recovery',()=>{
+        const scan=collectInterruptedTaskWorkflows();if(!scan.candidates.length&&!scan.blockedCandidates.length)return captureObservationComposite({ok:true,recovered:[],skipped:[],resumableScriptRuns:captureObservationRows(scan.resumableScriptRuns)});
+        const input=Object.freeze({reason:'kswarm_service_started'});serverRecoveryInputs.add(input);
+        migrationBoundary.markUnknown('server_startup_recovery');migrationBoundary.markExecutionAttempt();return persisted.recoverInterruptedTaskWorkflows(input);
+      },true);},
+      normalizePoAgents(input,context){
+        schedulerActor(context);const agents=captureExecutionData(input);if(!Array.isArray(agents))throw Error('SERVER_SCHEDULER_INPUT_INVALID');
+        return migrationBoundary.runPublic('server.startup.normalize',()=>{
+          const pending=[];let changed=0;
+          for(const [id,raw] of projects){
+            if(acceptanceOwner.dsh.isProject(id))continue;
+            const before=captureExecutionData(raw);if(['closed','delivered'].includes(before.status))continue;
+            const draft=structuredClone(before),resolution=resolvePlanRetryPoAgent(draft,agents);let count=0;
+            if(resolution.changed&&resolution.poAgent){draft.poAgent=resolution.poAgent;count++;}
+            if(reconcileProjectAgentSelectionWithEffectiveAgents(draft))count++;
+            if(count){pending.push({id,raw,before,draft,resolution,count});changed+=count;}
+          }
+          if(!pending.length)return {changed:0,changes:[]};
+          const response=captureExecutionData({changed,changes:pending.map(item=>({projectId:item.id,previousPoAgent:item.before.poAgent,poAgent:item.draft.poAgent,reason:item.resolution.reason}))});
+          migrationBoundary.markUnknown('server_startup_normalization');
+          return withActivityBudget('serverStartupNormalization',FULL_SCOPE,()=>{
+            for(const item of pending){if(projects.get(item.id)!==item.raw||protocolDigest(captureExecutionData(item.raw))!==protocolDigest(item.before))throw Error('SERVER_SCHEDULER_STATE_CHANGED');item.raw.poAgent=item.draft.poAgent;item.raw.members=item.draft.members;item.raw.agentSelection=item.draft.agentSelection;}
+            persistState(FULL_SCOPE);return response;
+          });
+        },true);
+      },
+    });
+    preparationTransportCallReader=(projectId,admissionId,digest,sourceIncarnation)=>{
+      const entry=typeof admissionId==='string'?preparationAdmissions.get(admissionId):undefined,p=entry?.candidate.preparation;
+      if(!p||p.projectId!==projectId||p.intentDigest!==digest||entry.candidate.sourceIncarnation!==sourceIncarnation)throw Error('DEFAULT_DISPATCH_PREPARATION_CALL_UNAVAILABLE');
+      schedulerPorts.assertDefaultDispatchPreparationTransportCurrent(admissionId,pinnedDeliveryOwner,deliveryConstructionActor);
+      return freezeTransportData(captureExecutionData({scope:p.scope,projectId,childKey:p.childKey,payloadHash:p.payloadHash,admissionId,sourceIncarnation,preparationIntentDigest:digest,runId:p.runId,preparationClaimId:p.preparationClaimId,hostId:p.hostId,targetParticipantId:p.targetParticipantId,targetIncarnation:p.targetIncarnation}));
+    };
+    preparationTransportCandidateReader=(projectId,admissionId,digest,sourceIncarnation)=>{
+      preparationTransportCallReader(projectId,admissionId,digest,sourceIncarnation);
+      const entry=preparationAdmissions.get(admissionId);if(!entry||entry.client!==preparationClient||entry.owner!==pinnedDeliveryOwner||entry.actor!==deliveryConstructionActor||entry.epoch!==preparationEpoch||!entry.used)throw Error('DEFAULT_DISPATCH_PREPARATION_CALL_UNAVAILABLE');return entry.candidate;
+    };
+    preparationHostSettlementReader=(projectId,data)=>{
+      const row=hostRegistrations.get(data.registrationDigest);
+      if(!row||row.unknown||!row.committed||row.projectId!==projectId||row.owner!==pinnedDeliveryOwner||row.context!==deliveryConstructionActor||row.client!==preparationClient||row.epoch!==preparationEpoch||row.registration.hostLeaseKey!==data.hostLeaseKey||row.registration.sourceIncarnation!==data.sourceIncarnation)return undefined;
+      return row.registrationToken;
+    };
+    let preparationBusinessBound=false;
+    const preparationBinding=dispatchPreparationOwners.get(publicApi);
+    preparationBinding.bind=(owner,actor,client)=>{
+      if(preparationBusinessBound)throw Error('DEFAULT_DISPATCH_PREPARATION_ALREADY_BOUND');preparationBusinessBound=true;
+      assertTransportLocal(owner,actor,client);
+      if(!originalPreparationClientMatchesSource(client,preparationTransportSource))throw Error('ORIGINAL_PREPARATION_CLIENT_REQUIRED');
+      return transportFreeze({__proto__:null,
+        assertCurrent:()=>assertTransportLocal(owner,actor,client),
+        assertSettlementCurrent:()=>{schedulerActor(actor);if(persistenceClosed||migrationBoundary.inspectState().phase!=='open'||!preparationSourceTaken||client!==preparationClient||owner!==pinnedDeliveryOwner||actor!==deliveryConstructionActor)throw Error('DEFAULT_DISPATCH_TRANSPORT_OWNER_UNAVAILABLE');},
+        registerHost:(projectId,frame)=>schedulerPorts.registerDefaultDispatchHostEffect(projectId,frame,owner,actor),
+        finishHostNoEffect:(projectId,frame)=>schedulerPorts.finishDefaultDispatchHostNoEffect(projectId,frame,owner,actor),
+        readBasis:(projectId,frame)=>schedulerPorts.readDefaultDispatchPreparationBasis(projectId,frame,actor),
+        prepareIntent:(projectId,frame)=>schedulerPorts.prepareDefaultDispatchChild(projectId,frame,actor),
+        startSend:(projectId,frame)=>owner.startDefaultDispatchPreparation(projectId,frame,actor),
+        readCall:(projectId,frame)=>schedulerPorts.readDefaultDispatchPreparationCall(projectId,frame,actor),
+        acknowledge:(projectId,frame)=>schedulerPorts.acknowledgeDefaultDispatchChild(projectId,frame,actor),
+        readSend:record=>schedulerPorts.readDefaultDispatchPreparationSend(record,owner,actor),
+        readSendCompletion:record=>schedulerPorts.readDefaultDispatchPreparationSendCompletion(record,owner,actor),
+        seal:()=>schedulerPorts.sealDefaultDispatchPreparationTransport(owner,actor),
+      });
+    };
+    return schedulerPorts;
+  });
+  const dispatchReadPlan=publicApi.readDefaultDispatchPlan,dispatchCapture=publicApi.captureDefaultDispatchOperation,dispatchReadOperation=publicApi.readDefaultDispatchOperation;
+  dispatchBusinessOwners.set(publicApi,{source:defaultDispatchActionSource,ports:Object.freeze({
+    readPlan:(projectId,token)=>dispatchReadPlan(projectId,token),
+    capture:(projectId,frame,context)=>dispatchCapture(projectId,frame,context),
+    readOperation:(projectId,lookup,token)=>dispatchReadOperation(projectId,lookup,token),
+  })});
+  dshBusinessOwners.set(publicApi,{source:dshBusinessSource,budgetSource:dshBudgetSource,ports:transportFreeze({
+    prepareOwner:publicApi.prepareDshAdmissionOwnerWriter,
+    readDomain:publicApi.readDshDomain,
+    applyControl:publicApi.applyDshScopeFence,
+    applyWorkMode:publicApi.applyDshWorkModeFence,
+    applyCommand:publicApi.applyDshOwnerCommand,
+    applyNarrowing:publicApi.applyDshNarrowingCommand,
+    prepareSlot:publicApi.prepareDshDraftSlot,
+    stageDraft:publicApi.stageDshDraft,
+    commitDraft:publicApi.commitDshDraft,
+    readDraft:publicApi.readDshDraft,
+    readBasis:publicApi.readDshAdmissionReceiptBasis,
+    readWork:publicApi.readDshWork,
+    readSlot:publicApi.readDshDraftSlot,
+  })});
+  dispatchPreparationOwners.set(publicApi,{__proto__:null,source:defaultDispatchPreparationSource,bind:undefined});
+  return publicApi;
 }
+import {projectReferencesAgent,assertClosedProjectAgentReferences} from './project-agent-references.js';

@@ -51,7 +51,7 @@ function createReadyProject(hub, projectId = 'proj-state-unification') {
   const added = hub.handleHumanAddTasks(projectId, [
     { id: 'item-1', title: '收集资料', assignedAgent: 'xiaok-worker' },
     { id: 'item-2', title: '生成报告', assignedAgent: 'xiaok-worker', dependencies: ['item-1'], requiredOutputs: ['markdown'] },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(projectId).ok, true);
   return project;

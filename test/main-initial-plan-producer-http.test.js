@@ -1,0 +1,50 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {spawn} from 'node:child_process';
+import {mkdtempSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import net from 'node:net';
+import {createServer} from '../../intent-broker/src/http/server.js';
+import {createBrokerService} from '../../intent-broker/src/broker/service.js';
+
+test('authenticated Main producer handshake commits binding and suppresses every old initial-PO sender',async t=>{
+ const root=mkdtempSync(join(tmpdir(),'main-plan-http-')),scope={profileId:'a'.repeat(64),workspaceId:'b'.repeat(64)};
+ const broker=createBrokerService({dbPath:join(root,'broker.sqlite')});
+ const server=createServer({broker,roomService:broker.room,roomDesktopToken:'room-user',roomKSwarmToken:'room-owner'});
+ await server.listen(0,'127.0.0.1');
+ const brokerUrl='http://127.0.0.1:'+server.address().port;
+ t.after(async()=>{await server.close();broker.close();rmSync(root,{recursive:true,force:true});});
+ const roomCall=async(path,body)=>{
+  const response=await fetch(brokerUrl+path,{method:'POST',headers:{'content-type':'application/json','x-intent-broker-room-token':'room-user'},body:JSON.stringify(body)});
+  const result=await response.json();assert.equal(result.ok,true,JSON.stringify(result));return result;
+ };
+ const room=(await roomCall('/rooms',{title:'Main project',memberAgentIds:['xiaok-po','xiaok-worker']})).room;
+ const message=(await roomCall('/rooms/'+room.roomId+'/messages',{text:'Create a project',mentions:[],responsePolicy:'mentioned',idempotencyKey:'source'})).message;
+ const probe=net.createServer();await new Promise(resolve=>probe.listen(0,'127.0.0.1',resolve));const port=probe.address().port;await new Promise(resolve=>probe.close(resolve));
+ const child=spawn(process.execPath,['src/server/index.js'],{cwd:process.cwd(),env:{...process.env,HOME:root,USERPROFILE:root,KSWARM_DATA_ROOT:join(root,'kswarm'),KSWARM_PORT:String(port),BROKER_URL:brokerUrl,INTENT_BROKER_KSWARM_TOKEN:'room-owner',KSWARM_DESKTOP_MUTATION_TOKEN:'main-only',KSWARM_DESKTOP_PROFILE_ID:scope.profileId,KSWARM_DESKTOP_WORKSPACE_ID:scope.workspaceId},stdio:'ignore'});
+ const close=new Promise(resolve=>child.once('exit',(code,signal)=>{console.log(JSON.stringify({test:'main-producer-http-child',pid:child.pid,code,signal,reaped:true}));resolve();}));
+ t.after(async()=>{if(child.exitCode===null)child.kill('SIGTERM');await close;});
+ const base='http://127.0.0.1:'+port,headers={'content-type':'application/json','x-kswarm-mutation-token':'main-only'};
+ for(let n=0;;n++){try{if((await fetch(base+'/health')).ok)break;}catch{}if(n===400||child.exitCode!==null)throw Error('startup_failed');await new Promise(resolve=>setTimeout(resolve,25));}
+ const get=async path=>(await fetch(base+path,{headers})).json();
+ const post=async(path,body,auth=headers)=>fetch(base+path,{method:'POST',headers:auth,body:JSON.stringify(body)});
+ assert.equal((await fetch(base+'/desktop/project-protocol')).status,401);
+ const capability=await get('/desktop/project-protocol');assert.equal(capability.protocol,'ordinary_initial_plan_v1');assert.deepEqual(capability.scope,scope);
+ const operation='conversation-project:'+'c'.repeat(64);
+ const input={name:'Main project',goal:'Write report',poAgent:'xiaok-po',members:['xiaok-worker'],primaryRoomId:room.roomId,sourceMessageIds:[message.messageId],clientRequestKey:operation,requestSource:'user',requestedStartPolicy:'plan_only',initialPlanProducer:{protocol:'ordinary_initial_plan_v1',canonicalCreateOperationId:operation,...scope}};
+ assert.equal((await post('/projects/room-first',input,{})).status,401);
+ assert.equal((await post('/projects/room-first',{...input,initialPlanProducer:{...input.initialPlanProducer,workspaceId:'d'.repeat(64)}})).status,403);
+ const response=await post('/projects/room-first',input);const created=await response.json();assert.equal(response.status,201,JSON.stringify(created));
+ assert.deepEqual(created.planningStart,{sent:false,reason:'desktop_main_bootstrap'});
+ assert.equal((await fetch(base+'/projects/'+created.project.id+'/initial-plan-producer')).status,401);
+ assert.deepEqual(await get('/projects/'+created.project.id+'/initial-plan-producer'),{ok:true,projectId:created.project.id,producer:'desktop_main_v1'});
+ const state=await get('/projects/'+created.project.id+'/initial-plan-inputs');assert.equal(state.ok,true);assert.equal(state.ownerBinding.canonicalCreateOperationId,operation);
+ assert.equal(state.ownerBinding.planGeneration,1);assert.equal(state.startPolicy,'plan_only');
+ const replay=await (await post('/projects/room-first',input)).json();assert.equal(replay.project.id,created.project.id);assert.deepEqual(replay.initialPlanning,state.ownerBinding);
+ const before=await get('/projects/'+created.project.id);
+ const retry=await (await post('/projects/'+created.project.id+'/retry-plan',{})).json();assert.equal(retry.error,'INITIAL_PLAN_MAIN_RECOVERY_REQUIRED');
+ const after=await get('/projects/'+created.project.id);
+ for(const key of ['project','tasks','plan','humanActions','activities'])assert.deepEqual(after[key],before[key]);
+ assert.equal((await get('/projects')).projects.length,1);
+},{timeout:20000});

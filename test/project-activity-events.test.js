@@ -164,7 +164,7 @@ test('known critical saturation rejects before business mutation while unrelated
   p.activityEventOutbox = Array.from({ length: 4096 }, (_, index) => ({ kind: 'input_required', occurredAt: Date.now(), sourceSequence: index + 1 }));
   const before = hub.getProjectActivity('p');
   const notices = []; hub.subscribeProjectActivity(value => notices.push(value));
-  assert.throws(() => hub.handleCloseProject('p'), /project_activity_capacity_exceeded/);
+  assert.throws(() => hub.handleCloseProject('p','',{requestSource:'user'}), /project_activity_capacity_exceeded/);
   assert.equal(hub.getProject('p').status, 'created');
   assert.equal(hub.getPersistenceHealth().status, 'ok');
   assert.deepEqual(hub.getProjectActivity('p'), before);
@@ -189,7 +189,7 @@ test('concurrent admissions cannot both reserve the last critical slot; committe
 });
 test('real FULL team metadata invalidation leaves a saturated terminal project healthy and does not duplicate its terminal', t => {
   const { hub } = fixture(t);
-  hub.createProject({ ...project, members: ['worker'] }); hub.handleCloseProject('p');
+  hub.createProject({ ...project, members: ['worker'] }); hub.handleCloseProject('p','',{requestSource:'user'});
   const p = hub.getProject('p');
   p.activityEventSeq = 4096;
   p.activityEventOutbox = Array.from({ length: 4096 }, (_, index) => ({ kind: 'input_required', occurredAt: Date.now(), sourceSequence: index + 1, eventId: `p#${index + 1}` }));

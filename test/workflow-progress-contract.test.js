@@ -41,7 +41,7 @@ function createStartedWorkflowRun(hub) {
   });
   const added = hub.handleHumanAddTasks(project.id, [
     { title: '输出诊断材料', assignedAgent: 'xiaok-worker' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   const approved = hub.handleApprove(project.id);
   assert.equal(approved.ok, true);

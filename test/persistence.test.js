@@ -19,10 +19,12 @@ import * as realFs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
 
 import { createPersistence } from '../src/core/persistence.js';
 import {
   createSqlitePersistence,
+  windowsLockOwnerMatches,
   PersistenceLoadError,
   PersistenceCommitError,
 } from '../src/core/sqlite-persistence.js';
@@ -37,9 +39,42 @@ import {
 const tests = [];
 function test(name, fn) { tests.push({ name, fn }); }
 
+test('Windows lock ownership rejects a reused PID, retaining live or unknown owners', () => {
+  assert.equal(windowsLockOwnerMatches(10000, 20000), false);
+  assert.equal(windowsLockOwnerMatches(10000, 9999), true);
+  assert.equal(windowsLockOwnerMatches(10000, 10000), true);
+  for (const value of [undefined, NaN, 0, '10000']) assert.equal(windowsLockOwnerMatches(value, 20000), true);
+  assert.equal(windowsLockOwnerMatches(10000, NaN), true);
+});
+
 function tempDir(label = 'persist') {
   return mkdtempSync(join(tmpdir(), `kswarm-${label}-`));
 }
+
+test('Windows real process birth distinguishes a reused PID without stopping the unrelated process', async () => {
+  if (process.platform !== 'win32') return;
+  const dir = tempDir('windows-pid-reuse'), filePath = join(dir, 'state.sqlite');
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore', windowsHide: true });
+  const exited = new Promise(resolve => child.once('exit', resolve));
+  let persistence;
+  try {
+    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+    const file = filePath + '.lock';
+    writeFileSync(file, JSON.stringify({ pid: child.pid, token: 'synthetic-live', createdAt: Date.now() }));
+    persistence = createSqlitePersistence({ filePath });
+    assert.throws(() => persistence.load(), /locked by live writer/);
+    persistence.close();
+    writeFileSync(file, JSON.stringify({ pid: child.pid, token: 'synthetic-stale', createdAt: Date.now() - 600_000 }));
+    persistence = createSqlitePersistence({ filePath });
+    assert.equal(persistence.load(), null);
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+  } finally {
+    persistence?.close();
+    child.kill();
+    await exited;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function passthroughFs(overrides = {}) {
   return {
@@ -340,28 +375,27 @@ test('sqlite: save failure sets failed health, rejects subsequent mutations (exi
 test('sqlite: single-writer lock rejects live writers and only reclaims dead owners', () => {
   const dir = tempDir('sql-lock');
   try {
-    const filePath = join(dir, 'state.sqlite');
-    const lockPath = `${filePath}.lock`;
-    realFs.mkdirSync(dir, { recursive: true });
-    // Foreign live writer holds the lock.
-    realFs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
-
-    const live = createSqlitePersistence({ filePath, isProcessAlive: () => true });
+    // Each liveness branch owns a distinct path: a rejected default Native
+    // source remains HELD and cannot authorize reopening the same path.
+    const livePath = join(dir, 'live.sqlite');
+    realFs.writeFileSync(`${livePath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
+    const live = createSqlitePersistence({ filePath: livePath, isProcessAlive: () => true });
     assert.throws(() => live.load(), (e) => e instanceof PersistenceLoadError);
+    live.close();
 
-    // Dead pid -> reclaim.
-    const dead = createSqlitePersistence({ filePath, isProcessAlive: () => false });
+    const deadPath = join(dir, 'dead.sqlite');
+    realFs.writeFileSync(`${deadPath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() }));
+    const dead = createSqlitePersistence({ filePath: deadPath, isProcessAlive: () => false });
     assert.doesNotThrow(() => dead.load());
     dead.close();
 
-    // Age alone must never allow a live writer to be pre-empted.
-    realFs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() - 120_000 }));
-    const stale = createSqlitePersistence({ filePath, isProcessAlive: () => true });
+    const stalePath = join(dir, 'stale.sqlite');
+    realFs.writeFileSync(`${stalePath}.lock`, JSON.stringify({ pid: 999999, token: 'foreign', createdAt: Date.now() - 120_000 }));
+    const stale = createSqlitePersistence({ filePath: stalePath, isProcessAlive: () => true });
     assert.throws(() => stale.load(), (e) => e instanceof PersistenceLoadError);
     stale.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
-
 test('sqlite: single-writer claim uses exclusive atomic file creation', () => {
   const dir = tempDir('sql-lock-atomic');
   try {

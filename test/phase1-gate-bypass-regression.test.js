@@ -99,7 +99,7 @@ test('[GREEN] markProjectTasksDoneByWorkflow must NOT overwrite an existing bloc
   const added = hub.handleHumanAddTasks('proj-gate-workflow', [
     { title: '独立评审任务', description: '对素材做独立评审', assignedAgent: 'xiaok-worker' },
     { title: '生成最终报告', description: '输出项目最终报告', assignedAgent: 'xiaok-worker', requiredOutputs: ['markdown'] },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove('proj-gate-workflow').ok, true);
 

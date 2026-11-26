@@ -21,7 +21,7 @@ function createActiveProject(hub, id = 'proj-kualityforge') {
   });
   const added = hub.handleHumanAddTasks(id, [
     { title: '执行质量门禁', assignedAgent: 'codex:gpt-5' },
-  ]);
+  ], {requestSource: 'user'});
   assert.equal(added.ok, true);
   assert.equal(hub.handleApprove(id).ok, true);
   return project;
