@@ -1,0 +1,17 @@
+name: CLI discovery
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  discovery:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-2022]
+        node: ['22.22.0', '24.16.0']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test test/cli-discovery.test.js
+      - run: node test/agent-runtime-selection.test.js
